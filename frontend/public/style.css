@@ -1407,6 +1407,15 @@ tbody tr:hover .row-action {
   fill: var(--green);
 }
 
+/* 进程指定出口：和主出口用不同颜色区分，避免两条线混在一起。 */
+.nm-label.proc {
+  fill: var(--amber);
+}
+
+.nm-node.proc .nm-dot {
+  fill: var(--amber);
+}
+
 .nm-target {
   fill: var(--text-faint);
 }
@@ -1421,6 +1430,10 @@ tbody tr:hover .row-action {
 
 .nm-particle {
   filter: drop-shadow(0 0 5px var(--accent));
+}
+
+.nm-particle.proc {
+  filter: drop-shadow(0 0 5px var(--amber));
 }
 
 .nm-node .nm-dot {
@@ -1488,6 +1501,14 @@ tbody tr:hover .row-action {
   height: 2px;
   border-radius: 2px;
   background: linear-gradient(90deg, var(--accent), transparent);
+}
+
+.nm-swatch.proc {
+  width: 18px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--amber);
+  margin-left: 10px;
 }
 
 /* 目标点的悬停浮层 */

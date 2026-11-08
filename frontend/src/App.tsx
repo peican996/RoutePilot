@@ -12,7 +12,7 @@ import {
   POLL_MAIN_HIDDEN_MS,
   POLL_MAIN_MS,
 } from "./constants";
-import NodeMap from "./NodeMap";
+import NodeMap, { type MapExit } from "./NodeMap";
 import ConnectionsPanel from "./components/ConnectionsPanel";
 import NodesPanel from "./components/NodesPanel";
 import OverviewPanel from "./components/OverviewPanel";
@@ -89,6 +89,17 @@ const EMPTY_SUB: SubInfo = {
 // 顶栏只放"规则 / 全局"。直连不放这里——它会让所有流量绕过代理，
 // 一旦误点就是"我明明开了代理却上不了网"，排查成本极高。
 // 直连挪到设置页，并且明确标注用途。
+
+// mihomo 的 chains 形如 "香港 01 → 节点选择 → Copilot"：节点在最前，
+// 后面是逐层经过的策略组。进程指定节点后链尾会挂 nx-pp- 隐藏组。
+// 取第一段才是真正出口。
+function exitNodeOf(c: Conn): string {
+  const parts = c.chains.split("→").map((s) => s.trim()).filter(Boolean);
+  return parts.length > 0 ? parts[0] : "";
+}
+
+// 进程指定出口的隐藏组前缀，和后端 configgen.ProcessGroupPrefix 保持一致。
+const PROC_TARGET_PREFIX = "nx-pp-";
 
 const BUILTIN = new Set([
   "GLOBAL",
@@ -497,29 +508,6 @@ export default function App() {
   // 地图只画叶子节点（跳过"剩余流量"这类噪音项）。
   const nodeNames = useMemo(() => leafNodes.map((n) => n.name), [leafNodes]);
 
-  // 连接目标在地图上的落点。同一国家只画一个，最多 8 个，避免满屏都是点。
-  // 每个点带上 IP 和域名，供悬停提示显示。
-  const mapTargets = useMemo(() => {
-    const seen = new Map<
-      string,
-      { lon: number; lat: number; country: string; ip: string; host: string }
-    >();
-    for (const c of conns) {
-      const ip = c.destIP;
-      if (!ip) continue;
-      const loc = targetLocs[ip];
-      if (!loc) continue;
-      const key = `${loc.lon},${loc.lat}`;
-      if (seen.has(key)) continue;
-      seen.set(key, {
-        ...loc,
-        ip,
-        host: c.host || c.dest || "",
-      });
-    }
-    return [...seen.values()].slice(0, 8);
-  }, [conns, targetLocs]);
-
   // 节点详情（协议、延迟），地图悬停时显示。
   const nodeMeta = useMemo(() => {
     const m: Record<string, { type: string; delay: number }> = {};
@@ -556,6 +544,114 @@ export default function App() {
 
   const activeNode =
     status.mode === "global" ? (globalGroup?.now ?? "") : (mainGroup?.now ?? "");
+
+  // 主策略组的 now 可能指向另一个组（机场常见的分层结构），
+  // 地图需要的是最终落地的节点。解析不到就退回空，避免把组名当节点画。
+  const mainExitNode = useMemo(() => {
+    if (!activeNode) return "";
+    const leafSet = new Set(leafNodes.map((n) => n.name));
+    if (leafSet.has(activeNode)) return activeNode;
+    const groupNow = new Map<string, string>();
+    for (const n of nodes) {
+      if (n.group && n.now) groupNow.set(n.name, n.now);
+    }
+    let cur = activeNode;
+    for (let i = 0; i < 4; i++) {
+      const next = groupNow.get(cur);
+      if (!next || next === cur) return "";
+      if (leafSet.has(next)) return next;
+      cur = next;
+    }
+    return "";
+  }, [activeNode, leafNodes, nodes]);
+
+  // 地图按"真实出口"分组绘制。主策略组只代表未命中进程规则的流量，
+  // 进程指定节点后，实际出口可能同时有好几个。
+  const mapExits = useMemo<MapExit[]>(() => {
+    const leafSet = new Set(leafNodes.map((n) => n.name));
+    const groupNow = new Map<string, string>();
+    for (const n of nodes) {
+      if (n.group && n.now) groupNow.set(n.name, n.now);
+    }
+
+    const byName = new Map<string, MapExit>();
+    const ensure = (name: string): MapExit => {
+      let e = byName.get(name);
+      if (!e) {
+        e = { name, main: name === mainExitNode, procs: [], conns: 0, targets: [] };
+        byName.set(name, e);
+      }
+      return e;
+    };
+
+    // 主出口即使暂时没有连接也要画出来。
+    if (mainExitNode) ensure(mainExitNode);
+
+    // 策略组可能嵌套（组里再选组），一路跟到真正的叶子节点。
+    const resolveGroupNode = (name: string): string => {
+      let cur = name;
+      for (let i = 0; i < 4; i++) {
+        if (leafSet.has(cur)) return cur;
+        const next = groupNow.get(cur);
+        if (!next || next === cur) return "";
+        cur = next;
+      }
+      return "";
+    };
+
+    // 已配置的进程出口先标出来：没有流量时也应该在地图上看到它。
+    for (const [proc, policy] of Object.entries(procRules)) {
+      if (!policy.startsWith("target:")) continue;
+      const target = policy.slice("target:".length);
+      const node = leafSet.has(target) ? target : resolveGroupNode(target);
+      if (!node || !leafSet.has(node)) continue;
+      const e = ensure(node);
+      if (!e.procs.includes(proc)) e.procs.push(proc);
+    }
+
+    // 活动连接的真实出口。每个出口最多保留 3 个目标点，
+    // 多出口时否则连线会把地图铺满。
+    for (const c of conns) {
+      const name = exitNodeOf(c);
+      if (!name || !leafSet.has(name)) continue;
+      const e = ensure(name);
+      e.conns += 1;
+      // 链上出现 nx-pp- 说明这条连接命中了"进程指定出口"。
+      // 即使进程规则还没同步过来，也能靠连接本身识别出来。
+      if (
+        c.chains.includes(PROC_TARGET_PREFIX) &&
+        c.process &&
+        c.process !== "—" &&
+        !e.procs.includes(c.process)
+      ) {
+        e.procs.push(c.process);
+      }
+      const loc = c.destIP ? targetLocs[c.destIP] : undefined;
+      if (!loc) continue;
+      const key = `${loc.lon},${loc.lat}`;
+      if (e.targets.some((t) => `${t.lon},${t.lat}` === key)) continue;
+      if (e.targets.length >= 3) continue;
+      e.targets.push({
+        lon: loc.lon,
+        lat: loc.lat,
+        country: loc.country,
+        ip: c.destIP,
+        host: c.host || c.dest || "",
+      });
+    }
+
+    // 只画主出口和进程指定出口。机场业务组（Netflix/ChatGPT 等）
+    // 自己选到别的节点时不算进程分流，避免把它们误标成"进程出口"。
+    const list = [...byName.values()].filter((e) => e.main || e.procs.length > 0);
+    list.sort(
+      (a, b) =>
+        Number(b.main) - Number(a.main) ||
+        b.conns - a.conns ||
+        a.name.localeCompare(b.name),
+    );
+    return list.slice(0, 4);
+  }, [mainExitNode, conns, leafNodes, nodes, procRules, targetLocs]);
+
 
   // 订阅流量。机场把用量放在 subscription-userinfo 响应头里，
   // 已用 = 上传 + 下载，和面板显示的口径一致。
@@ -1050,9 +1146,8 @@ export default function App() {
           <div style={{ display: tab === "overview" ? "block" : "none" }}>
             <NodeMap
               names={nodeNames}
-              active={activeNode}
-              conns={conns.length}
-              targets={mapTargets}
+              active={mainExitNode}
+              exits={mapExits}
               delays={delays}
               nodeMeta={nodeMeta}
               onRefresh={onTestAll}

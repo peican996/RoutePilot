@@ -23,11 +23,23 @@ export type Target = {
   host: string;
 };
 
+// 一个实际出口：主策略组出口，或某个进程指定到的节点。
+// 地图按出口分组画线，而不是只画"当前节点"一条。
+export type MapExit = {
+  name: string;
+  main: boolean;
+  /** 指定到这个出口的进程名，没有流量的配置也会带上。 */
+  procs: string[];
+  /** 当前走这个出口的连接数。 */
+  conns: number;
+  /** 这些连接的目标落点，已经去重并限量。 */
+  targets: Target[];
+};
+
 type Props = {
   names: string[];
   active: string;
-  conns?: number;
-  targets?: Target[];
+  exits?: MapExit[];
   onPick?: (name: string) => void;
   /** 节点名 → 延迟（毫秒）。用来给节点着色：绿/黄/红。 */
   delays?: Record<string, number>;
@@ -54,8 +66,7 @@ type Props = {
 export default function NodeMap({
   names,
   active,
-  conns = 0,
-  targets,
+  exits,
   onPick,
   delays,
   nodeMeta,
@@ -186,6 +197,29 @@ export default function NodeMap({
   const activeXY = activePlace ? project(activePlace.lon, activePlace.lat) : null;
   const homeXY = project(home.lon, home.lat);
 
+  // 把出口解析成地图坐标。解析不到位置的（DIRECT、已下线的节点）直接跳过。
+  const exitPlaces = useMemo(() => {
+    const out: Array<{
+      exit: MapExit;
+      x: number;
+      y: number;
+      label: string;
+    }> = [];
+    for (const e of exits ?? []) {
+      const p = resolvePlace(e.name);
+      if (!p) continue;
+      const xy = project(p.lon, p.lat);
+      out.push({ exit: e, ...xy, label: p.label });
+    }
+    return out;
+  }, [exits]);
+
+  const exitByName = useMemo(() => {
+    const m = new Map<string, MapExit>();
+    for (const e of exits ?? []) m.set(e.name, e);
+    return m;
+  }, [exits]);
+
   // 拖动平移。用 pointer events，鼠标和触屏都能拖。
   // 拖完 3px 以内算点击，超过算拖动——否则用户想点节点会误触发平移。
   const justDraggedRef = useRef(false);
@@ -265,7 +299,29 @@ export default function NodeMap({
       });
     }
 
-    for (const t of targets?.slice(0, 6) ?? []) {
+    // 进程指定出口单独标出来，没有流量时也能看出"这里还有一个出口"。
+    for (const ep of exitPlaces) {
+      if (ep.exit.main) continue;
+      out.push({
+        key: `exit-${ep.exit.name}`,
+        ...placeLabel(ep.x, ep.y, ep.label, taken, k),
+        text: ep.label,
+        cls: "nm-label proc",
+      });
+    }
+
+    // 目标点只标一次。多出口可能连到同一个国家/城市，重复标注没有意义。
+    const seen = new Set<string>();
+    const drawn: Array<{ lon: number; lat: number; country: string }> = [];
+    for (const ep of exitPlaces) {
+      for (const t of ep.exit.targets) {
+        const key = `${t.lon},${t.lat}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        drawn.push(t);
+      }
+    }
+    for (const t of drawn.slice(0, 6)) {
       const tp = project(t.lon, t.lat);
       out.push({
         key: `t-${t.lon},${t.lat}`,
@@ -276,7 +332,7 @@ export default function NodeMap({
     }
 
     return out;
-  }, [homeXY, activeXY, activePlace, targets, k]);
+  }, [homeXY, activeXY, activePlace, exitPlaces, k]);
 
   return (
     <div className="nodemap-wrap">
@@ -298,6 +354,10 @@ export default function NodeMap({
             <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.85" />
             <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
           </radialGradient>
+          <radialGradient id="nm-glow-proc" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="var(--amber)" stopOpacity="0.8" />
+            <stop offset="100%" stopColor="var(--amber)" stopOpacity="0" />
+          </radialGradient>
           <linearGradient id="nm-line" x1="0" y1="0" x2="1" y2="0">
             <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.1" />
             <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.8" />
@@ -311,90 +371,121 @@ export default function NodeMap({
         {/* 真实世界陆地轮廓（Natural Earth 110m，已抽稀） */}
         <path className="nm-land" d={WORLD_PATH} />
 
-        {/* 本机 → 当前节点 的流量线 */}
-        {activeXY && (
-          <>
-            <path
-              className="nm-line"
-              d={`M ${homeXY.x} ${homeXY.y} Q ${(homeXY.x + activeXY.x) / 2} ${
-                Math.min(homeXY.y, activeXY.y) - 40
-              } ${activeXY.x} ${activeXY.y}`}
-              fill="none"
-              stroke="url(#nm-line)"
-              strokeWidth={1.6 * k}
-            />
-            {(() => {
-              const path = `M ${homeXY.x} ${homeXY.y} Q ${(homeXY.x + activeXY.x) / 2} ${
-                Math.min(homeXY.y, activeXY.y) - 40
-              } ${activeXY.x} ${activeXY.y}`;
-              const dur = conns > 8 ? 1.7 : 2.9;
-              // 连接越多光点越密。最多 4 颗，再多就显得满屏乱飞了。
-              const count = conns > 12 ? 4 : conns > 4 ? 3 : 2;
-              return Array.from({ length: count }, (_, i) => (
-                <circle key={i} className="nm-particle" r={2.6 * k} fill="var(--accent)">
-                  <animateMotion
-                    dur={`${dur}s`}
-                    begin={`${((i * dur) / count).toFixed(2)}s`}
-                    repeatCount="indefinite"
-                    path={path}
-                  />
-                </circle>
-              ));
-            })()}
-          </>
-        )}
+        {/* 本机 → 各出口，以及出口 → 目标。
+            主出口用强调色；进程指定出口用琥珀色，没有流量时线条变淡。 */}
+        {exitPlaces.map(({ exit, x, y }) => {
+          const proc = !exit.main;
+          const path = `M ${homeXY.x} ${homeXY.y} Q ${(homeXY.x + x) / 2} ${
+            Math.min(homeXY.y, y) - 40
+          } ${x} ${y}`;
+          const dur = proc ? 3.4 : exit.conns > 8 ? 1.7 : 2.9;
+          // 连接越多光点越密。最多 4 颗，再多就显得满屏乱飞了。
+          const count = proc
+            ? exit.conns > 0
+              ? 2
+              : 0
+            : exit.conns > 12
+              ? 4
+              : exit.conns > 4
+                ? 3
+                : exit.conns > 0
+                  ? 2
+                  : 0;
+          return (
+            <g key={exit.name}>
+              <path
+                className={proc ? "nm-line proc" : "nm-line"}
+                d={path}
+                fill="none"
+                stroke={proc ? "var(--amber)" : "url(#nm-line)"}
+                strokeWidth={(proc ? 1.2 : 1.6) * k}
+                strokeDasharray={
+                  proc && exit.conns === 0 ? `${2 * k} ${4 * k}` : undefined
+                }
+                opacity={proc && exit.conns === 0 ? 0.4 : 1}
+              />
+              {count > 0 &&
+                Array.from({ length: count }, (_, i) => (
+                  <circle
+                    key={i}
+                    className={proc ? "nm-particle proc" : "nm-particle"}
+                    r={(proc ? 2 : 2.6) * k}
+                    fill={proc ? "var(--amber)" : "var(--accent)"}
+                  >
+                    <animateMotion
+                      dur={`${dur}s`}
+                      begin={`${((i * dur) / count).toFixed(2)}s`}
+                      repeatCount="indefinite"
+                      path={path}
+                    />
+                  </circle>
+                ))}
 
-        {/* 当前节点 → 连接目标（第二段）。虚线弱化处理，
-            免得和主路径抢视觉焦点。 */}
-        {activeXY &&
-          targets?.slice(0, 6).map((t) => {
-            const tp = project(t.lon, t.lat);
-            const mx = (activeXY.x + tp.x) / 2;
-            const my = (activeXY.y + tp.y) / 2 - 16;
-            return (
-              <g key={`${t.lon},${t.lat}`}>
-                <path
-                  className="nm-line second"
-                  d={`M ${activeXY.x} ${activeXY.y} Q ${mx} ${my} ${tp.x} ${tp.y}`}
-                  fill="none"
-                  stroke="var(--text-faint)"
-                  strokeWidth={1 * k}
-                  strokeDasharray={`${3 * k} ${6 * k}`}
-                  opacity={0.55}
-                />
-                {/* 命中区比可见点大，否则鼠标很难停上去 */}
-                <circle
-                  cx={tp.x}
-                  cy={tp.y}
-                  r={9 * k}
-                  fill="transparent"
-                  className="nm-hit"
-                  onMouseEnter={(e) =>
-                    setTip({
-                      x: e.clientX,
-                      y: e.clientY,
-                      rows: [
-                        { cls: "country", text: t.country },
-                        { cls: "ip", text: t.ip },
-                        ...(t.host ? [{ cls: "host", text: t.host }] : []),
-                      ],
-                    })
-                  }
-                  onMouseMove={(e) =>
-                    setTip((cur) => (cur ? { ...cur, x: e.clientX, y: e.clientY } : cur))
-                  }
-                  onMouseLeave={() => setTip(null)}
-                />
-                <circle cx={tp.x} cy={tp.y} r={2.2 * k} className="nm-target" />
-              </g>
-            );
-          })}
+              {/* 出口 → 连接目标（第二段）。虚线弱化处理，
+                  免得和主路径抢视觉焦点。 */}
+              {exit.targets.map((t) => {
+                const tp = project(t.lon, t.lat);
+                const mx = (x + tp.x) / 2;
+                const my = (y + tp.y) / 2 - 16;
+                return (
+                  <g key={`${exit.name}-${t.lon},${t.lat}`}>
+                    <path
+                      className="nm-line second"
+                      d={`M ${x} ${y} Q ${mx} ${my} ${tp.x} ${tp.y}`}
+                      fill="none"
+                      stroke={proc ? "var(--amber)" : "var(--text-faint)"}
+                      strokeWidth={1 * k}
+                      strokeDasharray={`${3 * k} ${6 * k}`}
+                      opacity={proc ? 0.4 : 0.55}
+                    />
+                    {/* 命中区比可见点大，否则鼠标很难停上去 */}
+                    <circle
+                      cx={tp.x}
+                      cy={tp.y}
+                      r={9 * k}
+                      fill="transparent"
+                      className="nm-hit"
+                      onMouseEnter={(e) =>
+                        setTip({
+                          x: e.clientX,
+                          y: e.clientY,
+                          rows: [
+                            { cls: "country", text: t.country },
+                            { cls: "ip", text: t.ip },
+                            { cls: "host", text: `出口 ${exit.name}` },
+                            ...(t.host ? [{ cls: "host", text: t.host }] : []),
+                          ],
+                        })
+                      }
+                      onMouseMove={(e) =>
+                        setTip((cur) => (cur ? { ...cur, x: e.clientX, y: e.clientY } : cur))
+                      }
+                      onMouseLeave={() => setTip(null)}
+                    />
+                    <circle
+                      cx={tp.x}
+                      cy={tp.y}
+                      r={2.2 * k}
+                      className="nm-target"
+                      style={proc ? { fill: "var(--amber)", opacity: 0.8 } : undefined}
+                    />
+                  </g>
+                );
+              })}
+            </g>
+          );
+        })}
 
         {/* 其他节点 */}
         {placed.map((p) => {
           // 激活节点可能被合并进簇里（p.x/y 是簇中心），必须按名字判断，
           // 否则当前出口在合并后高亮就丢了。
           const isActive = active ? p.names.includes(active) : false;
+          // 合并簇里只要有一个进程指定出口，就整簇标成琥珀色。
+          const procExitsHere = p.names
+            .map((n) => exitByName.get(n))
+            .filter((e): e is MapExit => Boolean(e && !e.main));
+          const isProc = !isActive && procExitsHere.length > 0;
           const d = delays?.[p.name];
           const meta = nodeMeta?.[p.name];
           const rows: Array<{ cls: string; text: string }> = [
@@ -407,13 +498,29 @@ export default function NodeMap({
               text: `${meta.type} · ${delayText(meta.delay)}`,
             });
           }
+          if (isProc) {
+            const procs = [...new Set(procExitsHere.flatMap((e) => e.procs))];
+            const count = procExitsHere.reduce((n, e) => n + e.conns, 0);
+            if (procs.length > 0) {
+              rows.push({
+                cls: "host",
+                text: `指定：${procs.slice(0, 3).join("、")}${procs.length > 3 ? "…" : ""}`,
+              });
+            }
+            rows.push({
+              cls: "host",
+              text: count > 0 ? `${count} 条连接走此出口` : "已指定，暂无流量",
+            });
+          }
           if (p.count > 1) {
             rows.push({ cls: "host", text: `附近共 ${p.count} 个节点` });
           }
           return (
             <g
               key={p.name}
-              className={isActive ? "nm-node active" : "nm-node"}
+              className={
+                isActive ? "nm-node active" : isProc ? "nm-node proc" : "nm-node"
+              }
               onClick={(e) => {
                 if (justDraggedRef.current) {
                   justDraggedRef.current = false;
@@ -433,13 +540,24 @@ export default function NodeMap({
               onMouseLeave={() => setTip(null)}
               style={{ cursor: onPick ? "pointer" : "default" }}
             >
-              <circle cx={p.x} cy={p.y} r={(isActive ? 12 : 6) * k} fill="url(#nm-glow)" />
               <circle
                 cx={p.x}
                 cy={p.y}
-                r={(isActive ? 3.6 : 2.4) * k}
+                r={(isActive ? 12 : isProc ? 9 : 6) * k}
+                fill={isProc ? "url(#nm-glow-proc)" : "url(#nm-glow)"}
+              />
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={(isActive ? 3.6 : isProc ? 3 : 2.4) * k}
                 className="nm-dot"
-                style={isActive ? undefined : { fill: delayColor(d) }}
+                style={
+                  isActive
+                    ? undefined
+                    : isProc
+                      ? { fill: "var(--amber)" }
+                      : { fill: delayColor(d) }
+                }
               />
             </g>
           );
@@ -480,7 +598,8 @@ export default function NodeMap({
           <i className="nm-swatch slow" /> 慢
         </span>
         <span>
-          <i className="nm-swatch line" /> 当前出口
+          <i className="nm-swatch line" /> 主出口
+          <i className="nm-swatch proc" /> 进程出口
         </span>
       </div>
 

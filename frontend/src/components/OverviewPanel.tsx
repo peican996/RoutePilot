@@ -58,7 +58,7 @@ export default function OverviewPanel({
           </span>
         </div>
         <div className="kv">
-          <span className="kv-k">当前节点</span>
+          <span className="kv-k">主出口节点</span>
           <span className="kv-v">{activeNode || "—"}</span>
         </div>
       </div>
@@ -112,12 +112,12 @@ export default function OverviewPanel({
 
   <div className="card">
     <div className="card-head">
-      <span className="card-title">按程序分流 · 即将解锁</span>
+      <span className="card-title">按程序分流</span>
     </div>
     <div style={{ fontSize: 12.5, color: "var(--text-dim)", lineHeight: 1.75 }}>
-      内核已开启进程识别（<span className="mono">find-process-mode: always</span>）。
-      去「连接」页可以看到每条连接对应的程序。下一步会在此基础上做学习式分流：
-      新程序首次联网时问一次，之后自动记住。
+      去「连接」页可以给每个程序单独选代理、直连、跟随规则，或指定任意节点/策略组。
+      不同程序各走不同出口时，上方地图会同时画出多条路径：主出口用蓝色，
+      进程指定出口用琥珀色。Windows 按 exe 名识别，同一个程序的多个进程共享策略。
     </div>
   </div>
     </>
