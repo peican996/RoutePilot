@@ -7,7 +7,7 @@
     python package.py            # 用默认版本 1.0.0
     python package.py 1.2.0     # 指定版本号
 
-流程：前端构建 → Go 编译（带图标）→ 打包 zip
+流程：前端构建 → 生成 Windows 资源（图标/版本）→ Go 编译 → 打包 zip
 """
 
 import os
@@ -31,11 +31,15 @@ def main() -> int:
     print(f"==> 打包 NexusLink v{version}")
 
     # 1. 前端
-    print("\n[1/4] 构建前端")
+    print("\n[1/5] 构建前端")
     run(["npm", "run", "build"], cwd=ROOT / "frontend")
 
-    # 2. Go 编译（rsrc 已把图标嵌进 rsrc_windows_amd64.syso）
-    print("\n[2/4] 编译 Go")
+    # 2. Windows 资源（exe 图标、版本信息、manifest）
+    print("\n[2/5] 生成 Windows 资源")
+    run([sys.executable, "scripts/gen-resources.py", version])
+
+    # 3. Go 编译
+    print("\n[3/5] 编译 Go")
     exe_name = "NexusLink.exe"
     run(
         [
@@ -49,8 +53,8 @@ def main() -> int:
         ]
     )
 
-    # 3. 准备发布目录
-    print("\n[3/4] 组装发布内容")
+    # 4. 准备发布目录
+    print("\n[4/5] 组装发布内容")
     if DIST.exists():
         shutil.rmtree(DIST)
     DIST.mkdir(parents=True)
@@ -88,8 +92,8 @@ def main() -> int:
 """
     (DIST / "使用说明.txt").write_text(readme, encoding="utf-8")
 
-    # 4. 压成 zip
-    print("\n[4/4] 压缩")
+    # 5. 压成 zip
+    print("\n[5/5] 压缩")
     zip_name = f"NexusLink-v{version}-win64-portable.zip"
     # 发布包统一放 release/，根目录只留源码
     release_dir = ROOT / "release"
@@ -108,23 +112,23 @@ def main() -> int:
 
     # 5. 可选：NSIS 安装包
     nsis_script = ROOT / "nexuslink-installer.nsi"
-    if nsis_script.exists():
+    makensis = shutil.which("makensis")
+    if nsis_script.exists() and makensis:
         try:
             subprocess.run(
-                ["makensis", "/V2", str(nsis_script)],
+                [makensis, f"/DAPP_VERSION={version}", "/V2", str(nsis_script)],
                 cwd=ROOT,
                 check=True,
-                shell=(os.name == "nt"),
                 capture_output=True,
             )
             setup = ROOT / f"NexusLink-{version}-setup.exe"
             if setup.exists():
                 mb = setup.stat().st_size / 1024 / 1024
                 print(f"    安装包: {setup.name}  ({mb:.1f} MB)")
-        except FileNotFoundError:
-            print("    [跳过] 未安装 makensis，不生成安装包")
         except subprocess.CalledProcessError as e:
             print(f"    [跳过] NSIS 打包失败: {e}")
+    elif nsis_script.exists():
+        print("    [跳过] 未安装 makensis，不生成安装包")
 
     return 0
 

@@ -1,17 +1,17 @@
 {
 	"fixed": {
-		"file_version": "0.1.0",
-		"product_version": "0.1.0"
+		"file_version": "1.6.0",
+		"product_version": "1.6.0"
 	},
 	"info": {
 		"0409": {
-			"FileVersion": "0.1.0",
-			"ProductVersion": "0.1.0",
-			"CompanyName": "My Company",
-			"FileDescription": "A proxdeck application",
-			"LegalCopyright": "© 2026, My Company",
-			"ProductName": "ProxDeck",
-			"Comments": "This is a comment"
+			"FileVersion": "1.6.0",
+			"ProductVersion": "1.6.0",
+			"CompanyName": "NexusLink Project",
+			"FileDescription": "NexusLink",
+			"LegalCopyright": "© 2026, NexusLink Project",
+			"ProductName": "NexusLink",
+			"Comments": "按程序分流的 Windows 代理控制台"
 		}
 	}
 }

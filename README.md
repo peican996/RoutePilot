@@ -39,7 +39,7 @@ NexusLink 把进程名直接暴露到界面上：连接列表带进程、进程�
 ## 技术栈
 
 - **后端**：Go 1.26、Wails v3、Windows 注册表 / Job Object / UAC
-- **前端**：React 19、TypeScript、Vite、纯 SVG 图表（不引图表库）
+- **前端**：React 18、TypeScript、Vite、纯 SVG 图表（不引图表库）
 - **内核**：[mihomo](https://github.com/MetaCubeX/mihomo)（独立进程，通过外部控制 API 通信）
 
 ## 快速开始
@@ -114,12 +114,17 @@ wails3 dev                     # 后端 + WebView 联调
 
 ```
 %APPDATA%\NexusLink\
-├── config.yaml           # 由订阅生成的运行时配置
-├── sub.json / sub-*.yaml # 订阅列表与各订阅原文
-├── app-state.json        # 模式、TUN、窗口位置、本机坐标
-├── process-rules.json    # 进程分流规则
-├── cache.db              # 流量历史
-└── bin\                  # 释放出来的内核
+├── config.yaml              # 由订阅生成的运行时配置
+├── subs.json / sub-*.yaml   # 多订阅列表与各订阅原文
+├── app-state.json           # 模式、TUN、窗口位置、本机坐标
+├── proxy.json               # 接管系统代理前的原始设置
+├── process-rules.json       # 进程分流规则
+├── process-direct.yaml / process-proxy.yaml  # 进程规则 provider
+├── process-ignored.json     # 用户选择不再提示的进程
+├── traffic-history.json     # 分钟级流量历史（保留 7 天）
+├── geoip.metadb / geosite.dat  # 内置地理数据
+├── debug.log / kernel.log   # 运行日志
+└── bin\                     # 释放出来的内核与 wintun.dll
 ```
 
 旧版本（`ProxDeck`）的数据会在首次启动时自动迁移。
@@ -127,7 +132,8 @@ wails3 dev                     # 后端 + WebView 联调
 ## 隐私
 
 - 无遥测、无统计上报、无账号体系
-- 除订阅地址与内核升级检查外，不主动发起任何网络请求
+- 除订阅地址、内核升级检查、代理链路健康检查和节点测速外，不主动发起网络请求
+- 健康检查与测速会按当前模式请求固定的 `generate_204` 端点，用于判断链路是否可用
 - 订阅、规则、历史全部保存在本机 `%APPDATA%`，不上传
 - GeoIP 查询使用内置离线数据库，不依赖在线接口
 

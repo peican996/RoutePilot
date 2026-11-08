@@ -6,8 +6,11 @@
 !include "FileFunc.nsh"
 
 ; ---- 基本信息 ----
+; 版本号可由 package.py 通过 /DAPP_VERSION=x.y.z 覆盖，避免两处硬编码不同步
+!ifndef APP_VERSION
+  !define APP_VERSION "1.0.0"
+!endif
 !define APP_NAME "NexusLink"
-!define APP_VERSION "1.3.1"
 !define APP_PUBLISHER "NexusLink Project"
 !define APP_EXE "NexusLink.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
@@ -24,7 +27,9 @@ RequestExecutionLevel admin
 !define MUI_UNICON "build\appicon.ico"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
+; 仓库里的许可证文件是 LICENSE（无扩展名），这里必须写实际路径，
+; 否则 makensis 会因找不到 LICENSE.txt 直接失败。
+!insertmacro MUI_PAGE_LICENSE "LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH

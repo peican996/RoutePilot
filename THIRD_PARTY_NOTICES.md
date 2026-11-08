@@ -54,4 +54,12 @@ cd frontend && npx license-checker --summary
 
 ## 字体与图标
 
-界面使用系统字体，未内嵌字体文件。应用图标为项目自制，随本项目以 GPL-3.0 发布。
+界面内嵌以下字体（`frontend/public/fonts`），均为 **SIL Open Font License 1.1**：
+
+| 字体 | 来源 |
+|---|---|
+| Orbitron | https://github.com/theleagueof/orbitron |
+| Rajdhani | https://github.com/itfoundry/rajdhani |
+| JetBrains Mono | https://github.com/JetBrains/JetBrainsMono |
+
+应用图标为项目自制，随本项目以 GPL-3.0 发布。字体许可证全文见各上游仓库的 `OFL.txt`。

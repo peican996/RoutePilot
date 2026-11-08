@@ -1,7 +1,11 @@
 ﻿# NexusLink 本地构建脚本（只生成 exe，不打 zip）
 # 用法：.\build.ps1                 默认走官方源
 #       .\build.ps1 -ChinaMirror    走国内镜像（goproxy.cn / npmmirror）
-param([switch]$ChinaMirror)
+#       .\build.ps1 -Version 1.2.3  指定写进 exe 版本信息的版本号
+param(
+    [switch]$ChinaMirror,
+    [string]$Version = "1.6.0"
+)
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -36,7 +40,7 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
     if ($LASTEXITCODE -ne 0) { throw "内嵌资源不完整，按上面的提示补齐后重试。" }
 }
 
-Write-Host "[1/3] 构建前端..." -ForegroundColor Cyan
+Write-Host "[1/4] 构建前端..." -ForegroundColor Cyan
 Push-Location frontend
 try {
     if (Test-Path package-lock.json) {
@@ -51,11 +55,15 @@ try {
     Pop-Location
 }
 
-Write-Host "[2/3] 编译 Go 应用..." -ForegroundColor Cyan
+Write-Host "[2/4] 生成 Windows 资源（图标/版本信息）..." -ForegroundColor Cyan
+python scripts/gen-resources.py $Version
+if ($LASTEXITCODE -ne 0) { throw "Windows 资源生成失败" }
+
+Write-Host "[3/4] 编译 Go 应用..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path bin | Out-Null
 go build -ldflags "-s -w -H windowsgui" -o bin\NexusLink.exe .
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
-Write-Host "[3/3] 完成 -> bin\NexusLink.exe" -ForegroundColor Green
+Write-Host "[4/4] 完成 -> bin\NexusLink.exe" -ForegroundColor Green
 $size = [math]::Round((Get-Item bin\NexusLink.exe).Length / 1MB, 1)
 Write-Host "      体积 $size MB" -ForegroundColor Green

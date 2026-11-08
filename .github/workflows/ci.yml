@@ -41,5 +41,16 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+      # gofmt 不通过就失败，避免格式问题长期累积
+      - name: Go format
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请运行 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Go test
         run: go test ./...
