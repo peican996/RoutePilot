@@ -164,3 +164,61 @@ func TestBuildDefaultRulesUseProviderGroup(t *testing.T) {
 		t.Fatalf("兜底规则应指向 provider 组，实际 %q", last)
 	}
 }
+
+func TestBuildProcessTargets(t *testing.T) {
+	base := map[string]any{
+		"proxies": []any{map[string]any{"name": "NodeA", "type": "ss"}},
+		"proxy-groups": []any{
+			map[string]any{"name": "节点选择", "type": "select", "proxies": []any{"NodeA"}},
+		},
+		"rules": []any{"MATCH,节点选择"},
+	}
+	const hidden = ProcessGroupPrefix + "abc"
+	opts := Options{
+		Base:               base,
+		ProcessRules:       true,
+		ProcessGroups:      []map[string]any{{"name": hidden, "type": "select", "proxies": []any{"NodeA"}}},
+		ProcessCustomRules: []string{"PROCESS-NAME,chrome.exe," + hidden},
+	}
+	cfg := Build(opts)
+
+	groups, ok := cfg["proxy-groups"].([]any)
+	if !ok {
+		t.Fatalf("proxy-groups 类型异常：%T", cfg["proxy-groups"])
+	}
+	found := false
+	for _, g := range groups {
+		if m, ok := g.(map[string]any); ok && m["name"] == hidden {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("缺少隐藏策略组 %s：%v", hidden, groups)
+	}
+
+	rules, _ := cfg["rules"].([]any)
+	customIdx, matchIdx := -1, -1
+	for i, r := range rules {
+		if r == "PROCESS-NAME,chrome.exe,"+hidden {
+			customIdx = i
+		}
+		if r == "MATCH,节点选择" {
+			matchIdx = i
+		}
+	}
+	if customIdx < 0 || matchIdx < 0 || customIdx >= matchIdx {
+		t.Fatalf("自定义进程规则位置不对：%v", rules)
+	}
+}
+
+func TestMainProxyGroupSkipsProcessGroups(t *testing.T) {
+	cfg := map[string]any{
+		"proxy-groups": []any{
+			map[string]any{"name": ProcessGroupPrefix + "abc", "type": "select", "proxies": []any{"a", "b", "c"}},
+			map[string]any{"name": "节点选择", "type": "select", "proxies": []any{"a"}},
+		},
+	}
+	if got := MainProxyGroup(cfg); got != "节点选择" {
+		t.Fatalf("隐藏进程组不应成为主策略组，实际 %q", got)
+	}
+}

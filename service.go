@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -46,6 +47,10 @@ type proxyBackup struct {
 
 const proxyStateFile = "proxy.json"
 
+// processTargetPrefix 是进程规则里"指定节点/策略组"的值前缀。
+// 例：target:NodeA。direct / proxy / follow 仍用原来的短值。
+const processTargetPrefix = "target:"
+
 // CoreService 是暴露给前端的唯一入口。所有方法都会生成 TypeScript 绑定。
 type CoreService struct {
 	app *application.App
@@ -85,6 +90,10 @@ type CoreService struct {
 	subConfig map[string]any
 	subInfo   SubInfo
 	subRaw    []byte // 机场返回的原始内容，用来判断自动更新后配置有没有真变化
+	// 当前订阅里可作为"进程指定出口"的目标：显式节点名、策略组名，
+	// 以及 provider 名称（provider 节点要在内核里按 provider 选择）。
+	subTargets   map[string]bool
+	subProviders []string
 
 	// 多订阅列表。subs[i] 是第 i 个订阅的元信息，activeIdx 指向正在用的那个。
 	subs      []subMeta
@@ -470,15 +479,139 @@ func (s *CoreService) options() configgen.Options {
 	// TUN 改不动配置，界面显示和实际行为会脱节。
 	wantTUN := s.tunOn && elevate.IsElevated()
 
+	plan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+
 	return configgen.Options{
-		MixedPort:    s.mixedPort,
-		APIPort:      s.apiPort,
-		DNSListen:    s.dnsPort,
-		Secret:       s.secret,
-		Mode:         mode,
-		Tun:          wantTUN,
-		ProcessRules: true,
-		Base:         s.subConfig,
+		MixedPort:          s.mixedPort,
+		APIPort:            s.apiPort,
+		DNSListen:          s.dnsPort,
+		Secret:             s.secret,
+		Mode:               mode,
+		Tun:                wantTUN,
+		ProcessRules:       true,
+		ProcessCustomRules: plan.Rules,
+		ProcessGroups:      plan.Groups,
+		Base:               s.subConfig,
+	}
+}
+
+// processTargetSelection 描述一个需要在内核就绪后执行的组选择。
+type processTargetSelection struct {
+	Group          string
+	Target         string
+	ProviderBacked bool
+}
+
+type processTargetPlan struct {
+	Groups     []map[string]any
+	Rules      []string
+	Selections []processTargetSelection
+}
+
+// processTargetGroupName 为"进程指定出口"生成稳定的隐藏组名。
+// 用目标名哈希而不是直接拼名字，避免逗号、中文等字符影响规则结构。
+func processTargetGroupName(target string) string {
+	sum := sha256.Sum256([]byte(target))
+	return configgen.ProcessGroupPrefix + hex.EncodeToString(sum[:4])
+}
+
+// buildProcessTargetPlan 把进程规则映射成隐藏策略组 + PROCESS-NAME 规则。
+//
+// 目标分两类：
+//   - 显式节点/策略组：配置解析阶段就存在，组里直接放 [target] 即可。
+//   - provider 节点：解析阶段还不存在，组用 use 引用 provider，等内核
+//     启动后再通过 API 把组选到目标节点；失败时回退 DIRECT。
+func buildProcessTargetPlan(rules map[string]string, targets map[string]bool, providers []string) processTargetPlan {
+	plan := processTargetPlan{}
+	if len(rules) == 0 {
+		return plan
+	}
+
+	procs := make([]string, 0, len(rules))
+	for proc := range rules {
+		procs = append(procs, proc)
+	}
+	sort.Strings(procs)
+
+	groupsByTarget := map[string]bool{}
+	for _, proc := range procs {
+		policy := rules[proc]
+		if !strings.HasPrefix(policy, processTargetPrefix) {
+			continue
+		}
+		target := strings.TrimSpace(strings.TrimPrefix(policy, processTargetPrefix))
+		if target == "" || strings.HasPrefix(target, configgen.ProcessGroupPrefix) {
+			continue
+		}
+		if sanitizeProcName(proc) == "" {
+			continue
+		}
+
+		group := processTargetGroupName(target)
+		if !groupsByTarget[target] {
+			g := map[string]any{"name": group, "type": "select"}
+			if targets[target] {
+				g["proxies"] = []any{target}
+				plan.Selections = append(plan.Selections, processTargetSelection{Group: group, Target: target})
+			} else if len(providers) > 0 {
+				// provider 节点：先放 DIRECT 兜底，再引用所有 provider；
+				// 内核就绪后选到具体节点，选不中就退回 DIRECT。
+				use := make([]any, 0, len(providers))
+				for _, p := range providers {
+					use = append(use, p)
+				}
+				g["proxies"] = []any{"DIRECT"}
+				g["use"] = use
+				plan.Selections = append(plan.Selections, processTargetSelection{
+					Group: group, Target: target, ProviderBacked: true,
+				})
+			} else {
+				// 目标已不存在且没有 provider 兜底，忽略，进程回到跟随规则。
+				continue
+			}
+			plan.Groups = append(plan.Groups, g)
+			groupsByTarget[target] = true
+		}
+		plan.Rules = append(plan.Rules, fmt.Sprintf("PROCESS-NAME,%s,%s", proc, group))
+	}
+	return plan
+}
+
+// reloadConfig 让内核重新读取生成的配置，不重启进程。
+func (s *CoreService) reloadConfig(path string) error {
+	if s.api == nil {
+		return fmt.Errorf("内核 API 未就绪")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return s.api.ReloadConfig(ctx, path)
+}
+
+// selectProcessTargets 把 provider 支撑的隐藏组选到具体节点。
+// 显式节点/组在配置里只有单个成员，会自动选中；这里统一补一次，
+// 失败时 provider 组退回 DIRECT，避免悄悄用第一个节点。
+func (s *CoreService) selectProcessTargets() {
+	if s.api == nil || s.mgr == nil || !s.mgr.IsRunning() {
+		return
+	}
+	s.mu.RLock()
+	plan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+	s.mu.RUnlock()
+	if len(plan.Selections) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, sel := range plan.Selections {
+		if err := s.api.Select(ctx, sel.Group, sel.Target); err != nil {
+			s.dbg("select process target %s -> %s failed: %v", sel.Group, sel.Target, err)
+			if sel.ProviderBacked {
+				if fallbackErr := s.api.Select(ctx, sel.Group, "DIRECT"); fallbackErr != nil {
+					s.dbg("fallback process target %s -> DIRECT failed: %v", sel.Group, fallbackErr)
+				}
+			}
+		}
 	}
 }
 
@@ -544,6 +677,10 @@ func (s *CoreService) afterStart() {
 		} else if wantProxy {
 			_ = s.SetSystemProxy(true)
 		}
+
+		// 进程指定到 provider 节点的隐藏组需要显式选中；
+		// 显式节点组也会统一补一次，保证与持久化映射一致。
+		s.selectProcessTargets()
 	}()
 }
 
@@ -1477,7 +1614,8 @@ func (s *CoreService) Mode() string {
 func pickSelectorGroup(proxies map[string]kernel.Proxy, mustContain string) string {
 	names := make([]string, 0, len(proxies))
 	for name, p := range proxies {
-		if p.Type != "Selector" || builtinGroupNames[name] {
+		if p.Type != "Selector" || builtinGroupNames[name] ||
+			strings.HasPrefix(name, configgen.ProcessGroupPrefix) {
 			continue
 		}
 		if mustContain != "" {
@@ -2249,6 +2387,7 @@ func (s *CoreService) SwitchSubscription(idx int) error {
 	s.subConfig = res.Config
 	s.subRaw = b
 	s.subInfo = info
+	s.subTargets, s.subProviders = subscriptionTargets(res)
 	s.mu.Unlock()
 
 	s.saveSubs()
@@ -2363,6 +2502,8 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
 		s.subConfig = nil
 		s.subRaw = nil
 		s.subInfo = SubInfo{}
+		s.subTargets = nil
+		s.subProviders = nil
 	} else if wasActive {
 		s.activeIdx = 0
 	} else if idx < s.activeIdx {
@@ -2443,6 +2584,22 @@ func subInfoFromResult(m subMeta, res *subscription.Result) SubInfo {
 	return info
 }
 
+// subscriptionTargets 汇总当前订阅可用的进程出口目标。
+// base64 订阅的节点来自 provider，不能在配置解析阶段直接写进组，
+// 只能记录策略组；节点目标交给 provider 支撑的隐藏组处理。
+func subscriptionTargets(res *subscription.Result) (map[string]bool, []string) {
+	targets := make(map[string]bool, len(res.Nodes)+len(res.Groups))
+	if res.Format != "base64" {
+		for _, n := range res.Nodes {
+			targets[n.Name] = true
+		}
+	}
+	for _, g := range res.Groups {
+		targets[g] = true
+	}
+	return targets, append([]string(nil), res.Providers...)
+}
+
 // loadSavedSubscription 读取上次落盘的订阅，让应用离线也能直接起。
 func (s *CoreService) loadSavedSubscription() {
 	dir := dataDir()
@@ -2498,6 +2655,7 @@ func (s *CoreService) loadSavedSubscription() {
 	s.subConfig = res.Config
 	s.subRaw = cb
 	s.subInfo = info
+	s.subTargets, s.subProviders = subscriptionTargets(res)
 	s.mu.Unlock()
 }
 
@@ -2565,6 +2723,7 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
 	s.subConfig = res.Config
 	s.subRaw = res.Raw
 	s.subInfo = subInfoFromResult(meta, res)
+	s.subTargets, s.subProviders = subscriptionTargets(res)
 	s.mu.Unlock()
 
 	s.saveSubs()
@@ -2668,6 +2827,10 @@ func (s *CoreService) Nodes() ([]NodeView, error) {
 		"Selector": true, "URLTest": true, "Fallback": true, "LoadBalance": true,
 	}
 	for _, p := range proxies {
+		// 进程自定义出口的隐藏组不当作普通策略组展示。
+		if strings.HasPrefix(p.Name, configgen.ProcessGroupPrefix) {
+			continue
+		}
 		delay := 0
 		if len(p.History) > 0 {
 			delay = p.History[len(p.History)-1].Delay
@@ -2960,9 +3123,10 @@ func (s *CoreService) writeProcRulesYAML() error {
 
 	var proxyList, directList []string
 	for proc, policy := range snapshot {
-		if policy == "proxy" {
+		switch policy {
+		case "proxy":
 			proxyList = append(proxyList, proc)
-		} else {
+		case "direct":
 			directList = append(directList, proc)
 		}
 	}
@@ -3269,7 +3433,8 @@ func (s *CoreService) ProcessRules() map[string]string {
 }
 
 // SetProcessRule 设置某个程序的分流策略。
-// policy 取 "proxy" / "direct" / "follow"（follow 表示删除该记录、回到订阅规则）。
+// policy 取 "proxy" / "direct" / "follow"，或 "target:<节点/策略组名>"。
+// follow 表示删除该记录、回到订阅规则。
 //
 // 返回值是"补断开的旧连接条数"。mihomo 只在建连那一刻匹配规则，已建立的
 // 连接不会重新判定，所以改完策略必须把该进程的老连接掐掉，用户才能立刻看到效果。
@@ -3278,13 +3443,22 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 	if proc == "" {
 		return 0, fmt.Errorf("进程名为空或含有非法字符")
 	}
-	switch policy {
-	case "proxy", "direct":
-	case "follow", "":
+
+	target := ""
+	switch {
+	case policy == "proxy" || policy == "direct":
+	case policy == "follow" || policy == "":
 		policy = "follow"
+	case strings.HasPrefix(policy, processTargetPrefix):
+		target = strings.TrimSpace(strings.TrimPrefix(policy, processTargetPrefix))
+		if err := s.validateProcessTarget(target); err != nil {
+			return 0, err
+		}
+		policy = processTargetPrefix + target
 	default:
 		return 0, fmt.Errorf("不支持的策略: %s", policy)
 	}
+
 	if policy == "proxy" {
 		s.mu.RLock()
 		group := configgen.MainProxyGroup(s.subConfig)
@@ -3292,6 +3466,13 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 		if group == "" {
 			return 0, fmt.Errorf("还没有可用节点，请先添加订阅")
 		}
+	}
+
+	s.mu.RLock()
+	oldPolicy := s.procRules[proc]
+	s.mu.RUnlock()
+	if oldPolicy == policy {
+		return 0, nil
 	}
 
 	s.mu.Lock()
@@ -3320,23 +3501,85 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 		return 0, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
+	// 只要变更涉及"指定节点"，就必须改 proxy-groups / rules，
+	// 通过配置重载生效；纯 direct/proxy 仍走 provider 热刷新。
+	targetInvolved := strings.HasPrefix(oldPolicy, processTargetPrefix) ||
+		strings.HasPrefix(policy, processTargetPrefix)
+	if targetInvolved {
+		confPath, err := configgen.Write(dataDir(), s.options())
+		if err != nil {
+			return 0, fmt.Errorf("规则已保存，但生成配置失败: %w", err)
+		}
+		if err := s.reloadConfig(confPath); err != nil {
+			s.dbg("reload config failed, fallback to kernel restart: %v", err)
+			if restartErr := s.RestartKernel(); restartErr != nil {
+				return 0, fmt.Errorf("规则已保存，但重载内核失败: %v（重启也失败: %w）", err, restartErr)
+			}
+		}
+		s.selectProcessTargets()
+		return s.closeProcessConnections(proc), nil
+	}
 
 	// 热刷新：只重新加载这两个 rule-provider，不重载整个配置，
 	// 已经建立的连接一条都不会断。
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
 	for _, name := range []string{procDirectProv, procProxyProv} {
 		if err := s.api.UpdateRuleProvider(ctx, name); err != nil {
 			return 0, fmt.Errorf("规则已保存，但热刷新失败（重启内核可生效）: %w", err)
 		}
 	}
+	return s.closeProcessConnections(proc), nil
+}
 
-	// 规则先生效，再把该进程的旧连接掐掉。这样浏览器自动重连时就是新规则，
-	// 用户基本无感——比让他自己点「全部断开」靠谱得多。
+// validateProcessTarget 校验指定出口是否存在。
+// 内核没运行时只能依据当前订阅解析结果判断。
+func (s *CoreService) validateProcessTarget(target string) error {
+	if target == "" {
+		return fmt.Errorf("指定的节点名为空")
+	}
+	if strings.ContainsAny(target, "\n\r\t\x00") {
+		return fmt.Errorf("节点名含有非法字符")
+	}
+	if strings.HasPrefix(target, configgen.ProcessGroupPrefix) {
+		return fmt.Errorf("不能把进程指向内部隐藏策略组")
+	}
+
+	if s.api != nil && s.mgr != nil && s.mgr.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		proxies, _, err := s.allProxies(ctx)
+		if err != nil {
+			return fmt.Errorf("读取节点列表失败: %w", err)
+		}
+		if _, ok := proxies[target]; !ok {
+			return fmt.Errorf("找不到节点或策略组: %s", target)
+		}
+		return nil
+	}
+
+	s.mu.RLock()
+	explicit := s.subTargets[target]
+	hasProvider := len(s.subProviders) > 0
+	s.mu.RUnlock()
+	if !explicit && !hasProvider {
+		return fmt.Errorf("找不到节点或策略组: %s", target)
+	}
+	return nil
+}
+
+// closeProcessConnections 掐掉某个进程的旧连接，让新规则立即生效。
+func (s *CoreService) closeProcessConnections(proc string) int {
+	if s.api == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
 	closed := 0
 	resp, err := s.api.Connections(ctx)
 	if err != nil {
-		return closed, nil
+		return 0
 	}
 	for _, c := range resp.Connections {
 		name := c.Metadata.Process
@@ -3351,5 +3594,5 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 		}
 	}
 	s.invalidateConnCache()
-	return closed, nil
+	return closed
 }

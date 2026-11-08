@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ type Result struct {
 	// 落盘给内核 file provider 用：mihomo 的 base64 解码不接受首尾空白，
 	// 直接喂原始 base64 很容易因换行失败，喂解码后的 URI 行最稳。
 	ProviderContent []byte     `json:"-"`
+	Providers       []string   `json:"providers"`
 	Nodes           []NodeInfo `json:"nodes"`
 	Groups          []string   `json:"groups"`
 	Rules           int        `json:"rules"`
@@ -244,6 +246,7 @@ func Parse(body []byte, subURL string, allowInsecure bool) (*Result, error) {
 			res.ProviderContent = []byte(strings.Join(uris, "\n"))
 			res.Nodes = nodesFromURIs(uris)
 			res.Groups = []string{"节点选择"}
+			res.Providers = []string{"nexuslink"}
 			return res, nil
 		}
 	}
@@ -255,6 +258,7 @@ func Parse(body []byte, subURL string, allowInsecure bool) (*Result, error) {
 		res.ProviderContent = []byte(strings.Join(uris, "\n"))
 		res.Nodes = nodesFromURIs(uris)
 		res.Groups = []string{"节点选择"}
+		res.Providers = []string{"nexuslink"}
 		return res, nil
 	}
 
@@ -338,6 +342,15 @@ func collectClashMeta(res *Result, cfg map[string]any) {
 
 	if arr, ok := cfg["rules"].([]any); ok {
 		res.Rules = len(arr)
+	}
+
+	// 记录 proxy-providers 名称：进程指定到 provider 节点时，
+	// 需要用它生成隐藏 select 组。
+	if providers, ok := cfg["proxy-providers"].(map[string]any); ok {
+		for name := range providers {
+			res.Providers = append(res.Providers, name)
+		}
+		sort.Strings(res.Providers)
 	}
 }
 

@@ -1073,6 +1073,7 @@ export default function App() {
           {tab === "connections" && (
             <ConnectionsPanel
               conns={conns}
+              nodes={nodes}
               procRules={procRules}
               running={running}
               busy={busy}

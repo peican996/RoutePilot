@@ -234,6 +234,13 @@ func (c *Client) UpdateRuleProvider(ctx context.Context, name string) error {
 	return c.do(ctx, http.MethodPut, "/providers/rules/"+url.PathEscape(name), nil, nil)
 }
 
+// ReloadConfig 让内核重新读取配置文件。force=true 会强制重建，
+// 用于"进程 → 指定节点"这类必须改 rules / proxy-groups 的变更；
+// 不重启内核进程。
+func (c *Client) ReloadConfig(ctx context.Context, path string) error {
+	return c.do(ctx, http.MethodPut, "/configs?force=true", map[string]string{"path": path}, nil)
+}
+
 // ---------- 代理 provider ----------
 
 // ProviderProxies 返回每个 proxy-provider 解析出来的节点。

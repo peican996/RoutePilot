@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -24,6 +25,15 @@ type Options struct {
 	// 规则内容由上层动态写文件，改完通过 API 热刷新，不重载整个配置。
 	ProcessRules bool
 
+	// ProcessCustomRules 是"进程 → 指定节点/策略组"的直接规则，例如
+	// PROCESS-NAME,chrome.exe,nx-pp-xxxx。改这部分需要重载配置，
+	// 但不需要重启内核进程。
+	ProcessCustomRules []string
+
+	// ProcessGroups 是这些自定义规则指向的隐藏 select 组。
+	// 组名统一带 nx-pp- 前缀，界面上不作为普通策略组展示。
+	ProcessGroups []map[string]any
+
 	// Base 是订阅解析出来的原始配置。为空时退化为一份最小可用的直连配置。
 	Base map[string]any
 }
@@ -42,6 +52,10 @@ func (o *Options) applyDefaults() {
 		o.Mode = "rule"
 	}
 }
+
+// ProcessGroupPrefix 是进程自定义出口的隐藏策略组前缀。
+// 这类组是内部实现，不应出现在普通策略组列表里。
+const ProcessGroupPrefix = "nx-pp-"
 
 // defaultGroups 在没有订阅时提供最小可用的策略组，
 // 避免内核因为找不到引用的 proxy group 而拒绝启动。
@@ -194,6 +208,21 @@ func Build(o Options) map[string]any {
 	if _, ok := cfg["proxy-groups"]; !ok {
 		cfg["proxy-groups"] = defaultGroups()
 	}
+	// 进程自定义出口的隐藏组追加在订阅组之后。
+	if len(o.ProcessGroups) > 0 {
+		groups, _ := cfg["proxy-groups"].([]any)
+		if groups == nil {
+			if typed, ok := cfg["proxy-groups"].([]map[string]any); ok {
+				for _, g := range typed {
+					groups = append(groups, g)
+				}
+			}
+		}
+		for _, g := range o.ProcessGroups {
+			groups = append(groups, g)
+		}
+		cfg["proxy-groups"] = groups
+	}
 
 	// 规则统一成 []any，方便在后面插入进程分流规则。
 	var rules []any
@@ -232,6 +261,12 @@ func Build(o Options) map[string]any {
 				"type": "file", "behavior": "classical", "path": "./process-proxy.yaml",
 			}
 			prepend = append(prepend, fmt.Sprintf("RULE-SET,pp-proxy,%s", group))
+		}
+
+		// "进程 → 指定节点/组"的直接规则必须排在自己的 direct/proxy
+		// 规则之后、订阅规则之前；每条自带策略，不需要额外 provider。
+		for _, rule := range o.ProcessCustomRules {
+			prepend = append(prepend, rule)
 		}
 
 		// 合并而不是覆盖。订阅规则里经常有 RULE-SET 引用它自己的 rule-provider，
@@ -305,7 +340,7 @@ func MainProxyGroup(cfg map[string]any) string {
 			continue
 		}
 		name, _ := m["name"].(string)
-		if name == "" || builtinGroups[name] {
+		if name == "" || builtinGroups[name] || strings.HasPrefix(name, ProcessGroupPrefix) {
 			continue
 		}
 		proxies, _ := m["proxies"].([]any)

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import type { Conn } from "../types";
+import type { Conn, NodeView } from "../types";
 import { CONN_PAGE_SIZE, PROC_LIST_MAX } from "../constants";
 import { fmtBytes, fmtDuration } from "../utils";
 
@@ -9,6 +9,7 @@ type SortKey = "" | "up" | "down";
 
 type Props = {
   conns: Conn[];
+  nodes: NodeView[];
   procRules: Record<string, string>;
   running: boolean;
   busy: boolean;
@@ -23,9 +24,24 @@ const POLICIES: Array<[Policy, string]> = [
   ["follow", "跟随规则"],
 ];
 
+// 内置组直接选没有意义（DIRECT 已由「直连」覆盖），列表里过滤掉。
+const BUILTIN = new Set([
+  "GLOBAL",
+  "DIRECT",
+  "REJECT",
+  "REJECT-DROP",
+  "COMPATIBLE",
+  "PASS",
+  "PASS-RULE",
+  "PROXY",
+]);
+
+const TARGET_PREFIX = "target:";
+
 /** 连接面板：进程策略 + 活动连接表。 */
 export default function ConnectionsPanel({
   conns,
+  nodes,
   procRules,
   running,
   busy,
@@ -60,6 +76,16 @@ export default function ConnectionsPanel({
     if (!q) return procs;
     return procs.filter(([name]) => name.toLowerCase().includes(q));
   }, [procs, procFilter]);
+
+  // 进程「指定节点」下拉的可选目标：策略组排前面，节点排后面。
+  const groupChoices = useMemo(
+    () => nodes.filter((n) => n.group && !BUILTIN.has(n.name)),
+    [nodes],
+  );
+  const nodeChoices = useMemo(
+    () => nodes.filter((n) => !n.group && !BUILTIN.has(n.name)),
+    [nodes],
+  );
 
   // 默认沿用后端顺序，点表头才按流量排
   const sortedConns = useMemo(() => {
@@ -121,26 +147,68 @@ export default function ConnectionsPanel({
           </div>
         ) : (
           <div className="proc-list">
-            {filteredProcs.slice(0, PROC_LIST_MAX).map(([name, count]) => (
-              <div className="proc-row" key={name}>
-                <span className="proc-name" title={name}>
-                  {name}
-                </span>
-                <span className="proc-count">{count > 0 ? `${count} 连接` : "未运行"}</span>
-                <div className="segmented sm">
-                  {POLICIES.map(([p, label]) => (
-                    <button
-                      key={p}
-                      className={(procRules[name] ?? "follow") === p ? "active" : ""}
-                      onClick={() => onSetProc(name, p)}
-                      disabled={busy}
-                    >
-                      {label}
-                    </button>
-                  ))}
+            {filteredProcs.slice(0, PROC_LIST_MAX).map(([name, count]) => {
+              const value = procRules[name] ?? "follow";
+              const isTarget = value.startsWith(TARGET_PREFIX);
+              const target = isTarget ? value.slice(TARGET_PREFIX.length) : "";
+              const targetValid = isTarget && nodes.some((n) => n.name === target);
+              const activePolicy = isTarget ? "" : value;
+              return (
+                <div className="proc-row" key={name}>
+                  <span className="proc-name" title={name}>
+                    {name}
+                  </span>
+                  <span className="proc-count">{count > 0 ? `${count} 连接` : "未运行"}</span>
+                  <div className="segmented sm">
+                    {POLICIES.map(([p, label]) => (
+                      <button
+                        key={p}
+                        className={activePolicy === p ? "active" : ""}
+                        onClick={() => onSetProc(name, p)}
+                        disabled={busy}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <select
+                    className="input"
+                    style={{ width: 118, flexShrink: 0 }}
+                    value={isTarget ? value : ""}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      if (next) onSetProc(name, next);
+                    }}
+                    disabled={busy}
+                    title="指定该程序使用的节点或策略组"
+                  >
+                    <option value="">指定节点…</option>
+                    {isTarget && <option value="follow">取消指定（跟随规则）</option>}
+                    {isTarget && !targetValid && (
+                      <option value={value}>{`已失效：${target}`}</option>
+                    )}
+                    {groupChoices.length > 0 && (
+                      <optgroup label="策略组">
+                        {groupChoices.map((g) => (
+                          <option key={`g-${g.name}`} value={`${TARGET_PREFIX}${g.name}`}>
+                            {g.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {nodeChoices.length > 0 && (
+                      <optgroup label="节点">
+                        {nodeChoices.map((n) => (
+                          <option key={`n-${n.name}`} value={`${TARGET_PREFIX}${n.name}`}>
+                            {n.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

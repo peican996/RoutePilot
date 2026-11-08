@@ -16,6 +16,10 @@ proxies:
 proxy-groups:
   - name: PROXY
     type: select
+proxy-providers:
+  airport:
+    type: http
+    url: https://example.com/provider
 rules:
   - MATCH,PROXY
 `)
@@ -28,6 +32,9 @@ rules:
 	}
 	if len(res.Nodes) != 2 || len(res.Groups) != 1 || res.Rules != 1 {
 		t.Fatalf("统计不符：nodes=%d groups=%d rules=%d", len(res.Nodes), len(res.Groups), res.Rules)
+	}
+	if len(res.Providers) != 1 || res.Providers[0] != "airport" {
+		t.Fatalf("应记录 Clash provider：%v", res.Providers)
 	}
 	if res.Config == nil {
 		t.Fatal("Clash 订阅应保留原始配置")
@@ -51,6 +58,9 @@ func TestParseBase64NodeList(t *testing.T) {
 	}
 	if res.Nodes[0].Name != "Node1" || res.Nodes[0].Type != "trojan" {
 		t.Fatalf("节点元信息不符：%+v", res.Nodes[0])
+	}
+	if len(res.Providers) != 1 || res.Providers[0] != "nexuslink" {
+		t.Fatalf("base64 订阅应记录 provider：%v", res.Providers)
 	}
 	if !strings.Contains(string(res.ProviderContent), "trojan://pass@example.com:443#Node1") {
 		t.Fatalf("provider 内容应为解码后的 URI 列表：%q", res.ProviderContent)
