@@ -69,9 +69,9 @@ const instanceMutexName = "Local\\NexusLink.SingleInstance"
 const instanceLockPort = "127.0.0.1:47914"
 
 var (
-	instanceLn    net.Listener
-	instanceMutex windows.Handle
-	procCreateMx  = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
+	instanceLn     net.Listener
+	instanceMutex  windows.Handle
+	procCreateMx   = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
 	procMessageBox = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
 )
 

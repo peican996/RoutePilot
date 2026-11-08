@@ -51,7 +51,7 @@ type LatestInfo struct {
 
 // fetchLatest 查询最新 release。timeout 控制整体超时，国内访问 GitHub 可能很慢。
 func fetchLatest(timeout time.Duration) (*release, error) {
-	client := &http.Client{ Timeout: timeout}
+	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequest(http.MethodGet, repoAPI, nil)
 	if err != nil {
 		return nil, err
@@ -83,17 +83,29 @@ type winAsset struct {
 }
 
 func pickWindowsAsset(rel *release) winAsset {
-	// 优先标准 amd64 包，其次任何 windows zip
+	// 内置内核用的是 compatible（GOAMD64=v1）变体，升级也沿用同一变体；
+	// 否则老 CPU 用户升级后会直接起不来，和内置版本的选择自相矛盾。
 	for _, a := range rel.Assets {
 		n := strings.ToLower(a.Name)
-		if strings.Contains(n, "windows") && strings.Contains(n, "amd64") && strings.HasSuffix(n, ".zip") {
-			// 排除 compatible 版本（旧 CPU），优先标准版
-			if strings.Contains(n, "compatible") {
-				continue
-			}
+		if strings.Contains(n, "windows") && strings.Contains(n, "amd64") &&
+			strings.HasSuffix(n, ".zip") && strings.Contains(n, "compatible") {
 			return winAsset{a.Name, a.BrowserDownloadURL, a.Digest}
 		}
 	}
+	// 没有 compatible 就优先标准 amd64 包，跳过带 go1xx / v2 / v3 的变体，
+	// 它们对 CPU 指令集有额外要求。
+	for _, a := range rel.Assets {
+		n := strings.ToLower(a.Name)
+		if !strings.Contains(n, "windows") || !strings.Contains(n, "amd64") || !strings.HasSuffix(n, ".zip") {
+			continue
+		}
+		if strings.Contains(n, "compatible") || strings.Contains(n, "go1") ||
+			strings.Contains(n, "-v2-") || strings.Contains(n, "-v3-") {
+			continue
+		}
+		return winAsset{a.Name, a.BrowserDownloadURL, a.Digest}
+	}
+	// 最后兜底：任何 Windows zip
 	for _, a := range rel.Assets {
 		n := strings.ToLower(a.Name)
 		if strings.Contains(n, "windows") && strings.HasSuffix(n, ".zip") {
@@ -249,7 +261,11 @@ func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, timeout time.Dur
 	return hex.EncodeToString(sum[:])[:12], nil
 }
 
-// extractMihomo 从 zip 里解出 mihomo.exe。
+// extractMihomo 从 zip 里解出内核 exe。
+//
+// 不能写死 "mihomo.exe"：官方 release 包里的文件名是
+// mihomo-windows-amd64-compatible.exe（标准版则是 mihomo-windows-amd64.exe），
+// 只有按前缀 + 后缀匹配才能兼容这两种命名。
 func extractMihomo(zipData []byte) ([]byte, error) {
 	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
@@ -257,7 +273,7 @@ func extractMihomo(zipData []byte) ([]byte, error) {
 	}
 	for _, f := range zr.File {
 		name := strings.ToLower(filepath.Base(f.Name))
-		if name != "mihomo.exe" {
+		if !strings.HasPrefix(name, "mihomo") || !strings.HasSuffix(name, ".exe") {
 			continue
 		}
 		rc, err := f.Open()

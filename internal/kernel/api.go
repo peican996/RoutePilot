@@ -86,13 +86,13 @@ func (c *Client) Version(ctx context.Context) (*VersionInfo, error) {
 // ---------- 配置 ----------
 
 type Configs struct {
-	Port        int    `json:"port"`
-	SocksPort   int    `json:"socks-port"`
-	MixedPort   int    `json:"mixed-port"`
-	Mode        string `json:"mode"`
-	LogLevel    string `json:"log-level"`
-	AllowLan    bool   `json:"allow-lan"`
-	IPv6        bool   `json:"ipv6"`
+	Port      int    `json:"port"`
+	SocksPort int    `json:"socks-port"`
+	MixedPort int    `json:"mixed-port"`
+	Mode      string `json:"mode"`
+	LogLevel  string `json:"log-level"`
+	AllowLan  bool   `json:"allow-lan"`
+	IPv6      bool   `json:"ipv6"`
 }
 
 func (c *Client) Configs(ctx context.Context) (*Configs, error) {
@@ -119,8 +119,8 @@ type Proxy struct {
 		Time  string `json:"time"`
 		Delay int    `json:"delay"`
 	} `json:"history"`
-	UDP       bool `json:"udp"`
-	Alive     bool `json:"alive"`
+	UDP   bool `json:"udp"`
+	Alive bool `json:"alive"`
 }
 
 type ProxiesResp struct {

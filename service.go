@@ -106,6 +106,17 @@ type CoreService struct {
 	delayMu      sync.Mutex
 	delayHistory map[string][]DelaySample
 
+	// 内核版本缓存。Status 被前端高频轮询，/version 一分钟查一次就够。
+	verMu     sync.Mutex
+	verCache  string
+	verCached time.Time
+
+	// /connections 在同一轮轮询里会被 Traffic 和 Connections 各请求一次，
+	// 这里做 500ms 短缓存，避免重复传输和序列化整张连接表。
+	connMu      sync.Mutex
+	connCache   *kernel.ConnectionsResp
+	connCacheAt time.Time
+
 	// 窗口位置记忆
 	winX, winY, winW, winH int
 
@@ -287,7 +298,14 @@ func copyDirAll(src, dst string) error {
 			failed = append(failed, e.Name())
 			continue
 		}
-		if err := os.WriteFile(dstPath, b, 0o644); err != nil {
+		// 保留原文件权限，但始终给所有者写权限：迁移前 config.yaml /
+		// 订阅文件可能只有 0600，统一按 0644 重写会放宽权限；若源文件是
+		// 只读的，也不能把目标文件复制成只读，否则后续保存会失败。
+		mode := os.FileMode(0o644)
+		if fi, statErr := e.Info(); statErr == nil && fi.Mode().Perm() != 0 {
+			mode = fi.Mode().Perm() | 0o200
+		}
+		if err := os.WriteFile(dstPath, b, mode); err != nil {
 			failed = append(failed, e.Name())
 		}
 	}
@@ -371,7 +389,7 @@ func (s *CoreService) Boot() {
 	s.mgr = mgr
 
 	if _, err := mgr.EnsureBinary(embeddedKernel); err != nil {
-		s.setBootErr(err.Error())
+		s.failBoot(err)
 		return
 	}
 	// wintun.dll 是 TUN 模式的虚拟网卡驱动，提前放好，省得开启 TUN 时才发现缺文件。
@@ -382,7 +400,7 @@ func (s *CoreService) Boot() {
 
 	sec, err := randomSecret()
 	if err != nil {
-		s.setBootErr(err.Error())
+		s.failBoot(err)
 		return
 	}
 
@@ -402,12 +420,12 @@ func (s *CoreService) Boot() {
 
 	confPath, err := configgen.Write(dir, s.options())
 	if err != nil {
-		s.setBootErr(err.Error())
+		s.failBoot(err)
 		return
 	}
 
 	if err := mgr.Start(confPath); err != nil {
-		s.setBootErr(err.Error())
+		s.failBoot(err)
 		return
 	}
 
@@ -487,10 +505,17 @@ func (s *CoreService) afterStart() {
 		// TUN 的配置在生成阶段已经带上，这里只同步标记；
 		// 系统代理要显式开一次（reconcileProxy 只处理代理重启前后的状态，
 		// 处理不了"用户上次主动开着、这次要重新打开"）。
-		s.mu.RLock()
+		//
+		// 这两个标志只在启动阶段消费一次。若不清零，会话中用户主动关掉的
+		// TUN / 系统代理会在任意一次内核重启后按旧快照被重新打开；TUN 更糟：
+		// 配置是按当前 tunOn 生成的（不含 TUN），这里却把 tunOn 置回 true，
+		// 界面显示"已接管"，实际流量并没有走 TUN。
+		s.mu.Lock()
 		wantTUN := s.restoreTUN && elevate.IsElevated()
 		wantProxy := s.restoreProxy
-		s.mu.RUnlock()
+		s.restoreTUN = false
+		s.restoreProxy = false
+		s.mu.Unlock()
 
 		if wantTUN {
 			s.mu.Lock()
@@ -506,6 +531,22 @@ func (s *CoreService) setBootErr(msg string) {
 	s.mu.Lock()
 	s.bootErr = msg
 	s.mu.Unlock()
+}
+
+// failBoot 记录启动错误，并回滚上次遗留在注册表里的系统代理接管记录。
+//
+// Boot 失败时 afterStart 不会执行，reconcileProxy 也就没有机会校正。
+// 如果上次退出时系统代理仍指向本程序的内核端口，这次内核又没起来，
+// 注册表里就留下一个指向死端口的代理——用户表现为"开机直接断网"，
+// 而 Shutdown 只认内存里的 proxyOn，同样不会处理。
+func (s *CoreService) failBoot(err error) {
+	s.setBootErr(err.Error())
+	if _, statErr := os.Stat(filepath.Join(dataDir(), proxyStateFile)); statErr != nil {
+		return
+	}
+	if restoreErr := s.restoreSystemProxy(); restoreErr != nil {
+		s.dbg("boot failure: restore system proxy failed: %v", restoreErr)
+	}
 }
 
 func (s *CoreService) Attach(app *application.App) { s.app = app }
@@ -528,15 +569,18 @@ func (s *CoreService) Shutdown() {
 
 func (s *CoreService) Status() AppStatus {
 	s.mu.RLock()
-	mixed, apiPort, proxyOn, bootErr, tunOn := s.mixedPort, s.apiPort, s.proxyOn, s.bootErr, s.tunOn
+	mixed, apiPort, proxyOn, bootErr, tunOn, mode := s.mixedPort, s.apiPort, s.proxyOn, s.bootErr, s.tunOn, s.mode
 	s.mu.RUnlock()
+	if mode == "" {
+		mode = "rule"
+	}
 
 	st := AppStatus{
 		MixedPort: mixed,
 		APIPort:   apiPort,
 		ProxyOn:   proxyOn,
 		ProxyAddr: fmt.Sprintf("127.0.0.1:%d", mixed),
-		Mode:      "rule",
+		Mode:      mode,
 		BootErr:   bootErr,
 		DataDir:   dataDir(),
 		Tun:       tunOn,
@@ -550,16 +594,37 @@ func (s *CoreService) Status() AppStatus {
 		st.Error = ks.Error
 	}
 	if s.api != nil && st.State == "running" {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if v, err := s.api.Version(ctx); err == nil {
-			st.Version = v.Version
-		}
-		if c, err := s.api.Configs(ctx); err == nil {
-			st.Mode = c.Mode
-		}
+		st.Version = s.cachedVersion()
 	}
 	return st
+}
+
+// cachedVersion 返回内核版本，最多一分钟查一次。
+// 前端每 1.2 秒轮询一次 Status，每次都打 /version 纯属浪费；
+// 版本只在升级内核时变化，而升级路径会主动清掉缓存。
+func (s *CoreService) cachedVersion() string {
+	s.verMu.Lock()
+	defer s.verMu.Unlock()
+	if s.verCache != "" && time.Since(s.verCached) < time.Minute {
+		return s.verCache
+	}
+	if s.api == nil {
+		return s.verCache
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if v, err := s.api.Version(ctx); err == nil {
+		s.verCache = v.Version
+		s.verCached = time.Now()
+	}
+	return s.verCache
+}
+
+func (s *CoreService) clearVersionCache() {
+	s.verMu.Lock()
+	s.verCache = ""
+	s.verCached = time.Time{}
+	s.verMu.Unlock()
 }
 
 // ---------- 内核控制 ----------
@@ -575,6 +640,8 @@ func (s *CoreService) StartKernel() error {
 	if err := s.mgr.Start(confPath); err != nil {
 		return err
 	}
+	s.clearVersionCache()
+	s.invalidateConnCache()
 	s.afterStart()
 	return nil
 }
@@ -595,6 +662,8 @@ func (s *CoreService) StopKernel() error {
 	if err := s.SetSystemProxy(false); err != nil {
 		_ = err
 	}
+	s.clearVersionCache()
+	s.invalidateConnCache()
 	return s.mgr.Stop()
 }
 
@@ -618,6 +687,8 @@ func (s *CoreService) RestartKernel() error {
 	if err := s.mgr.Restart(confPath); err != nil {
 		return err
 	}
+	s.clearVersionCache()
+	s.invalidateConnCache()
 	s.afterStart()
 	return nil
 }
@@ -1036,9 +1107,11 @@ func (s *CoreService) startKernelWatchdog() {
 }
 
 // startNetworkHealthCheck 每 2 分钟测一次代理链路是否通。
-// 连续 2 次失败才告警（避免瞬时波动误报），恢复后重置计数。
+// 连续 2 次失败才告警（避免瞬时波动误报）；告警只在恢复前发一次，
+// 不再每 4 分钟重复弹窗。
 func (s *CoreService) startNetworkHealthCheck() {
 	failCount := 0
+	alerted := false
 	go func() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
@@ -1051,21 +1124,39 @@ func (s *CoreService) startNetworkHealthCheck() {
 			if s.Quitting() {
 				return
 			}
-			// 走代理测一个 204 端点
-			if s.api == nil {
+			// 内核没在运行时检测没有意义，否则用户主动停掉内核后
+			// 会一直收到"代理链路不通"的误报。
+			if s.mgr == nil || !s.mgr.IsRunning() || s.api == nil {
+				failCount, alerted = 0, false
 				continue
 			}
+
+			s.mu.RLock()
+			mode := s.mode
+			group := configgen.MainProxyGroup(s.subConfig)
+			s.mu.RUnlock()
+
+			// 直连模式没有代理链路可测；没有可用策略组时也不该断言代理不通。
+			// 测主策略组而不是 GLOBAL：GLOBAL 默认指向 DIRECT，测它等于测直连，
+			// 代理真的坏了也发现不了。
+			if mode == "direct" || group == "" {
+				failCount, alerted = 0, false
+				continue
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			d, err := s.api.Delay(ctx, "GLOBAL", "https://www.gstatic.com/generate_204", 5000)
+			d, err := s.api.Delay(ctx, group, "https://www.gstatic.com/generate_204", 5000)
 			cancel()
 			if err != nil || d <= 0 {
 				failCount++
-				if failCount >= 2 {
-					s.app.Event.Emit("network-degraded", "代理链路连续 2 次检测失败，网络可能不通")
-					failCount = 0 // 发一次告警后重置，避免刷屏
+				if failCount >= 2 && !alerted {
+					alerted = true
+					if s.app != nil {
+						s.app.Event.Emit("network-degraded", "代理链路连续 2 次检测失败，网络可能不通")
+					}
 				}
 			} else {
-				failCount = 0
+				failCount, alerted = 0, false
 			}
 		}
 	}()
@@ -1401,6 +1492,11 @@ func (s *CoreService) UpdateCore(url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("无法确认最新内核版本，已取消升级: %w", err)
 	}
+	// 已经是最新版就没必要停内核、断掉全部连接再换一个相同的文件。
+	// Current 为空说明内核没在运行、读不到版本，此时不拦，交给用户决定。
+	if info.Current != "" && !info.HasUpdate {
+		return "", fmt.Errorf("当前已是最新内核版本 %s", info.Latest)
+	}
 	if url != "" && url != info.URL {
 		return "", fmt.Errorf("下载地址与官方发布不一致，已拒绝")
 	}
@@ -1479,6 +1575,37 @@ func (s *CoreService) RelaunchElevated() error {
 
 // ---------- 连接 ----------
 
+// connCacheTTL 是连接表缓存窗口。前端每轮会同时请求 Traffic 和 Connections，
+// 两个接口各拉一次整表；500ms 内复用同一份响应，既省内核处理也省 IPC 序列化。
+const connCacheTTL = 500 * time.Millisecond
+
+// connections 返回连接表，带短缓存与并发合并。
+// 锁覆盖整个请求过程：并发进来的第二个调用会等第一个完成，然后直接命中缓存。
+func (s *CoreService) connections(ctx context.Context) (*kernel.ConnectionsResp, error) {
+	if s.api == nil {
+		return nil, fmt.Errorf("内核未就绪")
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.connCache != nil && time.Since(s.connCacheAt) < connCacheTTL {
+		return s.connCache, nil
+	}
+	resp, err := s.api.Connections(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.connCache = resp
+	s.connCacheAt = time.Now()
+	return resp, nil
+}
+
+func (s *CoreService) invalidateConnCache() {
+	s.connMu.Lock()
+	s.connCache = nil
+	s.connCacheAt = time.Time{}
+	s.connMu.Unlock()
+}
+
 func (s *CoreService) Connections() ([]ConnView, error) {
 	out := []ConnView{}
 	if s.api == nil {
@@ -1487,7 +1614,7 @@ func (s *CoreService) Connections() ([]ConnView, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	resp, err := s.api.Connections(ctx)
+	resp, err := s.connections(ctx)
 	if err != nil {
 		return out, err
 	}
@@ -1531,7 +1658,9 @@ func (s *CoreService) CloseConnection(id string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	return s.api.CloseConnection(ctx, id)
+	err := s.api.CloseConnection(ctx, id)
+	s.invalidateConnCache()
+	return err
 }
 
 // CloseAllConnections 断开全部活动连接。
@@ -1543,7 +1672,9 @@ func (s *CoreService) CloseAllConnections() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return s.api.CloseAllConnections(ctx)
+	err := s.api.CloseAllConnections(ctx)
+	s.invalidateConnCache()
+	return err
 }
 
 // ---------- 流量 ----------
@@ -1556,7 +1687,7 @@ func (s *CoreService) Traffic() TrafficView {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	resp, err := s.api.Connections(ctx)
+	resp, err := s.connections(ctx)
 	if err != nil {
 		return out
 	}
@@ -1809,13 +1940,13 @@ const (
 // 注意 TUN 的特殊性：开启它需要管理员权限，所以保存了 true
 // 但这次是普通权限启动的，就只能保持关闭、提示用户以管理员重启。
 type appState struct {
-	TUN      bool             `json:"tun"`
-	ProxyOn  bool             `json:"proxyOn"`
-	Mode     string           `json:"mode"`
-	WinX     int              `json:"winX"`
-	WinY     int              `json:"winY"`
-	WinW     int              `json:"winW"`
-	WinH     int              `json:"winH"`
+	TUN       bool            `json:"tun"`
+	ProxyOn   bool            `json:"proxyOn"`
+	Mode      string          `json:"mode"`
+	WinX      int             `json:"winX"`
+	WinY      int             `json:"winY"`
+	WinW      int             `json:"winW"`
+	WinH      int             `json:"winH"`
 	Favorites map[string]bool `json:"favorites"`
 
 	// 地图本机位置（不填则用默认值）
@@ -1933,8 +2064,8 @@ func (s *CoreService) ListSubscriptions() map[string]any {
 			"expire":    m.Expire,
 			// 缺这个字段前端就永远看不到"恢复证书校验"按钮，
 			// 一旦点过忽略证书就无法再关掉——安全设置单项锁死。
-			"insecure":  m.Insecure,
-			"active":    m.URL == s.subURL,
+			"insecure": m.Insecure,
+			"active":   m.URL == s.subURL,
 		})
 	}
 	return map[string]any{"items": out, "active": s.activeIdx}
@@ -1960,12 +2091,15 @@ func (s *CoreService) SwitchSubscription(idx int) error {
 		return fmt.Errorf("订阅配置损坏: %w", err)
 	}
 
+	info := subInfoFromMeta(meta)
+	applySubConfigCounts(&info, cfg)
+
 	s.mu.Lock()
 	s.activeIdx = idx
 	s.subURL = meta.URL
 	s.subConfig = cfg
 	s.subRaw = b
-	s.subInfo = subInfoFromMeta(meta)
+	s.subInfo = info
 	s.mu.Unlock()
 
 	s.saveSubs()
@@ -2133,6 +2267,15 @@ func subInfoFromMeta(m subMeta) SubInfo {
 	}
 }
 
+// applySubConfigCounts 从订阅配置里统计节点/策略组/规则数量。
+// 元信息文件里不存这些数字；切换订阅后必须重新统计，
+// 否则设置页会一直显示 0 节点，直到应用重启。
+func applySubConfigCounts(info *SubInfo, cfg map[string]any) {
+	info.Nodes = countArray(cfg, "proxies")
+	info.Groups = countArray(cfg, "proxy-groups")
+	info.Rules = countArray(cfg, "rules")
+}
+
 // loadSavedSubscription 读取上次落盘的订阅，让应用离线也能直接起。
 func (s *CoreService) loadSavedSubscription() {
 	dir := dataDir()
@@ -2177,9 +2320,7 @@ func (s *CoreService) loadSavedSubscription() {
 	}
 
 	info := subInfoFromMeta(meta)
-	info.Nodes = countArray(cfg, "proxies")
-	info.Groups = countArray(cfg, "proxy-groups")
-	info.Rules = countArray(cfg, "rules")
+	applySubConfigCounts(&info, cfg)
 
 	s.mu.Lock()
 	s.subURL = meta.URL
@@ -2713,6 +2854,12 @@ func (s *CoreService) dbg(format string, a ...any) {
 func (s *CoreService) saveAppState() {
 	s.mu.RLock()
 	lon, lat := s.homeLon, s.homeLat
+	// 拷贝一份收藏表。直接传 map 引用会让 json.Marshal 在锁外读取，
+	// 与并发的 ToggleFavorite 写入构成 map 并发读写，极少数情况下会直接 panic。
+	favorites := make(map[string]bool, len(s.favorites))
+	for k, v := range s.favorites {
+		favorites[k] = v
+	}
 	st := appState{
 		TUN:       s.tunOn,
 		ProxyOn:   s.proxyOn,
@@ -2721,7 +2868,7 @@ func (s *CoreService) saveAppState() {
 		WinY:      s.winY,
 		WinW:      s.winW,
 		WinH:      s.winH,
-		Favorites: s.favorites,
+		Favorites: favorites,
 		HomeLon:   &lon,
 		HomeLat:   &lat,
 		HomeLabel: s.homeLabel,
@@ -2926,5 +3073,6 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 			closed++
 		}
 	}
+	s.invalidateConnCache()
 	return closed, nil
 }

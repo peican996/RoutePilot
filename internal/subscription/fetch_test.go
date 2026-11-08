@@ -6,9 +6,9 @@ import "testing"
 // 非数字都要能兜住，否则流量与到期时间会显示成乱值。
 func TestParseUserInfo(t *testing.T) {
 	cases := []struct {
-		name                     string
-		in                       string
-		up, down, total, expire  int64
+		name                    string
+		in                      string
+		up, down, total, expire int64
 	}{
 		{"完整", "upload=100; download=200; total=1000; expire=1700000000", 100, 200, 1000, 1700000000},
 		{"带空格", " upload = 5 ; download = 6 ", 5, 6, 0, 0},

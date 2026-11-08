@@ -14,10 +14,10 @@ func TestSanitizeProcName(t *testing.T) {
 		{in: "游戏.exe", want: "游戏.exe"},
 
 		// 这些必须被拒绝
-		{in: "a,b.exe", want: ""},            // 逗号会把一条规则拆成两条
-		{in: "evil\nRULE-SET,x", want: ""},   // 换行注入新规则
+		{in: "a,b.exe", want: ""},          // 逗号会把一条规则拆成两条
+		{in: "evil\nRULE-SET,x", want: ""}, // 换行注入新规则
 		{in: "evil\r\n- PROCESS-NAME", want: ""},
-		{in: "path/to/x.exe", want: ""},      // 不该带路径
+		{in: "path/to/x.exe", want: ""}, // 不该带路径
 		{in: `C:\evil.exe`, want: ""},
 		{in: "tab\tname.exe", want: ""},
 		{in: "nul\x00byte", want: ""},
