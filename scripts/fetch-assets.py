@@ -22,6 +22,14 @@ import shutil
 import sys
 from pathlib import Path
 
+# Windows 上 stdout 默认是 cp1252，打印中文会抛 UnicodeEncodeError
+# （CI 里就是死在这里）。强制切 UTF-8，坏字符替换而不是崩。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "assets" / "manifest.json"
 

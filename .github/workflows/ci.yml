@@ -8,6 +8,9 @@ on:
 jobs:
   check:
     runs-on: windows-latest
+    env:
+      # Windows runner 默认 cp1252，脚本里的中文输出会直接崩
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
 
