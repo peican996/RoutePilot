@@ -4,12 +4,17 @@ package sysproxy
 
 import (
 	"fmt"
+	"os/exec"
+	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 const regPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+
+// WinHTTP 的代理设置是机器级状态，放在 HKLM 下。
+const winHTTPKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections`
 
 const (
 	optionRefresh         = 37 // INTERNET_OPTION_REFRESH
@@ -150,5 +155,55 @@ func ClearAutoConfigURL() error {
 	defer k.Close()
 	_ = k.DeleteValue("AutoConfigURL")
 	notify()
+	return nil
+}
+
+// WinHTTPBypass 是 WinHTTP 的本地绕过列表。
+const WinHTTPBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;192.168.*;*.local"
+
+// WinHTTPRaw 读取系统当前的 WinHTTP 代理二进制设置。
+// 返回值 nil 表示从未设置过（即直连），还原时删除该值即可。
+func WinHTTPRaw() ([]byte, error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, winHTTPKey, registry.QUERY_VALUE)
+	if err != nil {
+		return nil, fmt.Errorf("读取 WinHTTP 设置失败: %w", err)
+	}
+	defer k.Close()
+
+	b, _, err := k.GetBinaryValue("WinHttpSettings")
+	if err != nil {
+		// 值不存在等价于直连，不算错误。
+		return nil, nil
+	}
+	return b, nil
+}
+
+// RestoreWinHTTP 还原 WinHTTP 代理设置。data 为 nil 时删除设置（直连）。
+// 写 HKLM 需要管理员权限。
+func RestoreWinHTTP(data []byte) error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, winHTTPKey, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开 WinHTTP 注册表失败: %w", err)
+	}
+	defer k.Close()
+
+	if len(data) == 0 {
+		_ = k.DeleteValue("WinHttpSettings")
+		return nil
+	}
+	if err := k.SetBinaryValue("WinHttpSettings", data); err != nil {
+		return fmt.Errorf("还原 WinHTTP 设置失败: %w", err)
+	}
+	return nil
+}
+
+// EnableWinHTTP 把 WinHTTP 代理指向 addr。需要管理员权限；
+// 这里走 netsh 而不是自己拼二进制注册表值，减少格式出错的概率。
+func EnableWinHTTP(addr string) error {
+	cmd := exec.Command("netsh", "winhttp", "set", "proxy", addr, "bypass-list="+WinHTTPBypass)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("设置 WinHTTP 代理失败: %v（%s）", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }

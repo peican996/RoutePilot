@@ -66,6 +66,11 @@ type CoreService struct {
 	booted    bool
 	bootErr   string
 
+	// WinHTTP 是机器级代理设置，只有管理员能改。备份与"待还原"状态
+	// 落 app-state，避免这次以普通权限退出后把服务流量指向死端口。
+	winHTTPPending bool
+	winHTTPBackup  []byte
+
 	// 启动时要自动恢复的运行状态（从 app-state.json 读来）。
 	// TUN 需要管理员，做不到就保持关闭；系统代理随时能开。
 	restoreTUN   bool
@@ -378,6 +383,22 @@ func (s *CoreService) Boot() {
 	// 读上次的运行状态（模式、TUN、系统代理），启动后按需恢复。
 	s.loadAppState()
 
+	// 管理员进程启动时，把之前用 Run 键配置的普通自启升级为
+	// HighestAvailable 计划任务，TUN 下次开机就不用再手动提权。
+	if elevate.IsElevated() {
+		if err := autostart.UpgradeIfElevated(); err != nil {
+			s.dbg("autostart upgrade failed: %v", err)
+		}
+	}
+	// 上次进程异常退出可能留下被接管的 WinHTTP，提权启动时先还原。
+	s.restoreWinHTTPIfPending()
+	s.mu.RLock()
+	pendingWinHTTP := s.winHTTPPending
+	s.mu.RUnlock()
+	if pendingWinHTTP && !elevate.IsElevated() {
+		s.setBootErr("上次的 WinHTTP 代理设置尚未还原，请以管理员身份重启完成还原")
+	}
+
 	// GeoIP 用于地图上标注连接目标的位置。加载失败不影响主功能，
 	// 只是地图上少一层"目标点"。
 	if db, err := geoip.Load(geoipEmbed); err == nil {
@@ -540,12 +561,12 @@ func (s *CoreService) setBootErr(msg string) {
 // 而 Shutdown 只认内存里的 proxyOn，同样不会处理。
 func (s *CoreService) failBoot(err error) {
 	s.setBootErr(err.Error())
-	if _, statErr := os.Stat(filepath.Join(dataDir(), proxyStateFile)); statErr != nil {
-		return
+	if _, statErr := os.Stat(filepath.Join(dataDir(), proxyStateFile)); statErr == nil {
+		if restoreErr := s.restoreSystemProxy(); restoreErr != nil {
+			s.dbg("boot failure: restore system proxy failed: %v", restoreErr)
+		}
 	}
-	if restoreErr := s.restoreSystemProxy(); restoreErr != nil {
-		s.dbg("boot failure: restore system proxy failed: %v", restoreErr)
-	}
+	s.restoreWinHTTPIfPending()
 }
 
 func (s *CoreService) Attach(app *application.App) { s.app = app }
@@ -562,6 +583,9 @@ func (s *CoreService) Shutdown() {
 	if s.mgr != nil {
 		_ = s.mgr.Stop()
 	}
+	// 系统代理还原不处理 WinHTTP；退出前单独还原，避免服务流量
+	// 继续指向已经停止的内核端口。
+	s.restoreWinHTTPIfPending()
 }
 
 // ---------- 状态 ----------
@@ -739,10 +763,13 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 			}
 		}
 		s.persistProxyState(bk)
+		// 管理员权限下同时接管 WinHTTP，让系统服务 / CLI 也走代理。
+		s.takeOverWinHTTP(addr)
 	} else {
 		if err := s.restoreSystemProxy(); err != nil {
 			return err
 		}
+		s.restoreWinHTTPIfPending()
 	}
 
 	s.mu.Lock()
@@ -795,6 +822,68 @@ func (s *CoreService) restoreSystemProxy() error {
 		}
 	}
 	return err
+}
+
+// takeOverWinHTTP 备份并接管 WinHTTP 代理。WinHTTP 是机器级设置，
+// 只有管理员权限才能写；普通权限下直接跳过，不影响 WinINET 系统代理。
+func (s *CoreService) takeOverWinHTTP(addr string) {
+	if !elevate.IsElevated() {
+		return
+	}
+
+	s.mu.RLock()
+	pending := s.winHTTPPending
+	s.mu.RUnlock()
+	if pending {
+		// 上次的备份还没还原，绝不能覆盖；只把地址更新到当前端口。
+		if err := sysproxy.EnableWinHTTP(addr); err != nil {
+			s.dbg("WinHTTP enable failed: %v", err)
+		}
+		return
+	}
+
+	raw, err := sysproxy.WinHTTPRaw()
+	if err != nil {
+		s.dbg("WinHTTP backup failed: %v", err)
+		return
+	}
+	if err := sysproxy.EnableWinHTTP(addr); err != nil {
+		s.dbg("WinHTTP enable failed: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	s.winHTTPBackup = raw
+	s.winHTTPPending = true
+	s.mu.Unlock()
+	s.saveAppState()
+}
+
+// restoreWinHTTPIfPending 在管理员进程里还原 WinHTTP 设置。
+// 普通权限下无法写 HKLM，保留 pending 状态，等下次提权后继续还原。
+func (s *CoreService) restoreWinHTTPIfPending() {
+	s.mu.RLock()
+	pending := s.winHTTPPending
+	backup := append([]byte(nil), s.winHTTPBackup...)
+	s.mu.RUnlock()
+	if !pending {
+		return
+	}
+
+	if !elevate.IsElevated() {
+		s.dbg("WinHTTP restore postponed: process is not elevated")
+		return
+	}
+	if err := sysproxy.RestoreWinHTTP(backup); err != nil {
+		s.dbg("WinHTTP restore failed: %v", err)
+		return
+	}
+
+	s.mu.Lock()
+	s.winHTTPPending = false
+	s.winHTTPBackup = nil
+	s.mu.Unlock()
+	s.saveAppState()
 }
 
 // readProxyState 从磁盘读接管记录。没有记录或记录无效时返回零值。
@@ -851,6 +940,8 @@ func (s *CoreService) reconcileProxy() {
 		s.proxyOn = false
 		s.backup = proxyBackup{}
 		s.mu.Unlock()
+		// 用户手动关掉系统代理时，WinHTTP 也应该跟着还原。
+		s.restoreWinHTTPIfPending()
 		return
 	}
 
@@ -906,6 +997,8 @@ func (s *CoreService) SetTUN(on bool) error {
 		s.proxyOn = false
 		s.backup = proxyBackup{}
 		s.mu.Unlock()
+		// WinHTTP 也是系统代理类接管，TUN 生效前先还原，避免双代理。
+		s.restoreWinHTTPIfPending()
 	}
 
 	if s.mgr != nil && s.mgr.IsRunning() {
@@ -920,6 +1013,8 @@ func (s *CoreService) SetTUN(on bool) error {
 			// 否则用户会莫名其妙上不了网。
 			if prevProxyOn && prevBackup.Addr != "" {
 				_ = sysproxy.Enable(prevBackup.Addr)
+				// WinHTTP 刚才被还原了，回滚时要重新接管。
+				s.takeOverWinHTTP(prevBackup.Addr)
 			}
 			return fmt.Errorf("切换失败，已回滚: %w", err)
 		}
@@ -1579,7 +1674,7 @@ func (s *CoreService) AutoStart() bool {
 }
 
 func (s *CoreService) SetAutoStart(on bool) error {
-	if err := autostart.Set(on); err != nil {
+	if err := autostart.Set(on, elevate.IsElevated()); err != nil {
 		return fmt.Errorf("设置开机自启失败: %w", err)
 	}
 	return nil
@@ -1982,6 +2077,11 @@ type appState struct {
 	WinW      int             `json:"winW"`
 	WinH      int             `json:"winH"`
 	Favorites map[string]bool `json:"favorites"`
+
+	// WinHTTP 接管备份。数据是注册表二进制值（base64 存储），
+	// Pending=true 表示设置仍处于被接管状态，需要在管理员进程里还原。
+	WinHTTPBackup  []byte `json:"winHttpBackup,omitempty"`
+	WinHTTPPending bool   `json:"winHttpPending,omitempty"`
 
 	// 地图本机位置（不填则用默认值）
 	HomeLon   *float64 `json:"homeLon,omitempty"`
@@ -2917,6 +3017,8 @@ func (s *CoreService) loadAppState() {
 		s.tunOn = false
 	}
 	s.restoreProxy = st.ProxyOn
+	s.winHTTPPending = st.WinHTTPPending
+	s.winHTTPBackup = append([]byte(nil), st.WinHTTPBackup...)
 	s.winX, s.winY, s.winW, s.winH = st.WinX, st.WinY, st.WinW, st.WinH
 	if st.HomeLon != nil && st.HomeLat != nil {
 		s.homeLon, s.homeLat = *st.HomeLon, *st.HomeLat
@@ -2964,18 +3066,21 @@ func (s *CoreService) saveAppState() {
 	for k, v := range s.favorites {
 		favorites[k] = v
 	}
+	winBackup := append([]byte(nil), s.winHTTPBackup...)
 	st := appState{
-		TUN:       s.tunOn,
-		ProxyOn:   s.proxyOn,
-		Mode:      s.mode,
-		WinX:      s.winX,
-		WinY:      s.winY,
-		WinW:      s.winW,
-		WinH:      s.winH,
-		Favorites: favorites,
-		HomeLon:   &lon,
-		HomeLat:   &lat,
-		HomeLabel: s.homeLabel,
+		TUN:            s.tunOn,
+		ProxyOn:        s.proxyOn,
+		Mode:           s.mode,
+		WinX:           s.winX,
+		WinY:           s.winY,
+		WinW:           s.winW,
+		WinH:           s.winH,
+		Favorites:      favorites,
+		WinHTTPBackup:  winBackup,
+		WinHTTPPending: s.winHTTPPending,
+		HomeLon:        &lon,
+		HomeLat:        &lat,
+		HomeLabel:      s.homeLabel,
 	}
 	s.mu.RUnlock()
 	if st.Mode == "" {
