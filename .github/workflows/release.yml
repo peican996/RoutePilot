@@ -64,7 +64,8 @@ jobs:
         shell: bash
         run: |
           cd release
-          sha256sum ./*.zip > SHA256SUMS.txt
+          # 用 *.zip 而不是 ./*.zip，免得清单里带上 "./" 前缀
+          sha256sum *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: 上传到 Release
