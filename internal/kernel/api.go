@@ -233,3 +233,41 @@ func (c *Client) CloseAllConnections(ctx context.Context) error {
 func (c *Client) UpdateRuleProvider(ctx context.Context, name string) error {
 	return c.do(ctx, http.MethodPut, "/providers/rules/"+url.PathEscape(name), nil, nil)
 }
+
+// ---------- 代理 provider ----------
+
+// ProviderProxies 返回每个 proxy-provider 解析出来的节点。
+// base64 订阅的节点不会出现在 /proxies 里，必须从这里合并，
+// 否则界面上只能看到策略组，看不到具体节点。
+func (c *Client) ProviderProxies(ctx context.Context) (map[string][]Proxy, error) {
+	var v struct {
+		Providers map[string]struct {
+			Proxies []Proxy `json:"proxies"`
+		} `json:"providers"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/providers/proxies", nil, &v); err != nil {
+		return nil, err
+	}
+	out := make(map[string][]Proxy, len(v.Providers))
+	for name, p := range v.Providers {
+		out[name] = p.Proxies
+	}
+	return out, nil
+}
+
+// DelayProviderProxy 对 provider 里的单个节点测速。
+// 普通节点走 /proxies/{name}/delay，provider 节点必须走这个带 provider 前缀的路径。
+func (c *Client) DelayProviderProxy(ctx context.Context, provider, name, testURL string, timeoutMs int) (int, error) {
+	if testURL == "" {
+		testURL = "https://www.gstatic.com/generate_204"
+	}
+	path := fmt.Sprintf("/providers/proxies/%s/%s/healthcheck?timeout=%d&url=%s",
+		url.PathEscape(provider), url.PathEscape(name), timeoutMs, url.QueryEscape(testURL))
+	var v struct {
+		Delay int `json:"delay"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &v); err != nil {
+		return -1, err
+	}
+	return v.Delay, nil
+}

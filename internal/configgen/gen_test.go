@@ -97,3 +97,70 @@ func TestBuildMergesRuleProviders(t *testing.T) {
 		}
 	}
 }
+
+// 订阅里的入站监听、隧道、外部 UI 等字段不能被带进内核：
+// 它们会额外开端口或把控制面板暴露出去，而本应用只管理一个本地混合端口。
+func TestBuildStripsSubscriptionControlledFields(t *testing.T) {
+	base := map[string]any{
+		"proxies":         []any{map[string]any{"name": "a", "type": "ss"}},
+		"port":            7890,
+		"socks-port":      7891,
+		"redir-port":      7892,
+		"tproxy-port":     7893,
+		"listeners":       []any{map[string]any{"name": "public", "port": 8080}},
+		"tunnels":         []any{map[string]any{"network": "tcp"}},
+		"authentication":  []string{"user:pass"},
+		"external-ui":     "/tmp/ui",
+		"external-ui-url": "https://evil.example/ui.zip",
+		"script":          "console.log(1)",
+	}
+
+	cfg := Build(Options{Base: base})
+
+	for _, k := range []string{
+		"port", "socks-port", "redir-port", "tproxy-port",
+		"listeners", "tunnels", "authentication",
+		"external-ui", "external-ui-url", "script",
+	} {
+		if _, ok := cfg[k]; ok {
+			t.Fatalf("字段 %q 不应被带入内核配置", k)
+		}
+	}
+	if cfg["mixed-port"] == nil {
+		t.Fatal("应用自己的 mixed-port 应保留")
+	}
+}
+
+// base64 订阅的组只有 use，没有 proxies；仍要被识别为可选主策略组。
+func TestMainProxyGroupUsesProviderMembers(t *testing.T) {
+	cfg := map[string]any{
+		"proxy-groups": []any{
+			map[string]any{"name": "节点选择", "type": "select", "use": []any{"nexuslink"}},
+		},
+	}
+	if got := MainProxyGroup(cfg); got != "节点选择" {
+		t.Fatalf("应识别引用 provider 的策略组，实际 %q", got)
+	}
+}
+
+// 没有订阅规则时，默认 MATCH 必须指向实际存在的策略组，
+// 不能写死 PROXY，否则 base64 订阅的内核会拒绝启动。
+func TestBuildDefaultRulesUseProviderGroup(t *testing.T) {
+	base := map[string]any{
+		"proxies": []any{},
+		"proxy-groups": []any{
+			map[string]any{"name": "节点选择", "type": "select", "use": []any{"nexuslink"}},
+		},
+	}
+
+	cfg := Build(Options{Base: base})
+
+	rules, ok := cfg["rules"].([]any)
+	if !ok || len(rules) == 0 {
+		t.Fatalf("应生成默认规则：%v", cfg["rules"])
+	}
+	last, _ := rules[len(rules)-1].(string)
+	if last != "MATCH,节点选择" {
+		t.Fatalf("兜底规则应指向 provider 组，实际 %q", last)
+	}
+}

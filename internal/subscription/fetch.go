@@ -2,8 +2,11 @@ package subscription
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,13 +29,19 @@ type NodeInfo struct {
 }
 
 type Result struct {
-	Config    map[string]any `json:"-"`
-	Nodes     []NodeInfo     `json:"nodes"`
-	Groups    []string       `json:"groups"`
-	Rules     int            `json:"rules"`
-	FetchedAt int64          `json:"fetchedAt"`
-	Insecure  bool           `json:"insecure"`
-	Raw       []byte         `json:"-"`
+	Config map[string]any `json:"-"`
+	// Format 是识别出来的订阅格式：clash / clash-base64 / base64。
+	Format string `json:"format"`
+	// ProviderContent 是 base64 订阅解码后的明文节点列表。
+	// 落盘给内核 file provider 用：mihomo 的 base64 解码不接受首尾空白，
+	// 直接喂原始 base64 很容易因换行失败，喂解码后的 URI 行最稳。
+	ProviderContent []byte     `json:"-"`
+	Nodes           []NodeInfo `json:"nodes"`
+	Groups          []string   `json:"groups"`
+	Rules           int        `json:"rules"`
+	FetchedAt       int64      `json:"fetchedAt"`
+	Insecure        bool       `json:"insecure"`
+	Raw             []byte     `json:"-"`
 
 	// 以下来自响应头，是 V2board 系面板的通行做法。
 	// 没有这些头也不影响使用，只是界面显示不到流量信息。
@@ -178,7 +187,81 @@ func parseFilename(cd string) string {
 	return ""
 }
 
-// Fetch 拉取订阅并解析成 Clash 配置结构。
+// RawFileName 返回订阅原文的稳定文件名。
+// 服务层持久化订阅原文、base64 订阅的 file provider 都靠它定位文件，
+// 两边必须用同一套命名规则，否则内核会读到一个不存在的文件。
+func RawFileName(rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return "sub-" + hex.EncodeToString(sum[:8]) + ".yaml"
+}
+
+// ProviderFileName 是 base64 订阅解码后给内核 file provider 读取的文件名。
+func ProviderFileName(rawURL string) string {
+	return strings.TrimSuffix(RawFileName(rawURL), ".yaml") + ".provider.yaml"
+}
+
+// Parse 解析订阅原文。支持 Clash YAML，也支持 base64 / 明文的节点 URI 列表。
+//
+// base64 订阅不自己实现各种协议的 URI 转换：生成一个 file 类型的
+// proxy-provider 指向落盘的原文，由内核的 V2Ray 转换器解析。
+// 这样 ss / vmess / vless / trojan / hysteria2 等格式都能直接复用内核能力。
+func Parse(body []byte, subURL string, allowInsecure bool) (*Result, error) {
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil, fmt.Errorf("订阅内容为空")
+	}
+
+	res := &Result{
+		Insecure: allowInsecure,
+		Raw:      body,
+	}
+
+	// 1. 直接是 Clash YAML
+	if cfg, ok := parseClashConfig(body); ok {
+		res.Config = cfg
+		res.Format = "clash"
+		collectClashMeta(res, cfg)
+		if len(res.Nodes) == 0 {
+			return nil, fmt.Errorf("订阅解析完成，但没有拿到任何节点")
+		}
+		return res, nil
+	}
+
+	// 2. base64 包着 Clash YAML（少数面板会这么返回）
+	if decoded, ok := decodeBase64Body(body); ok {
+		if cfg, ok := parseClashConfig(decoded); ok {
+			res.Config = cfg
+			res.Format = "clash-base64"
+			collectClashMeta(res, cfg)
+			if len(res.Nodes) == 0 {
+				return nil, fmt.Errorf("订阅解析完成，但没有拿到任何节点")
+			}
+			return res, nil
+		}
+		// 3. base64 节点 URI 列表
+		if uris := uriLines(decoded); len(uris) > 0 {
+			res.Config = base64ProviderConfig(subURL)
+			res.Format = "base64"
+			res.ProviderContent = []byte(strings.Join(uris, "\n"))
+			res.Nodes = nodesFromURIs(uris)
+			res.Groups = []string{"节点选择"}
+			return res, nil
+		}
+	}
+
+	// 4. 明文节点 URI 列表（部分面板直接返回多行链接）
+	if uris := uriLines(body); len(uris) > 0 {
+		res.Config = base64ProviderConfig(subURL)
+		res.Format = "base64"
+		res.ProviderContent = []byte(strings.Join(uris, "\n"))
+		res.Nodes = nodesFromURIs(uris)
+		res.Groups = []string{"节点选择"}
+		return res, nil
+	}
+
+	return nil, fmt.Errorf("无法识别订阅格式：需要 Clash YAML，或 base64/明文节点列表")
+}
+
+// Fetch 拉取订阅并解析。
 // allowInsecure 由用户针对该订阅显式开启，默认 false。
 func Fetch(ctx context.Context, subURL string, allowInsecure bool) (*Result, error) {
 	subURL = strings.TrimSpace(subURL)
@@ -194,25 +277,11 @@ func Fetch(ctx context.Context, subURL string, allowInsecure bool) (*Result, err
 		return nil, err
 	}
 
-	var cfg map[string]any
-	if err := yaml.Unmarshal(body, &cfg); err != nil {
-		return nil, fmt.Errorf("订阅内容不是合法的 YAML: %w", err)
+	res, err := Parse(body, subURL, insecure)
+	if err != nil {
+		return nil, err
 	}
-	if cfg == nil {
-		return nil, fmt.Errorf("订阅内容为空")
-	}
-
-	rawProxies, hasProxies := cfg["proxies"]
-	if !hasProxies {
-		return nil, fmt.Errorf("订阅里没有 proxies 字段，可能是 base64 节点格式，当前只支持 Clash 格式订阅")
-	}
-
-	res := &Result{
-		Config:    cfg,
-		FetchedAt: time.Now().UnixMilli(),
-		Insecure:  insecure,
-		Raw:       body,
-	}
+	res.FetchedAt = time.Now().UnixMilli()
 
 	// 机场元信息
 	res.Name = parseFilename(hdr.Get("content-disposition"))
@@ -223,8 +292,26 @@ func Fetch(ctx context.Context, subURL string, allowInsecure bool) (*Result, err
 			res.UpdateHrs = n
 		}
 	}
+	return res, nil
+}
 
-	if arr, ok := rawProxies.([]any); ok {
+// parseClashConfig 判断并解析 Clash 配置。没有 proxies 字段就不算 Clash，
+// 交给 base64 / URI 分支继续识别。
+func parseClashConfig(body []byte) (map[string]any, bool) {
+	var cfg map[string]any
+	if err := yaml.Unmarshal(body, &cfg); err != nil || cfg == nil {
+		return nil, false
+	}
+	rawProxies, ok := cfg["proxies"].([]any)
+	if !ok || len(rawProxies) == 0 {
+		return nil, false
+	}
+	return cfg, true
+}
+
+// collectClashMeta 统计 Clash 配置里的节点/策略组/规则。
+func collectClashMeta(res *Result, cfg map[string]any) {
+	if arr, ok := cfg["proxies"].([]any); ok {
 		for _, item := range arr {
 			m, ok := item.(map[string]any)
 			if !ok {
@@ -252,9 +339,84 @@ func Fetch(ctx context.Context, subURL string, allowInsecure bool) (*Result, err
 	if arr, ok := cfg["rules"].([]any); ok {
 		res.Rules = len(arr)
 	}
+}
 
-	if len(res.Nodes) == 0 {
-		return nil, fmt.Errorf("订阅解析完成，但没有拿到任何节点")
+// base64ProviderConfig 为节点 URI 列表生成最小可用配置。
+// provider 用 file 类型读落盘的解码后 URI 列表（不是原始 base64，
+// 避免 mihomo 的 base64 解码被首尾空白卡住），内核自己完成 URI → proxy 转换；
+// 选择组显式引用 provider，进程分流与节点切换才有出口可用。
+func base64ProviderConfig(subURL string) map[string]any {
+	const providerName = "nexuslink"
+	return map[string]any{
+		"proxy-providers": map[string]any{
+			providerName: map[string]any{
+				"type": "file",
+				"path": "./" + ProviderFileName(subURL),
+				// 让内核定期测速，provider 节点才有 History 供界面展示初始延迟。
+				"health-check": map[string]any{
+					"enable":   true,
+					"url":      "https://www.gstatic.com/generate_204",
+					"interval": 600,
+				},
+			},
+		},
+		"proxy-groups": []any{
+			map[string]any{
+				// 不能叫 PROXY / GLOBAL 这类内置名，否则会被当作内置组跳过。
+				"name": "节点选择",
+				"type": "select",
+				"use":  []any{providerName},
+			},
+		},
 	}
-	return res, nil
+}
+
+// decodeBase64Body 解 base64。订阅里常带换行和空格，先整体去掉。
+func decodeBase64Body(body []byte) ([]byte, bool) {
+	s := strings.TrimSpace(string(body))
+	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(s)
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if data, err := enc.DecodeString(compact); err == nil && len(data) > 0 {
+			return data, true
+		}
+	}
+	return nil, false
+}
+
+// uriLines 从文本里挑出节点 URI 行。
+func uriLines(body []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "://") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// nodesFromURIs 构造节点元信息。名称优先取 URI 的 # 片段，
+// 取不到就用序号；这只是给订阅卡片展示数量/名称用，真实节点由内核解析。
+func nodesFromURIs(uris []string) []NodeInfo {
+	out := make([]NodeInfo, 0, len(uris))
+	for i, uri := range uris {
+		name := fmt.Sprintf("节点 %d", i+1)
+		if k := strings.LastIndex(uri, "#"); k >= 0 && k < len(uri)-1 {
+			if v, err := url.PathUnescape(uri[k+1:]); err == nil && v != "" {
+				name = v
+			}
+		}
+		typ := ""
+		if k := strings.Index(uri, "://"); k > 0 {
+			typ = uri[:k]
+		}
+		out = append(out, NodeInfo{Name: name, Type: typ})
+	}
+	return out
 }

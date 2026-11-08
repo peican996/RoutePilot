@@ -110,3 +110,45 @@ func SetOverride(s string) error {
 	notify()
 	return nil
 }
+
+// AutoConfigURL 读取当前的 PAC 地址。
+// Windows 里 PAC 的优先级高于手动 ProxyServer，接管时必须一起处理，
+// 否则用户明明看到"系统代理已开启"，浏览器却还在按 PAC 走。
+func AutoConfigURL() string {
+	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, err := k.GetStringValue("AutoConfigURL")
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
+// SetAutoConfigURL 写回 PAC 地址。
+func SetAutoConfigURL(s string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开注册表失败: %w", err)
+	}
+	defer k.Close()
+	if err := k.SetStringValue("AutoConfigURL", s); err != nil {
+		return fmt.Errorf("写入 AutoConfigURL 失败: %w", err)
+	}
+	notify()
+	return nil
+}
+
+// ClearAutoConfigURL 移除 PAC 地址。原本不存在时也视为成功。
+func ClearAutoConfigURL() error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开注册表失败: %w", err)
+	}
+	defer k.Close()
+	_ = k.DeleteValue("AutoConfigURL")
+	notify()
+	return nil
+}

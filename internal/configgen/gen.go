@@ -55,8 +55,13 @@ func defaultGroups() []map[string]any {
 	}
 }
 
-// defaultRules 是保守的起步规则：内网和国内直连，其余交给策略组。
-func defaultRules() []string {
+// defaultRulesFor 生成以指定策略组兜底的默认规则。
+// base64 订阅的策略组不叫 PROXY，兜底规则必须指向真实存在的组，
+// 否则内核会因引用不存在的策略组拒绝启动。
+func defaultRulesFor(group string) []string {
+	if group == "" {
+		group = "PROXY"
+	}
 	return []string{
 		"DOMAIN-SUFFIX,local,DIRECT",
 		"IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
@@ -65,7 +70,7 @@ func defaultRules() []string {
 		"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
 		"GEOIP,LAN,DIRECT,no-resolve",
 		"GEOIP,CN,DIRECT",
-		"MATCH,PROXY",
+		"MATCH," + group,
 	}
 }
 
@@ -114,6 +119,32 @@ func deepCopy(v any) any {
 	}
 }
 
+// strippedSubscriptionKeys 是订阅里即使出现也必须移除的字段。
+//
+// 这些字段要么会额外开放入站端口（listeners / tunnels / port / socks-port /
+// redir-port / tproxy-port），要么会把控制面板或认证逻辑塞进内核
+// （external-ui / authentication），要么可能引入脚本执行。
+// 本应用只负责一个监听在 127.0.0.1 的混合端口，其余一律不应由订阅决定。
+var strippedSubscriptionKeys = []string{
+	"listeners",
+	"tunnels",
+	"authentication",
+	"port",
+	"socks-port",
+	"redir-port",
+	"tproxy-port",
+	"external-ui",
+	"external-ui-url",
+	"external-ui-name",
+	"script",
+}
+
+func sanitizeSubscriptionConfig(cfg map[string]any) {
+	for _, k := range strippedSubscriptionKeys {
+		delete(cfg, k)
+	}
+}
+
 // Build 组装最终的配置对象。
 //
 // 有 Base（订阅配置）时以它为骨架，节点、代理组、规则全部保留机场原样，
@@ -129,6 +160,10 @@ func Build(o Options) map[string]any {
 	if cfg == nil {
 		cfg = map[string]any{}
 	}
+
+	// 订阅内容不可全信：入站监听、隧道、外部 UI 等字段会以管理员权限
+	// 在内核里生效，必须由本应用白名单式接管或直接剥掉。
+	sanitizeSubscriptionConfig(cfg)
 
 	// 以下字段无论订阅里怎么写都必须由本应用决定，否则端口会撞车、
 	// 控制 API 会被订阅里的设置顶掉。
@@ -171,7 +206,9 @@ func Build(o Options) map[string]any {
 		}
 	}
 	if rules == nil {
-		for _, s := range defaultRules() {
+		// 没有订阅规则时用默认规则，兜底组要跟随实际的主策略组：
+		// base64 订阅的组叫「节点选择」，写死 MATCH,PROXY 内核会拒绝启动。
+		for _, s := range defaultRulesFor(MainProxyGroup(cfg)) {
 			rules = append(rules, s)
 		}
 	}
@@ -272,8 +309,14 @@ func MainProxyGroup(cfg map[string]any) string {
 			continue
 		}
 		proxies, _ := m["proxies"].([]any)
-		if len(proxies) > bestCount {
-			bestCount = len(proxies)
+		members := len(proxies)
+		// base64 订阅走 proxy-provider，组里只有 use 没有 proxies；
+		// 不把 use 算进成员数，这类订阅会被误判成"没有可用策略组"。
+		if use, ok := m["use"].([]any); ok {
+			members += len(use)
+		}
+		if members > bestCount {
+			bestCount = members
 			best = name
 		}
 	}

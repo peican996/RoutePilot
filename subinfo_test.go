@@ -1,42 +1,37 @@
 package main
 
 import (
-	"reflect"
 	"testing"
+
+	"proxdeck/internal/subscription"
 )
 
-// 切换订阅时必须从配置里重新统计节点/组/规则数量。
+// 切换订阅 / 自动更新后必须使用解析结果里的计数。
 // 之前的实现只恢复 meta，切完订阅设置页会一直显示 0 节点。
-func TestApplySubConfigCounts(t *testing.T) {
-	cfg := map[string]any{
-		"proxies":      []any{map[string]any{"name": "a"}, map[string]any{"name": "b"}},
-		"proxy-groups": []any{map[string]any{"name": "PROXY"}},
-		"rules":        []any{"MATCH,PROXY", "GEOIP,CN,DIRECT"},
+func TestSubInfoFromResultCounts(t *testing.T) {
+	res := &subscription.Result{
+		Nodes: []subscription.NodeInfo{
+			{Name: "a", Type: "ss"},
+			{Name: "b", Type: "trojan"},
+		},
+		Groups: []string{"PROXY"},
+		Rules:  2,
 	}
-	info := SubInfo{URL: "https://example.com/sub"}
+	meta := subMeta{URL: "https://example.com/sub", Name: "test", Upload: 1}
 
-	applySubConfigCounts(&info, cfg)
+	info := subInfoFromResult(meta, res)
 
 	if info.Nodes != 2 || info.Groups != 1 || info.Rules != 2 {
 		t.Fatalf("统计结果不符：nodes=%d groups=%d rules=%d", info.Nodes, info.Groups, info.Rules)
 	}
-	if info.URL != "https://example.com/sub" {
-		t.Fatalf("统计不应改动其他元信息，URL 变成 %q", info.URL)
+	if info.URL != meta.URL || info.Name != meta.Name || info.Upload != meta.Upload {
+		t.Fatalf("元信息应保持不变，实际 %+v", info)
 	}
 }
 
-// 缺字段或类型不对时返回 0，而不是 panic。
-func TestApplySubConfigCountsMissingFields(t *testing.T) {
-	cases := []map[string]any{
-		{},
-		{"proxies": "not-an-array"},
-		{"proxies": nil},
-	}
-	for _, cfg := range cases {
-		info := SubInfo{}
-		applySubConfigCounts(&info, cfg)
-		if !reflect.DeepEqual(info, SubInfo{}) {
-			t.Fatalf("空配置应保持零值，实际 %+v", info)
-		}
+func TestSubInfoFromResultEmpty(t *testing.T) {
+	info := subInfoFromResult(subMeta{}, &subscription.Result{})
+	if info.Nodes != 0 || info.Groups != 0 || info.Rules != 0 {
+		t.Fatalf("空结果应全部为 0，实际 %+v", info)
 	}
 }

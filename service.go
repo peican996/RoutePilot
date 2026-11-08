@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,7 +26,6 @@ import (
 	"proxdeck/internal/sysproxy"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
-	"gopkg.in/yaml.v3"
 )
 
 // proxyBackup 记录接管系统代理之前的原始设置。
@@ -38,11 +36,12 @@ import (
 // 应用重启后必须能认出"注册表里那个地址是上次我自己设的"，
 // 否则要么误占别人的设置，要么显示未开启而实际开着、还指向一个死端口。
 type proxyBackup struct {
-	Addr     string `json:"addr"`     // 我们设进去的地址
-	Server   string `json:"server"`   // 接管前系统原本的地址
-	Override string `json:"override"` // 接管前系统原本的绕过列表
-	Enabled  bool   `json:"enabled"`  // 接管前系统原本是否启用
-	Saved    bool   `json:"saved"`
+	Addr          string `json:"addr"`                    // 我们设进去的地址
+	Server        string `json:"server"`                  // 接管前系统原本的地址
+	Override      string `json:"override"`                // 接管前系统原本的绕过列表
+	AutoConfigURL string `json:"autoConfigUrl,omitempty"` // 接管前系统原本的 PAC 地址
+	Enabled       bool   `json:"enabled"`                 // 接管前系统原本是否启用
+	Saved         bool   `json:"saved"`
 }
 
 const proxyStateFile = "proxy.json"
@@ -716,11 +715,12 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 		if !s.backup.Saved {
 			srv, enabled := sysproxy.Current()
 			s.backup = proxyBackup{
-				Addr:     addr,
-				Server:   srv,
-				Override: sysproxy.Override(),
-				Enabled:  enabled,
-				Saved:    true,
+				Addr:          addr,
+				Server:        srv,
+				Override:      sysproxy.Override(),
+				AutoConfigURL: sysproxy.AutoConfigURL(),
+				Enabled:       enabled,
+				Saved:         true,
 			}
 		} else {
 			s.backup.Addr = addr
@@ -729,6 +729,14 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 		s.mu.Unlock()
 		if err := sysproxy.Enable(addr); err != nil {
 			return err
+		}
+		// PAC 优先级高于手动代理，接管时必须移除，否则我们的地址根本不生效。
+		// 原地址已经记在 backup 里，关闭代理时再写回去。
+		if bk.AutoConfigURL != "" {
+			if err := sysproxy.ClearAutoConfigURL(); err != nil {
+				_ = s.restoreSystemProxy()
+				return fmt.Errorf("清除系统 PAC 设置失败: %w", err)
+			}
 		}
 		s.persistProxyState(bk)
 	} else {
@@ -780,6 +788,12 @@ func (s *CoreService) restoreSystemProxy() error {
 			err = e
 		}
 	}
+	// 接管时移除的 PAC 地址也要原样还回去。
+	if bk.AutoConfigURL != "" {
+		if e := sysproxy.SetAutoConfigURL(bk.AutoConfigURL); e != nil && err == nil {
+			err = e
+		}
+	}
 	return err
 }
 
@@ -827,6 +841,11 @@ func (s *CoreService) reconcileProxy() {
 	cur, enabled := sysproxy.Current()
 	if !enabled {
 		// 用户自己把系统代理关了，撤掉接管记录。
+		// 接管时移除的 PAC 也要还回去，否则用户只是关了个代理，
+		// 原来的 PAC 配置就永久丢了。
+		if st.AutoConfigURL != "" {
+			_ = sysproxy.SetAutoConfigURL(st.AutoConfigURL)
+		}
 		_ = os.Remove(filepath.Join(dir, proxyStateFile))
 		s.mu.Lock()
 		s.proxyOn = false
@@ -1384,9 +1403,9 @@ func (s *CoreService) QuickNodes(topN int) ([]string, string) {
 	if s.api == nil {
 		return nil, ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	proxies, err := s.api.Proxies(ctx)
+	proxies, _, err := s.allProxies(ctx)
 	if err != nil {
 		return nil, ""
 	}
@@ -1968,13 +1987,6 @@ type subMeta struct {
 	UpdateHrs int    `json:"updateHrs"`
 }
 
-func countArray(cfg map[string]any, key string) int {
-	if arr, ok := cfg[key].([]any); ok {
-		return len(arr)
-	}
-	return 0
-}
-
 // ---------- 多订阅 ----------
 
 // subsStore 是订阅列表的磁盘格式。
@@ -1984,10 +1996,30 @@ type subsStore struct {
 }
 
 // subFileName 为每个订阅的原始配置起个稳定文件名。
-// 用 URL 的哈希，用户换 URL 之后旧文件不会撞名。
+// 命名规则统一放在 subscription 包里，base64 订阅的 file provider
+// 会用同一个文件名定位原文。
 func subFileName(rawURL string) string {
-	sum := sha256.Sum256([]byte(rawURL))
-	return "sub-" + hex.EncodeToString(sum[:8]) + ".yaml"
+	return subscription.RawFileName(rawURL)
+}
+
+// writeSubscriptionFiles 落盘订阅原文，以及 base64 订阅给内核 provider
+// 准备的解码后节点列表。两者成对写入，避免内核启动时 provider 文件缺失。
+func (s *CoreService) writeSubscriptionFiles(url string, res *subscription.Result) error {
+	dir := dataDir()
+	if err := os.WriteFile(filepath.Join(dir, subFileName(url)), res.Raw, 0o600); err != nil {
+		return fmt.Errorf("保存订阅配置失败: %w", err)
+	}
+
+	providerPath := filepath.Join(dir, subscription.ProviderFileName(url))
+	if len(res.ProviderContent) > 0 {
+		if err := os.WriteFile(providerPath, res.ProviderContent, 0o600); err != nil {
+			return fmt.Errorf("保存订阅节点列表失败: %w", err)
+		}
+	} else {
+		// 订阅从 base64 变成 Clash 时，清掉遗留的 provider 文件。
+		_ = os.Remove(providerPath)
+	}
+	return nil
 }
 
 func (s *CoreService) loadSubs() {
@@ -2086,18 +2118,20 @@ func (s *CoreService) SwitchSubscription(idx int) error {
 		return fmt.Errorf("找不到该订阅的本地配置，请点刷新重新拉取: %w", err)
 	}
 	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-	var cfg map[string]any
-	if err := yaml.Unmarshal(b, &cfg); err != nil || cfg == nil {
+	res, err := subscription.Parse(b, meta.URL, meta.Insecure)
+	if err != nil {
 		return fmt.Errorf("订阅配置损坏: %w", err)
 	}
+	if err := s.writeSubscriptionFiles(meta.URL, res); err != nil {
+		return err
+	}
 
-	info := subInfoFromMeta(meta)
-	applySubConfigCounts(&info, cfg)
+	info := subInfoFromResult(meta, res)
 
 	s.mu.Lock()
 	s.activeIdx = idx
 	s.subURL = meta.URL
-	s.subConfig = cfg
+	s.subConfig = res.Config
 	s.subRaw = b
 	s.subInfo = info
 	s.mu.Unlock()
@@ -2225,6 +2259,7 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
 	s.mu.Unlock()
 
 	_ = os.Remove(filepath.Join(dataDir(), subFileName(removed.URL)))
+	_ = os.Remove(filepath.Join(dataDir(), subscription.ProviderFileName(removed.URL)))
 	s.saveSubs()
 
 	// 删掉的不是激活订阅，当前配置不受影响，不用重启。
@@ -2267,13 +2302,30 @@ func subInfoFromMeta(m subMeta) SubInfo {
 	}
 }
 
-// applySubConfigCounts 从订阅配置里统计节点/策略组/规则数量。
-// 元信息文件里不存这些数字；切换订阅后必须重新统计，
-// 否则设置页会一直显示 0 节点，直到应用重启。
-func applySubConfigCounts(info *SubInfo, cfg map[string]any) {
-	info.Nodes = countArray(cfg, "proxies")
-	info.Groups = countArray(cfg, "proxy-groups")
-	info.Rules = countArray(cfg, "rules")
+// subMetaFromResult 把解析结果映射成落盘的订阅元信息。
+func subMetaFromResult(url string, res *subscription.Result) subMeta {
+	return subMeta{
+		URL:       url,
+		Name:      res.Name,
+		FetchedAt: res.FetchedAt,
+		Insecure:  res.Insecure,
+		Upload:    res.Upload,
+		Download:  res.Download,
+		Total:     res.Total,
+		Expire:    res.Expire,
+		WebPage:   res.WebPage,
+		UpdateHrs: res.UpdateHrs,
+	}
+}
+
+// subInfoFromResult 把解析结果映射成界面用的订阅信息。
+// 节点/组/规则数都取解析结果，Clash 与 base64 订阅走同一套逻辑。
+func subInfoFromResult(m subMeta, res *subscription.Result) SubInfo {
+	info := subInfoFromMeta(m)
+	info.Nodes = len(res.Nodes)
+	info.Groups = len(res.Groups)
+	info.Rules = res.Rules
+	return info
 }
 
 // loadSavedSubscription 读取上次落盘的订阅，让应用离线也能直接起。
@@ -2314,17 +2366,21 @@ func (s *CoreService) loadSavedSubscription() {
 		}
 	}
 	cb = bytes.TrimPrefix(cb, []byte{0xEF, 0xBB, 0xBF})
-	var cfg map[string]any
-	if err := yaml.Unmarshal(cb, &cfg); err != nil || cfg == nil {
+	res, err := subscription.Parse(cb, meta.URL, meta.Insecure)
+	if err != nil {
+		s.dbg("load saved subscription failed: %v", err)
+		return
+	}
+	if err := s.writeSubscriptionFiles(meta.URL, res); err != nil {
+		s.dbg("write saved subscription failed: %v", err)
 		return
 	}
 
-	info := subInfoFromMeta(meta)
-	applySubConfigCounts(&info, cfg)
+	info := subInfoFromResult(meta, res)
 
 	s.mu.Lock()
 	s.subURL = meta.URL
-	s.subConfig = cfg
+	s.subConfig = res.Config
 	s.subRaw = cb
 	s.subInfo = info
 	s.mu.Unlock()
@@ -2356,26 +2412,20 @@ func (s *CoreService) Subscribe(url string) error {
 		return err
 	}
 
+	return s.applySubscription(url, res)
+}
+
+// applySubscription 把已拉取/解析好的订阅落盘并设为激活。
+// 单独抽出来供自动更新复用：避免自动更新时再拉一次同样的内容。
+func (s *CoreService) applySubscription(url string, res *subscription.Result) error {
 	dir := dataDir()
-	// 每个订阅有自己的配置文件，多订阅切换时靠它还原。
-	if err := os.WriteFile(filepath.Join(dir, subFileName(url)), res.Raw, 0o600); err != nil {
-		return fmt.Errorf("保存订阅配置失败: %w", err)
+	if err := s.writeSubscriptionFiles(url, res); err != nil {
+		return err
 	}
 	// 同时维护一份"当前订阅"，兼容旧路径与迁移。
 	_ = os.WriteFile(filepath.Join(dir, subConfigFile), res.Raw, 0o600)
 
-	meta := subMeta{
-		URL:       url,
-		Name:      res.Name,
-		FetchedAt: res.FetchedAt,
-		Insecure:  res.Insecure,
-		Upload:    res.Upload,
-		Download:  res.Download,
-		Total:     res.Total,
-		Expire:    res.Expire,
-		WebPage:   res.WebPage,
-		UpdateHrs: res.UpdateHrs,
-	}
+	meta := subMetaFromResult(url, res)
 	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		_ = os.WriteFile(filepath.Join(dir, subMetaFile), mb, 0o600)
 	}
@@ -2399,21 +2449,7 @@ func (s *CoreService) Subscribe(url string) error {
 	s.subURL = url
 	s.subConfig = res.Config
 	s.subRaw = res.Raw
-	s.subInfo = SubInfo{
-		URL:       url,
-		Name:      res.Name,
-		Nodes:     len(res.Nodes),
-		Groups:    len(res.Groups),
-		Rules:     res.Rules,
-		FetchedAt: res.FetchedAt,
-		Insecure:  res.Insecure,
-		Upload:    res.Upload,
-		Download:  res.Download,
-		Total:     res.Total,
-		Expire:    res.Expire,
-		WebPage:   res.WebPage,
-		UpdateHrs: res.UpdateHrs,
-	}
+	s.subInfo = subInfoFromResult(meta, res)
 	s.mu.Unlock()
 
 	s.saveSubs()
@@ -2450,8 +2486,14 @@ func (s *CoreService) RefreshSubscription() error {
 // ClearSubscription 移除订阅，回到内置的直连配置。
 func (s *CoreService) ClearSubscription() error {
 	dir := dataDir()
+	s.mu.RLock()
+	url := s.subURL
+	s.mu.RUnlock()
 	_ = os.Remove(filepath.Join(dir, subConfigFile))
 	_ = os.Remove(filepath.Join(dir, subMetaFile))
+	if url != "" {
+		_ = os.Remove(filepath.Join(dir, subscription.ProviderFileName(url)))
+	}
 
 	s.mu.Lock()
 	s.subURL = ""
@@ -2465,6 +2507,34 @@ func (s *CoreService) ClearSubscription() error {
 	return nil
 }
 
+// allProxies 合并内核 /proxies 与 /providers/proxies。
+// base64 订阅的节点只存在于 provider 里，不合并就看不到节点、
+// 批量测速和托盘快速切换也会漏掉它们。owner 记录节点属于哪个 provider。
+func (s *CoreService) allProxies(ctx context.Context) (map[string]kernel.Proxy, map[string]string, error) {
+	if s.api == nil {
+		return nil, nil, fmt.Errorf("内核未就绪")
+	}
+	proxies, err := s.api.Proxies(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	providers, err := s.api.ProviderProxies(ctx)
+	if err != nil {
+		// 老版本内核没有 provider 接口时退化为普通节点，不影响主功能。
+		return proxies, nil, nil
+	}
+	owner := make(map[string]string)
+	for providerName, list := range providers {
+		for _, p := range list {
+			if _, exists := proxies[p.Name]; !exists {
+				proxies[p.Name] = p
+			}
+			owner[p.Name] = providerName
+		}
+	}
+	return proxies, owner, nil
+}
+
 // Nodes 从内核读取实时节点与策略组，附带最近一次延迟。
 func (s *CoreService) Nodes() ([]NodeView, error) {
 	out := []NodeView{}
@@ -2474,7 +2544,7 @@ func (s *CoreService) Nodes() ([]NodeView, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	proxies, err := s.api.Proxies(ctx)
+	proxies, _, err := s.allProxies(ctx)
 	if err != nil {
 		return out, err
 	}
@@ -2520,10 +2590,21 @@ func (s *CoreService) TestNode(name string) int {
 	if s.api == nil {
 		return -1
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	d, err := s.api.Delay(ctx, name, "https://www.gstatic.com/generate_204", 5000)
-	if err != nil {
+	if err == nil && d > 0 {
+		return d
+	}
+
+	// base64 订阅的节点不在 /proxies 里，普通测速会 404，
+	// 需要按所属 provider 走专门的单节点测速接口。
+	_, owner, oerr := s.allProxies(ctx)
+	if oerr != nil || owner[name] == "" {
+		return -1
+	}
+	d, err = s.api.DelayProviderProxy(ctx, owner[name], name, "https://www.gstatic.com/generate_204", 5000)
+	if err != nil || d <= 0 {
 		return -1
 	}
 	return d
@@ -2539,8 +2620,8 @@ func (s *CoreService) TestAllNodes() map[string]int {
 		return out
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	proxies, err := s.api.Proxies(ctx)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	proxies, owner, err := s.allProxies(ctx)
 	cancel()
 	if err != nil {
 		return out
@@ -2572,7 +2653,15 @@ func (s *CoreService) TestAllNodes() map[string]int {
 			defer func() { <-sem }()
 			c, cc := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cc()
-			d, err := s.api.Delay(c, n, "https://www.gstatic.com/generate_204", 5000)
+
+			var d int
+			var err error
+			if provider := owner[n]; provider != "" {
+				d, err = s.api.DelayProviderProxy(c, provider, n, "https://www.gstatic.com/generate_204", 5000)
+			} else {
+				d, err = s.api.Delay(c, n, "https://www.gstatic.com/generate_204", 5000)
+			}
+
 			mu.Lock()
 			var v int
 			if err != nil || d <= 0 {
@@ -2929,55 +3018,123 @@ func (s *CoreService) startAutoUpdate() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
 		for range t.C {
+			if s.Quitting() {
+				return
+			}
 			s.maybeAutoRefresh()
 		}
 	}()
 }
 
+// maybeAutoRefresh 检查全部订阅的更新间隔，而不只是当前激活的那个。
+// 非激活订阅也各自更新原文与配额信息，切换过去时直接就是新内容；
+// 只有激活订阅内容真的变了才重启内核，避免无谓断连。
 func (s *CoreService) maybeAutoRefresh() {
 	s.mu.RLock()
-	url := s.subURL
-	fetched := s.subInfo.FetchedAt
-	hours := s.subInfo.UpdateHrs
-	old := append([]byte(nil), s.subRaw...)
-	// 后台自动更新绝不自行降级证书校验：只有用户当初就为该订阅勾选过才沿用。
-	allowInsecure := s.subInfo.Insecure
+	subs := append([]subMeta(nil), s.subs...)
 	s.mu.RUnlock()
 
-	if url == "" || hours <= 0 || fetched == 0 {
-		return
+	for _, m := range subs {
+		if m.URL == "" || m.UpdateHrs <= 0 || m.FetchedAt == 0 {
+			continue
+		}
+		if time.Since(time.UnixMilli(m.FetchedAt)) < time.Duration(m.UpdateHrs)*time.Hour {
+			continue
+		}
+		if s.Quitting() {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		res, err := subscription.Fetch(ctx, m.URL, m.Insecure)
+		cancel()
+		if err != nil {
+			s.dbg("auto refresh skipped (%s): %v", m.URL, err)
+			continue
+		}
+
+		// 用户可能在等待网络期间切走了订阅，别把旧的激活订阅又抢回来。
+		s.mu.RLock()
+		active := s.subURL
+		old := append([]byte(nil), s.subRaw...)
+		s.mu.RUnlock()
+
+		if m.URL != active {
+			s.applyInactiveSubscription(m.URL, res)
+			continue
+		}
+		if bytes.Equal(old, res.Raw) {
+			s.updateActiveSubMeta(m.URL, res)
+			continue
+		}
+		if err := s.applySubscription(m.URL, res); err != nil {
+			s.dbg("auto refresh apply failed: %v", err)
+			continue
+		}
+		// 让前端知道这次是自动更新，不是用户手动刷新。
+		if s.app != nil {
+			s.app.Event.Emit("sub-auto-updated", res.Name)
+		}
 	}
-	if time.Since(time.UnixMilli(fetched)) < time.Duration(hours)*time.Hour {
+}
+
+// updateActiveSubMeta 内容没变时只刷新配额与时间戳，不重启内核。
+func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result) {
+	meta := subMetaFromResult(url, res)
+	s.mu.Lock()
+	for i := range s.subs {
+		if s.subs[i].URL == url {
+			s.subs[i] = meta
+			break
+		}
+	}
+	if s.subURL == url {
+		s.subInfo.Name = meta.Name
+		s.subInfo.FetchedAt = meta.FetchedAt
+		s.subInfo.Upload = meta.Upload
+		s.subInfo.Download = meta.Download
+		s.subInfo.Total = meta.Total
+		s.subInfo.Expire = meta.Expire
+		s.subInfo.UpdateHrs = meta.UpdateHrs
+	}
+	s.mu.Unlock()
+
+	s.saveSubs()
+	s.persistSubMeta()
+}
+
+// applyInactiveSubscription 更新非激活订阅的原文与元信息，不动内核。
+func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Result) {
+	if err := s.writeSubscriptionFiles(url, res); err != nil {
+		s.dbg("auto refresh save failed (%s): %v", url, err)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	res, err := subscription.Fetch(ctx, url, allowInsecure)
-	if err != nil {
-		s.dbg("auto refresh skipped: %v", err)
-		return
+	meta := subMetaFromResult(url, res)
+	s.mu.Lock()
+	idx := -1
+	for i := range s.subs {
+		if s.subs[i].URL == url {
+			idx = i
+			break
+		}
 	}
-
-	// 内容没变就只刷新流量和时间戳，不要重启内核——
-	// 白白断一次连接的代价比省这点流量数据大得多。
-	if bytes.Equal(old, res.Raw) {
-		s.mu.Lock()
-		s.subInfo.FetchedAt = res.FetchedAt
-		s.subInfo.Upload = res.Upload
-		s.subInfo.Download = res.Download
-		s.subInfo.Total = res.Total
+	if idx < 0 {
 		s.mu.Unlock()
-		s.persistSubMeta()
 		return
 	}
+	s.subs[idx] = meta
+	becameActive := s.subURL == url
+	s.mu.Unlock()
 
-	_ = s.Subscribe(url)
-	// 让前端知道这次是自动更新，不是用户手动刷新。
-	if s.app != nil {
-		s.app.Event.Emit("sub-auto-updated", res.Name)
+	if becameActive {
+		// 等待网络期间用户切到了这个订阅，需要走激活路径重启内核。
+		if err := s.applySubscription(url, res); err != nil {
+			s.dbg("auto refresh activate failed: %v", err)
+		}
+		return
 	}
+	s.saveSubs()
 }
 
 // ProcessRules 返回当前的进程分流表。
