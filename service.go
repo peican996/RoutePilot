@@ -1,0 +1,2930 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"proxdeck/internal/autostart"
+	"proxdeck/internal/configgen"
+	"proxdeck/internal/elevate"
+	"proxdeck/internal/geoip"
+	"proxdeck/internal/kernel"
+	"proxdeck/internal/subscription"
+	"proxdeck/internal/sysproxy"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+	"gopkg.in/yaml.v3"
+)
+
+// proxyBackup 记录接管系统代理之前的原始设置。
+// 用户机器上很可能已经有别的代理软件在跑（比如另一个 Clash），
+// 关掉自己的代理时必须把它原样还回去，而不是一律关闭。
+//
+// 这份记录要落盘：系统代理存在注册表里是持久的，但进程内存不是。
+// 应用重启后必须能认出"注册表里那个地址是上次我自己设的"，
+// 否则要么误占别人的设置，要么显示未开启而实际开着、还指向一个死端口。
+type proxyBackup struct {
+	Addr     string `json:"addr"`     // 我们设进去的地址
+	Server   string `json:"server"`   // 接管前系统原本的地址
+	Override string `json:"override"` // 接管前系统原本的绕过列表
+	Enabled  bool   `json:"enabled"`  // 接管前系统原本是否启用
+	Saved    bool   `json:"saved"`
+}
+
+const proxyStateFile = "proxy.json"
+
+// CoreService 是暴露给前端的唯一入口。所有方法都会生成 TypeScript 绑定。
+type CoreService struct {
+	app *application.App
+
+	mgr *kernel.Manager
+	api *kernel.Client
+
+	mu        sync.RWMutex
+	mixedPort int
+	apiPort   int
+	dnsPort   int
+	secret    string
+	proxyOn   bool
+	tunOn     bool
+	mode      string
+	quitting  bool
+	backup    proxyBackup
+	booted    bool
+	bootErr   string
+
+	// 启动时要自动恢复的运行状态（从 app-state.json 读来）。
+	// TUN 需要管理员，做不到就保持关闭；系统代理随时能开。
+	restoreTUN   bool
+	restoreProxy bool
+
+	// GeoIP 查询器，用来把连接目标的 IP 定位到国家/经纬度。
+	geoDB *geoip.DB
+
+	// 订阅相关。subConfig 是机场返回的原始 Clash 配置，
+	// 作为生成最终配置的骨架。
+	subURL    string
+	subConfig map[string]any
+	subInfo   SubInfo
+	subRaw    []byte // 机场返回的原始内容，用来判断自动更新后配置有没有真变化
+
+	// 多订阅列表。subs[i] 是第 i 个订阅的元信息，activeIdx 指向正在用的那个。
+	subs      []subMeta
+	activeIdx int
+
+	// 按程序分流：进程名 → "proxy" / "direct"。没有记录的进程走订阅规则。
+	procRules map[string]string
+	// 用户明确选择"不再提示"的进程。
+	ignored map[string]bool
+
+	trafficMu sync.Mutex
+	lastUp    int64
+	lastDown  int64
+	lastTick  time.Time
+	rateUp    int64
+	rateDown  int64
+
+	// 分钟级流量历史，落盘持久化。
+	histMu  sync.Mutex
+	history []TrafficSample
+
+	// 节点延迟历史，记录每次测速。
+	delayMu      sync.Mutex
+	delayHistory map[string][]DelaySample
+
+	// 窗口位置记忆
+	winX, winY, winW, winH int
+
+	// 流量告警阈值（字节），0 = 关闭
+	alertLimit int64
+	// 已发过告警的日期（"2006-01-02"）。跨天自动失效，实现"当日一次"。
+	alertSentDay string
+
+	// 收藏节点名集合
+	favorites map[string]bool
+
+	// 地图上"本机"的坐标。默认东莞，可在设置里改；
+	// 不在该地区的用户不改的话，地图连线和距离全是错的。
+	homeLon, homeLat float64
+	homeLabel        string
+}
+
+func NewCoreService() *CoreService {
+	return &CoreService{
+		mixedPort: defaultMixedPort,
+		apiPort:   defaultAPIPort,
+		homeLon:   113.75, // 东莞
+		homeLat:   23.02,
+		homeLabel: "本机",
+	}
+}
+
+// 默认端口刻意避开 Clash 生态惯用的 7890/7891/7897 和 9090。
+// 这台机器上同时装着 Clash Verge 和 mini-clash，用 7890 必然被抢，
+// 内核就会静默漂移，系统代理跟着指错端口——这类问题排查成本极高。
+// 换到冷门号段后端口基本稳定，漂移检测退化成纯防御。
+const (
+	defaultMixedPort = 17890
+	defaultAPIPort   = 19090
+	defaultDNSPort   = 11053
+)
+
+// ---------- 视图模型 ----------
+
+type AppStatus struct {
+	State     string `json:"state"`
+	PID       int    `json:"pid"`
+	Uptime    int64  `json:"uptime"`
+	Error     string `json:"error"`
+	Version   string `json:"version"`
+	ProxyOn   bool   `json:"proxyOn"`
+	ProxyAddr string `json:"proxyAddr"`
+	MixedPort int    `json:"mixedPort"`
+	APIPort   int    `json:"apiPort"`
+	Mode      string `json:"mode"`
+	BootErr   string `json:"bootErr"`
+	DataDir   string `json:"dataDir"`
+	Tun       bool   `json:"tun"`
+	Admin     bool   `json:"admin"`
+}
+
+type ConnView struct {
+	ID          string `json:"id"`
+	Host        string `json:"host"`
+	Dest        string `json:"dest"`
+	DestIP      string `json:"destIP"`
+	Process     string `json:"process"`
+	ProcessPath string `json:"processPath"`
+	Chains      string `json:"chains"`
+	Rule        string `json:"rule"`
+	Upload      int64  `json:"upload"`
+	Download    int64  `json:"download"`
+	Start       string `json:"start"`
+	Network     string `json:"network"`
+}
+
+type TrafficView struct {
+	UpTotal   int64 `json:"upTotal"`
+	DownTotal int64 `json:"downTotal"`
+	UpRate    int64 `json:"upRate"`
+	DownRate  int64 `json:"downRate"`
+}
+
+// SubInfo 是订阅的元信息，给前端展示用。
+type SubInfo struct {
+	URL       string `json:"url"`
+	Name      string `json:"name"`
+	Nodes     int    `json:"nodes"`
+	Groups    int    `json:"groups"`
+	Rules     int    `json:"rules"`
+	FetchedAt int64  `json:"fetchedAt"`
+	Insecure  bool   `json:"insecure"`
+	Upload    int64  `json:"upload"`
+	Download  int64  `json:"download"`
+	Total     int64  `json:"total"`
+	Expire    int64  `json:"expire"`
+	WebPage   string `json:"webPage"`
+	UpdateHrs int    `json:"updateHrs"`
+	Error     string `json:"error"`
+}
+
+// NodeView 是节点/策略组列表项。
+type NodeView struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Delay int    `json:"delay"`
+	Group bool   `json:"group"`
+	Now   string `json:"now"`
+	Count int    `json:"count"`
+}
+
+// ---------- 初始化 ----------
+
+// 数据目录名。历史版本叫 ProxDeck，现已统一为产品名 NexusLink，
+// 旧目录在首次启动时由 migrateDataDir 搬过来。
+const (
+	dataDirName   = "NexusLink"
+	legacyDirName = "ProxDeck"
+)
+
+func dataDir() string {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		base = "."
+	}
+	return filepath.Join(base, dataDirName)
+}
+
+// migrateDataDir 把旧数据目录搬到新名字下。
+// 只在「新目录不存在 + 旧目录存在」时执行一次，避免覆盖用户已有数据。
+func (s *CoreService) migrateDataDir() {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return
+	}
+	oldDir := filepath.Join(base, legacyDirName)
+	newDir := filepath.Join(base, dataDirName)
+
+	if _, err := os.Stat(newDir); err == nil {
+		return // 新目录已存在，什么都不动
+	}
+	if fi, err := os.Stat(oldDir); err != nil || !fi.IsDir() {
+		return
+	}
+
+	// 同一卷内 rename 是原子的，最干净
+	if err := os.Rename(oldDir, newDir); err == nil {
+		return
+	}
+	// 跨卷或被占用时退化为逐个复制；只有全部成功才删旧目录，
+	// 否则宁可留着让用户手动处理，也不能把没复制过去的数据删掉。
+	if err := copyDirAll(oldDir, newDir); err != nil {
+		s.dbg("data dir migrate skipped: %v", err)
+		return
+	}
+	_ = os.RemoveAll(oldDir)
+}
+
+// copyDirAll 递归复制目录。
+//
+// 任何文件复制失败都必须反映到返回值：调用方据此决定是否删除旧目录。
+// 之前失败一律 continue、永远返回 nil，随后 RemoveAll 旧目录，
+// 被占用（比如旧实例没退干净的 mihomo.exe）的文件就这样丢了。
+func copyDirAll(src, dst string) error {
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	var failed []string
+	for _, e := range entries {
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			if err := copyDirAll(srcPath, dstPath); err != nil {
+				failed = append(failed, e.Name()+"/")
+			}
+			continue
+		}
+		b, err := os.ReadFile(srcPath)
+		if err != nil {
+			failed = append(failed, e.Name())
+			continue
+		}
+		if err := os.WriteFile(dstPath, b, 0o644); err != nil {
+			failed = append(failed, e.Name())
+		}
+	}
+	if len(failed) > 0 {
+		// 只报前几个，避免日志刷屏
+		head := failed
+		if len(head) > 3 {
+			head = head[:3]
+		}
+		return fmt.Errorf("%d 个文件复制失败（%s），旧目录已保留",
+			len(failed), strings.Join(head, ", "))
+	}
+	return nil
+}
+
+// ensureGeodata 把内置的 GeoIP / GeoSite 数据库释放到数据目录。
+// 大小一致就跳过，避免每次启动都写十几兆。
+func ensureGeodata(dir string) {
+	files := map[string][]byte{
+		"geoip.metadb": geoipEmbed,
+		"geosite.dat":  geositeEmbed,
+	}
+	for name, data := range files {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && st.Size() == int64(len(data)) {
+			continue
+		}
+		_ = os.WriteFile(p, data, 0o644)
+	}
+}
+
+// randomSecret 生成控制 API 的鉴权密钥。
+// 熵不足时绝不回退到固定串——那等于把控制接口对本机所有程序敞开。
+func randomSecret() (string, error) {
+	b := make([]byte, 32)
+	for i := 0; i < 3; i++ {
+		if _, err := rand.Read(b); err == nil {
+			return hex.EncodeToString(b), nil
+		}
+	}
+	return "", fmt.Errorf("无法生成控制 API 密钥：系统随机源不可用")
+}
+
+// pickPort 返回一个尽量不冲突的端口：从 prefer 开始往上找。
+func pickPort(prefer int) int {
+	for p := prefer; p < prefer+60; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			_ = ln.Close()
+			return p
+		}
+	}
+	return prefer
+}
+
+// Boot 完成一次性准备：释放内核、生成配置、启动进程。
+// 内核启动是异步的，前端靠轮询 Status 感知状态变化。
+func (s *CoreService) Boot() {
+	// 迁移必须在任何读写数据目录的操作之前完成
+	s.migrateDataDir()
+
+	dir := dataDir()
+	s.mu.Lock()
+	if s.booted {
+		s.mu.Unlock()
+		return
+	}
+	s.booted = true
+	s.mu.Unlock()
+
+	// 读上次的运行状态（模式、TUN、系统代理），启动后按需恢复。
+	s.loadAppState()
+
+	// GeoIP 用于地图上标注连接目标的位置。加载失败不影响主功能，
+	// 只是地图上少一层"目标点"。
+	if db, err := geoip.Load(geoipEmbed); err == nil {
+		s.geoDB = db
+	}
+
+	mgr := kernel.NewManager(dir)
+	s.mgr = mgr
+
+	if _, err := mgr.EnsureBinary(embeddedKernel); err != nil {
+		s.setBootErr(err.Error())
+		return
+	}
+	// wintun.dll 是 TUN 模式的虚拟网卡驱动，提前放好，省得开启 TUN 时才发现缺文件。
+	mgr.EnsureAux(map[string][]byte{"wintun.dll": wintunDLL})
+	// 内核没有 GeoIP 数据库会去 GitHub 现下，国内基本卡死在这里。
+	// 直接内置一份，保证断网/新机器也能首次启动。
+	ensureGeodata(dir)
+
+	sec, err := randomSecret()
+	if err != nil {
+		s.setBootErr(err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	s.secret = sec
+	s.mixedPort = pickPort(defaultMixedPort)
+	s.apiPort = pickPort(defaultAPIPort)
+	s.dnsPort = pickPort(defaultDNSPort)
+	s.api = kernel.NewClient(fmt.Sprintf("127.0.0.1:%d", s.apiPort), s.secret)
+	s.mu.Unlock()
+
+	// 如果上次用过订阅，直接拿本地缓存起，不用等网络。
+	s.loadSavedSubscription()
+	s.loadProcRules()
+	s.loadIgnored()
+	_ = s.writeProcRulesYAML()
+
+	confPath, err := configgen.Write(dir, s.options())
+	if err != nil {
+		s.setBootErr(err.Error())
+		return
+	}
+
+	if err := mgr.Start(confPath); err != nil {
+		s.setBootErr(err.Error())
+		return
+	}
+
+	s.startAutoUpdate()
+	s.startHistorySampler()
+	s.startKernelWatchdog()
+	s.startNetworkHealthCheck()
+	s.afterStart()
+}
+
+// options 汇总当前端口与密钥，供生成配置使用。
+func (s *CoreService) options() configgen.Options {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	mode := s.mode
+	if mode == "" {
+		mode = "rule"
+	}
+
+	// TUN 以当前期望态为准。restoreTUN 只表示"上次退出时开着"，
+	// 用于启动阶段的一次性恢复，不能拿来生成配置——否则会话内开关
+	// TUN 改不动配置，界面显示和实际行为会脱节。
+	wantTUN := s.tunOn && elevate.IsElevated()
+
+	return configgen.Options{
+		MixedPort:    s.mixedPort,
+		APIPort:      s.apiPort,
+		DNSListen:    s.dnsPort,
+		Secret:       s.secret,
+		Mode:         mode,
+		Tun:          wantTUN,
+		ProcessRules: true,
+		Base:         s.subConfig,
+	}
+}
+
+// afterStart 等内核就绪后，把真实监听端口同步回来。
+//
+// mihomo 在端口被占用时会自动顺延（7890 → 7891），配置里写的端口因此
+// 不一定是它真正监听的端口。如果系统代理指向一个没人监听的端口，
+// 用户的表现就是"一开代理就断网"。所以必须以内核自报为准。
+func (s *CoreService) afterStart() {
+	if s.api == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for {
+			if _, err := s.api.Version(ctx); err == nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		cfg, err := s.api.Configs(ctx)
+		if err != nil || cfg.MixedPort <= 0 {
+			return
+		}
+		s.mu.Lock()
+		changed := s.mixedPort != cfg.MixedPort
+		s.mixedPort = cfg.MixedPort
+		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
+		proxyOn := s.proxyOn
+		s.mu.Unlock()
+		if changed && proxyOn {
+			_ = sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort))
+		}
+
+		// 校正系统代理：确保它指向内核这次真正监听的端口。
+		s.reconcileProxy()
+
+		// 恢复上次退出时的接管状态。
+		// TUN 的配置在生成阶段已经带上，这里只同步标记；
+		// 系统代理要显式开一次（reconcileProxy 只处理代理重启前后的状态，
+		// 处理不了"用户上次主动开着、这次要重新打开"）。
+		s.mu.RLock()
+		wantTUN := s.restoreTUN && elevate.IsElevated()
+		wantProxy := s.restoreProxy
+		s.mu.RUnlock()
+
+		if wantTUN {
+			s.mu.Lock()
+			s.tunOn = true
+			s.mu.Unlock()
+		} else if wantProxy {
+			_ = s.SetSystemProxy(true)
+		}
+	}()
+}
+
+func (s *CoreService) setBootErr(msg string) {
+	s.mu.Lock()
+	s.bootErr = msg
+	s.mu.Unlock()
+}
+
+func (s *CoreService) Attach(app *application.App) { s.app = app }
+
+// Shutdown 在应用退出时调用。只有确实是我们开的代理才需要还原，
+// 否则会把用户原本正在用的代理设置一并抹掉。
+func (s *CoreService) Shutdown() {
+	s.mu.RLock()
+	on := s.proxyOn
+	s.mu.RUnlock()
+	if on {
+		_ = s.restoreSystemProxy()
+	}
+	if s.mgr != nil {
+		_ = s.mgr.Stop()
+	}
+}
+
+// ---------- 状态 ----------
+
+func (s *CoreService) Status() AppStatus {
+	s.mu.RLock()
+	mixed, apiPort, proxyOn, bootErr, tunOn := s.mixedPort, s.apiPort, s.proxyOn, s.bootErr, s.tunOn
+	s.mu.RUnlock()
+
+	st := AppStatus{
+		MixedPort: mixed,
+		APIPort:   apiPort,
+		ProxyOn:   proxyOn,
+		ProxyAddr: fmt.Sprintf("127.0.0.1:%d", mixed),
+		Mode:      "rule",
+		BootErr:   bootErr,
+		DataDir:   dataDir(),
+		Tun:       tunOn,
+		Admin:     elevate.IsElevated(),
+	}
+	if s.mgr != nil {
+		ks := s.mgr.Status()
+		st.State = string(ks.State)
+		st.PID = ks.PID
+		st.Uptime = ks.Uptime
+		st.Error = ks.Error
+	}
+	if s.api != nil && st.State == "running" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if v, err := s.api.Version(ctx); err == nil {
+			st.Version = v.Version
+		}
+		if c, err := s.api.Configs(ctx); err == nil {
+			st.Mode = c.Mode
+		}
+	}
+	return st
+}
+
+// ---------- 内核控制 ----------
+
+func (s *CoreService) StartKernel() error {
+	if s.mgr == nil {
+		return fmt.Errorf("内核管理器未初始化")
+	}
+	confPath, err := configgen.Write(dataDir(), s.options())
+	if err != nil {
+		return err
+	}
+	if err := s.mgr.Start(confPath); err != nil {
+		return err
+	}
+	s.afterStart()
+	return nil
+}
+
+func (s *CoreService) StopKernel() error {
+	if s.mgr == nil {
+		return nil
+	}
+	if pc, file, line, ok := runtime.Caller(1); ok {
+		fn := runtime.FuncForPC(pc)
+		name := "?"
+		if fn != nil {
+			name = fn.Name()
+		}
+		s.dbg("StopKernel <- %s (%s:%d)", name, filepath.Base(file), line)
+	}
+	// 先恢复系统代理，避免关了内核还挂着代理导致断网。
+	if err := s.SetSystemProxy(false); err != nil {
+		_ = err
+	}
+	return s.mgr.Stop()
+}
+
+func (s *CoreService) RestartKernel() error {
+	if s.mgr == nil {
+		return fmt.Errorf("内核管理器未初始化")
+	}
+	// 记录触发方：内核反复重启时，只有调用栈能说明是谁在重启它。
+	if pc, file, line, ok := runtime.Caller(1); ok {
+		fn := runtime.FuncForPC(pc)
+		name := "?"
+		if fn != nil {
+			name = fn.Name()
+		}
+		s.dbg("RestartKernel <- %s (%s:%d)", name, filepath.Base(file), line)
+	}
+	confPath, err := configgen.Write(dataDir(), s.options())
+	if err != nil {
+		return err
+	}
+	if err := s.mgr.Restart(confPath); err != nil {
+		return err
+	}
+	s.afterStart()
+	return nil
+}
+
+// ---------- 系统代理 ----------
+
+func (s *CoreService) SetSystemProxy(on bool) error {
+	s.mu.RLock()
+	addr := fmt.Sprintf("127.0.0.1:%d", s.mixedPort)
+	s.mu.RUnlock()
+
+	if on {
+		if s.mgr != nil && !s.mgr.IsRunning() {
+			return fmt.Errorf("请先启动内核再开启系统代理")
+		}
+		// TUN 已经在 IP 层接管全部流量，这时再开系统代理等于代理两遍。
+		// 界面里的开关会禁用，但托盘菜单里的没禁，所以这里也必须拦一道。
+		s.mu.RLock()
+		tun := s.tunOn
+		s.mu.RUnlock()
+		if tun {
+			return fmt.Errorf("TUN 已开启，正在接管全部流量，请先关闭 TUN")
+		}
+		s.mu.Lock()
+		if !s.backup.Saved {
+			srv, enabled := sysproxy.Current()
+			s.backup = proxyBackup{
+				Addr:     addr,
+				Server:   srv,
+				Override: sysproxy.Override(),
+				Enabled:  enabled,
+				Saved:    true,
+			}
+		} else {
+			s.backup.Addr = addr
+		}
+		bk := s.backup
+		s.mu.Unlock()
+		if err := sysproxy.Enable(addr); err != nil {
+			return err
+		}
+		s.persistProxyState(bk)
+	} else {
+		if err := s.restoreSystemProxy(); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	s.proxyOn = on
+	s.mu.Unlock()
+	s.saveAppState()
+	return nil
+}
+
+// restoreSystemProxy 把系统代理还原成被接管之前的样子。
+// 原本就指向别的代理软件时原样还回去，原本关着才关闭。
+//
+// 关键前提：只还原「确实是我们接管过」的系统代理。
+// 没有接管记录时什么都不做——否则用户机器上正在跑的 Clash Verge、
+// v2rayN 之类会被我们顺手关掉，表现为"点了停止内核，整台机器断网"。
+func (s *CoreService) restoreSystemProxy() error {
+	s.mu.Lock()
+	bk := s.backup
+	s.backup = proxyBackup{}
+	s.mu.Unlock()
+
+	// 内存里没有记录（比如刚从托盘恢复、或进程重启过），
+	// 再看一眼磁盘上的接管记录，避免把指向死端口的代理留在注册表里。
+	if !bk.Saved {
+		bk = readProxyState()
+	}
+	if !bk.Saved {
+		return nil
+	}
+
+	_ = os.Remove(filepath.Join(dataDir(), proxyStateFile))
+
+	var err error
+	if bk.Enabled && bk.Server != "" {
+		err = sysproxy.Enable(bk.Server)
+	} else {
+		err = sysproxy.Disable()
+	}
+	// Enable 会把 ProxyOverride 覆盖成我们的固定串，用户原来的绕过列表
+	// 必须还原回去，否则自定义的 bypass 规则永久丢失。
+	if bk.Override != "" {
+		if e := sysproxy.SetOverride(bk.Override); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+// readProxyState 从磁盘读接管记录。没有记录或记录无效时返回零值。
+func readProxyState() proxyBackup {
+	b, err := os.ReadFile(filepath.Join(dataDir(), proxyStateFile))
+	if err != nil {
+		return proxyBackup{}
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var st proxyBackup
+	if err := json.Unmarshal(b, &st); err != nil {
+		return proxyBackup{}
+	}
+	return st
+}
+
+func (s *CoreService) persistProxyState(bk proxyBackup) {
+	mb, err := json.Marshal(bk)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dataDir(), proxyStateFile), mb, 0o600)
+}
+
+// reconcileProxy 让系统代理始终指向内核的真实端口。
+//
+// 系统代理是注册表里的持久状态，而内核端口会因端口冲突而变。
+// 只要 proxy.json 还在，就说明当前是我们接管中——此时不管内存里的
+// proxyOn 是什么值，都要把注册表校正到真实端口，否则用户看到的就是
+// "开关明明开着，网页却打不开"。
+func (s *CoreService) reconcileProxy() {
+	dir := dataDir()
+	b, err := os.ReadFile(filepath.Join(dir, proxyStateFile))
+	if err != nil {
+		// 没有接管记录，说明系统代理不归我们管，别去碰。
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var st proxyBackup
+	if err := json.Unmarshal(b, &st); err != nil || !st.Saved {
+		return
+	}
+
+	cur, enabled := sysproxy.Current()
+	if !enabled {
+		// 用户自己把系统代理关了，撤掉接管记录。
+		_ = os.Remove(filepath.Join(dir, proxyStateFile))
+		s.mu.Lock()
+		s.proxyOn = false
+		s.backup = proxyBackup{}
+		s.mu.Unlock()
+		return
+	}
+
+	s.mu.Lock()
+	want := fmt.Sprintf("127.0.0.1:%d", s.mixedPort)
+	s.proxyOn = true
+	s.backup = st
+	s.mu.Unlock()
+
+	if strings.EqualFold(cur, want) {
+		return
+	}
+	// 注册表指向的是旧端口，校正到当前端口，并更新接管记录。
+	if err := sysproxy.Enable(want); err == nil {
+		st.Addr = want
+		s.persistProxyState(st)
+	}
+}
+
+func (s *CoreService) SystemProxyState() bool {
+	_, enabled := sysproxy.Current()
+	return enabled
+}
+
+// ---------- TUN ----------
+
+// SetTUN 开关 TUN 模式。TUN 在 IP 层接管全部流量，
+// 是代理"不读系统代理设置"的程序（游戏、UWP、命令行工具）的唯一办法。
+func (s *CoreService) SetTUN(on bool) error {
+	if on && !elevate.IsElevated() {
+		return fmt.Errorf("开启 TUN 需要管理员权限")
+	}
+
+	// 先记住原状态。内核重启失败时要整体回滚——
+	// 不能出现"界面上写着开启、实际没启用"这种脱节。
+	s.mu.RLock()
+	prevTUN := s.tunOn
+	prevProxyOn := s.proxyOn
+	prevBackup := s.backup
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	s.tunOn = on
+	s.mu.Unlock()
+
+	if on {
+		// TUN 已经接管全部出站流量，此时如果系统代理还开着，
+		// 浏览器会先连本地代理端口、再由 TUN 转发一次，等于代理两遍。
+		// 所以强制关掉，并撤掉接管记录，避免 reconcileProxy 又把它打开。
+		_ = sysproxy.Disable()
+		_ = os.Remove(filepath.Join(dataDir(), proxyStateFile))
+		s.mu.Lock()
+		s.proxyOn = false
+		s.backup = proxyBackup{}
+		s.mu.Unlock()
+	}
+
+	if s.mgr != nil && s.mgr.IsRunning() {
+		if err := s.RestartKernel(); err != nil {
+			s.mu.Lock()
+			s.tunOn = prevTUN
+			s.proxyOn = prevProxyOn
+			s.backup = prevBackup
+			s.mu.Unlock()
+			s.saveAppState()
+			// 刚才为了开 TUN 把系统代理关了，失败就恢复回去，
+			// 否则用户会莫名其妙上不了网。
+			if prevProxyOn && prevBackup.Addr != "" {
+				_ = sysproxy.Enable(prevBackup.Addr)
+			}
+			return fmt.Errorf("切换失败，已回滚: %w", err)
+		}
+	}
+
+	s.saveAppState()
+	return nil
+}
+
+func (s *CoreService) TUNState() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tunOn
+}
+
+// ProxyEnabled 给托盘菜单读当前状态（菜单项需要在打开时知道勾没勾）。
+func (s *CoreService) ProxyEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.proxyOn
+}
+
+// Quitting 标记"用户是从托盘菜单主动退出的"，此时窗口关闭不再拦截。
+func (s *CoreService) Quitting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quitting
+}
+
+func (s *CoreService) MarkQuitting() {
+	s.mu.Lock()
+	s.quitting = true
+	s.mu.Unlock()
+}
+
+// ---------- 配置备份 ----------
+
+// ConfigBundle 导出的配置包。只含用户配置，不含流量历史等运行数据。
+type ConfigBundle struct {
+	Version    int               `json:"version"`
+	ExportedAt int64             `json:"exportedAt"`
+	Subs       []subMeta         `json:"subs"`
+	ProcRules  map[string]string `json:"procRules"`
+	Ignored    []string          `json:"ignored"`
+}
+
+// ExportConfig 导出配置为 JSON 字符串，供前端保存成文件。
+func (s *CoreService) ExportConfig() (string, error) {
+	s.mu.RLock()
+	bundle := ConfigBundle{
+		Version:    1,
+		ExportedAt: time.Now().Unix(),
+		Subs:       s.subs,
+		ProcRules:  s.procRules,
+	}
+	for k, v := range s.ignored {
+		if v {
+			bundle.Ignored = append(bundle.Ignored, k)
+		}
+	}
+	s.mu.RUnlock()
+
+	data, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// ImportConfig 从 JSON 导入配置。会覆盖当前订阅与进程规则。
+func (s *CoreService) ImportConfig(jsonStr string) error {
+	var bundle ConfigBundle
+	if err := json.Unmarshal([]byte(jsonStr), &bundle); err != nil {
+		return fmt.Errorf("配置格式不正确: %w", err)
+	}
+	if bundle.Version != 1 {
+		return fmt.Errorf("不支持的配置版本: %d", bundle.Version)
+	}
+
+	s.mu.Lock()
+	s.subs = bundle.Subs
+	s.procRules = bundle.ProcRules
+	s.ignored = make(map[string]bool)
+	for _, n := range bundle.Ignored {
+		s.ignored[n] = true
+	}
+	s.mu.Unlock()
+
+	s.saveSubs()
+	s.saveAppState()
+
+	// 导入的进程分流规则必须立刻落进 provider 文件并重载内核，
+	// 否则要等下一次别的操作触发写入才生效，表现为"导入完没反应"。
+	if mb, err := json.MarshalIndent(s.ProcessRules(), "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+	}
+	if mb, err := json.MarshalIndent(s.IgnoredProcesses(), "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644)
+	}
+	_ = s.writeProcRulesYAML()
+
+	if s.mgr != nil && s.mgr.IsRunning() {
+		if err := s.RestartKernel(); err != nil {
+			return fmt.Errorf("配置已导入，但重载内核失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// ---------- 节点延迟历史 ----------
+
+// DelaySample 是一次测速结果。
+type DelaySample struct {
+	Time  int64 `json:"t"` // Unix 秒
+	Delay int32 `json:"d"` // 延迟毫秒，<=0 表示超时/失败
+}
+
+// delayHistoryKeep 每个节点保留最近 100 次测速。
+const delayHistoryKeep = 100
+
+// NodeDelayHistory 返回所有节点的延迟历史，按时间升序。
+func (s *CoreService) NodeDelayHistory() map[string][]DelaySample {
+	s.delayMu.Lock()
+	defer s.delayMu.Unlock()
+	out := make(map[string][]DelaySample, len(s.delayHistory))
+	for k, v := range s.delayHistory {
+		cp := make([]DelaySample, len(v))
+		copy(cp, v)
+		out[k] = cp
+	}
+	return out
+}
+
+// recordDelay 记录一次测速结果。容量到顶就丢最旧的。
+func (s *CoreService) recordDelay(name string, delay int32) {
+	s.delayMu.Lock()
+	defer s.delayMu.Unlock()
+	if s.delayHistory == nil {
+		s.delayHistory = make(map[string][]DelaySample)
+	}
+	list := append(s.delayHistory[name], DelaySample{Time: time.Now().Unix(), Delay: delay})
+	if len(list) > delayHistoryKeep {
+		list = list[len(list)-delayHistoryKeep:]
+	}
+	s.delayHistory[name] = list
+}
+
+// ---------- 规则可视化 ----------
+
+// RuleView 给前端展示的规则条目。
+type RuleView struct {
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+	Proxy   string `json:"proxy"`
+}
+
+// ListRules 返回当前生效的分流规则，顺序即匹配顺序。
+func (s *CoreService) ListRules() ([]RuleView, error) {
+	if s.api == nil {
+		return nil, fmt.Errorf("内核未就绪")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rules, err := s.api.Rules(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RuleView, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, RuleView{Type: r.Type, Payload: r.Payload, Proxy: r.Proxy})
+	}
+	return out, nil
+}
+
+// startKernelWatchdog 内核崩溃自动重启。连续失败 3 次后放弃，避免死循环。
+func (s *CoreService) startKernelWatchdog() {
+	failCount := 0
+	s.mgr.OnExit = func(reason string) {
+		s.dbg("kernel exited unexpectedly: %s (quitting=%v)", reason, s.Quitting())
+		if s.Quitting() {
+			return
+		}
+		failCount++
+		if failCount > 3 {
+			s.app.Event.Emit("kernel-crashed", "内核连续崩溃 3 次，已停止自动重启，请查看数据目录下的 debug.log")
+			return
+		}
+		// 第一次崩就悄悄拉起，不打扰用户；连着崩才值得弹通知。
+		if failCount >= 2 {
+			s.app.Event.Emit(
+				"kernel-crashed",
+				fmt.Sprintf("内核反复退出（第 %d 次：%s），正在重试", failCount, reason),
+			)
+		}
+		s.dbg("kernel restart scheduled in %ds (failCount=%d)", failCount*2, failCount)
+		time.Sleep(time.Duration(failCount*2) * time.Second)
+		if s.Quitting() {
+			return
+		}
+		if err := s.RestartKernel(); err == nil {
+			failCount = 0
+		}
+	}
+}
+
+// startNetworkHealthCheck 每 2 分钟测一次代理链路是否通。
+// 连续 2 次失败才告警（避免瞬时波动误报），恢复后重置计数。
+func (s *CoreService) startNetworkHealthCheck() {
+	failCount := 0
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		// 首次检查等 30 秒，等内核完全就绪
+		time.Sleep(30 * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+			}
+			if s.Quitting() {
+				return
+			}
+			// 走代理测一个 204 端点
+			if s.api == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			d, err := s.api.Delay(ctx, "GLOBAL", "https://www.gstatic.com/generate_204", 5000)
+			cancel()
+			if err != nil || d <= 0 {
+				failCount++
+				if failCount >= 2 {
+					s.app.Event.Emit("network-degraded", "代理链路连续 2 次检测失败，网络可能不通")
+					failCount = 0 // 发一次告警后重置，避免刷屏
+				}
+			} else {
+				failCount = 0
+			}
+		}
+	}()
+}
+
+// ---------- 流量告警 ----------
+
+// TrafficAlertLimit 日流量告警阈值（字节）。0 表示不告警。
+func (s *CoreService) TrafficAlertLimit() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.alertLimit
+}
+
+// SetTrafficAlertLimit 设置日流量告警阈值（MB）。0 关闭告警。
+func (s *CoreService) SetTrafficAlertLimit(mb int64) {
+	if mb < 0 {
+		mb = 0
+	}
+	s.mu.Lock()
+	s.alertLimit = mb * 1024 * 1024
+	s.mu.Unlock()
+}
+
+// checkTrafficAlertToday 检查今日累计流量是否超阈值。
+//
+// "当日只告警一次"按日期判断，而不是一个进程级的布尔值——否则程序
+// 连开几天也只在第一天提醒一次。状态收进 CoreService 并加锁，
+// 避免采样 goroutine 与设置调用并发读写。
+func (s *CoreService) checkTrafficAlertToday() {
+	limit := s.TrafficAlertLimit()
+	if limit <= 0 || s.app == nil {
+		return
+	}
+
+	now := time.Now()
+	today := now.Format("2006-01-02")
+
+	s.mu.RLock()
+	already := s.alertSentDay == today
+	s.mu.RUnlock()
+	if already {
+		return
+	}
+
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Unix()
+	s.histMu.Lock()
+	var up, down int64
+	for _, sample := range s.history {
+		if sample.Time >= todayStart {
+			up += sample.Up
+			down += sample.Down
+		}
+	}
+	s.histMu.Unlock()
+
+	total := up + down
+	if total < limit {
+		return
+	}
+
+	// 再检查一次并置位，防止并发重复弹窗
+	s.mu.Lock()
+	if s.alertSentDay == today {
+		s.mu.Unlock()
+		return
+	}
+	s.alertSentDay = today
+	s.mu.Unlock()
+
+	s.app.Event.Emit("traffic-alert", fmt.Sprintf("今日流量已达 %s，超过设定阈值", formatBytes(total)))
+}
+
+// formatBytes 字节转人类可读。
+func formatBytes(n int64) string {
+	f := float64(n)
+	switch {
+	case f >= 1<<30:
+		return fmt.Sprintf("%.2f GB", f/(1<<30))
+	case f >= 1<<20:
+		return fmt.Sprintf("%.1f MB", f/(1<<20))
+	case f >= 1<<10:
+		return fmt.Sprintf("%.0f KB", f/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// ---------- 日志导出 ----------
+
+// ExportLogs 返回当前日志内容（纯文本，每行一条）。
+func (s *CoreService) ExportLogs() string {
+	if s.mgr == nil {
+		return ""
+	}
+	return s.mgr.Logs.Dump()
+}
+
+// ---------- 节点收藏 ----------
+
+// HomeLocation 返回地图上"本机"的位置。
+type HomeLocation struct {
+	Lon   float64 `json:"lon"`
+	Lat   float64 `json:"lat"`
+	Label string  `json:"label"`
+}
+
+// HomeLocation 读取当前设置的本机坐标。
+func (s *CoreService) HomeLocation() HomeLocation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	label := s.homeLabel
+	if label == "" {
+		label = "本机"
+	}
+	return HomeLocation{Lon: s.homeLon, Lat: s.homeLat, Label: label}
+}
+
+// SetHomeLocation 设置本机坐标。地图的起点和连线都以它为基准。
+func (s *CoreService) SetHomeLocation(lon, lat float64, label string) error {
+	if lon < -180 || lon > 180 {
+		return fmt.Errorf("经度必须在 -180 ~ 180 之间")
+	}
+	if lat < -90 || lat > 90 {
+		return fmt.Errorf("纬度必须在 -90 ~ 90 之间")
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "本机"
+	}
+	s.mu.Lock()
+	s.homeLon, s.homeLat, s.homeLabel = lon, lat, label
+	s.mu.Unlock()
+	s.saveAppState()
+	return nil
+}
+
+// FavoriteNodes 返回收藏的节点名列表。
+func (s *CoreService) FavoriteNodes() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.favorites))
+	for name, v := range s.favorites {
+		if v {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// IsFavorite 判断节点是否已收藏。
+func (s *CoreService) IsFavorite(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.favorites[name]
+}
+
+// ToggleFavorite 切换收藏状态，返回切换后的状态。
+func (s *CoreService) ToggleFavorite(name string) bool {
+	s.mu.Lock()
+	if s.favorites == nil {
+		s.favorites = make(map[string]bool)
+	}
+	s.favorites[name] = !s.favorites[name]
+	on := s.favorites[name]
+	if !on {
+		delete(s.favorites, name)
+	}
+	s.mu.Unlock()
+	s.saveAppState()
+	return on
+}
+
+// ---------- 托盘快捷操作 ----------
+
+// Mode 返回当前代理模式。
+func (s *CoreService) Mode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mode
+}
+
+// pickSelectorGroup 确定性地挑一个用户策略组。
+//
+// map 迭代顺序是随机的，"取第一个 Selector" 在多策略组订阅里会每次
+// 选到不同的组，表现为托盘菜单偶尔选错节点。规则改为：
+// 成员多的优先（通常是主选择组），成员数相同再按名字排序。
+// mustContain 非空时只考虑包含该节点的组。
+func pickSelectorGroup(proxies map[string]kernel.Proxy, mustContain string) string {
+	names := make([]string, 0, len(proxies))
+	for name, p := range proxies {
+		if p.Type != "Selector" || builtinGroupNames[name] {
+			continue
+		}
+		if mustContain != "" {
+			ok := false
+			for _, m := range p.All {
+				if m == mustContain {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Slice(names, func(i, j int) bool {
+		li, lj := len(proxies[names[i]].All), len(proxies[names[j]].All)
+		if li != lj {
+			return li > lj
+		}
+		return names[i] < names[j]
+	})
+	return names[0]
+}
+
+// QuickNodes 返回 topN 个延迟最低的节点名和当前选中节点。
+// 托盘菜单打开时调用，要快，只走已缓存的测速数据。
+func (s *CoreService) QuickNodes(topN int) ([]string, string) {
+	if s.api == nil {
+		return nil, ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	proxies, err := s.api.Proxies(ctx)
+	if err != nil {
+		return nil, ""
+	}
+
+	active := ""
+	if group := pickSelectorGroup(proxies, ""); group != "" {
+		active = proxies[group].Now
+	}
+
+	type nodeInfo struct {
+		name  string
+		delay int
+	}
+	var nodes []nodeInfo
+	for name, p := range proxies {
+		if builtinGroupNames[name] {
+			continue
+		}
+		switch p.Type {
+		case "Selector", "URLTest", "Fallback", "LoadBalance":
+			continue
+		}
+		d := 99999
+		s.delayMu.Lock()
+		if hist := s.delayHistory[name]; len(hist) > 0 {
+			last := hist[len(hist)-1]
+			if last.Delay > 0 {
+				d = int(last.Delay)
+			}
+		}
+		s.delayMu.Unlock()
+		nodes = append(nodes, nodeInfo{name, d})
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		fi := s.IsFavorite(nodes[i].name)
+		fj := s.IsFavorite(nodes[j].name)
+		if fi != fj {
+			return fi // 收藏的排前面
+		}
+		return nodes[i].delay < nodes[j].delay
+	})
+	if len(nodes) > topN {
+		nodes = nodes[:topN]
+	}
+	names := make([]string, len(nodes))
+	for i, n := range nodes {
+		names[i] = n.name
+	}
+	return names, active
+}
+
+// QuickSelectNode 快速切换当前出口节点。
+func (s *CoreService) QuickSelectNode(name string) error {
+	if s.api == nil {
+		return fmt.Errorf("内核未就绪")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	proxies, err := s.api.Proxies(ctx)
+	if err != nil {
+		return err
+	}
+	// 优先选包含该节点的策略组，没有则退回主选择组
+	group := pickSelectorGroup(proxies, name)
+	if group == "" {
+		group = pickSelectorGroup(proxies, "")
+	}
+	if group == "" {
+		return fmt.Errorf("找不到策略组")
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	return s.api.Select(ctx2, group, name)
+}
+
+// ---------- 内核版本更新 ----------
+
+// CheckCoreUpdate 查询 mihomo 的最新 release，和当前内核版本对比。
+// 版本号从内核的外部控制 API 读，读不到就返回空（前端显示"未知"）。
+func (s *CoreService) CheckCoreUpdate() (*kernel.LatestInfo, error) {
+	cur := ""
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if v, err := s.api.Version(ctx); err == nil {
+		cur = v.Version
+	}
+	// 国内访问 GitHub 可能很慢，给 25 秒
+	return kernel.CheckUpdate(cur, 25*time.Second)
+}
+
+// UpdateCore 下载新内核并替换，随后重启内核让新版本生效。
+// 返回新内核的 sha256 前 12 位。
+//
+// url 参数只用于比对：真正下载的地址由后端重新向 GitHub 查询后决定。
+// 否则前端（或任何能调用本方法的东西）传一个任意 URL 就能让我们
+// 下载并执行任意程序——TUN 场景下还是管理员权限。
+func (s *CoreService) UpdateCore(url string) (string, error) {
+	if s.mgr == nil {
+		return "", fmt.Errorf("内核管理器未初始化")
+	}
+
+	info, err := kernel.CheckUpdate(s.Status().Version, 30*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("无法确认最新内核版本，已取消升级: %w", err)
+	}
+	if url != "" && url != info.URL {
+		return "", fmt.Errorf("下载地址与官方发布不一致，已拒绝")
+	}
+
+	// exe 被占用时替换会失败，先停内核
+	if err := s.StopKernel(); err != nil {
+		return "", fmt.Errorf("停止内核失败: %w", err)
+	}
+
+	sum, err := s.mgr.DownloadAndReplace(info.URL, info.Digest, 3*time.Minute)
+	if err != nil {
+		// 下载/替换失败要把服务拉回来，不能让用户断网
+		_ = s.RestartKernel()
+		return "", err
+	}
+
+	if err := s.RestartKernel(); err != nil {
+		return sum, fmt.Errorf("内核已替换但重启失败: %w", err)
+	}
+	return sum, nil
+}
+
+// ResetCore 回退到内置内核：清除升级标记、删掉磁盘上的内核文件。
+func (s *CoreService) ResetCore() error {
+	if s.mgr == nil {
+		return fmt.Errorf("内核管理器未初始化")
+	}
+	_ = s.StopKernel()
+	kernel.ClearCustomMark(s.mgr.DataDir())
+	_ = os.Remove(filepath.Join(s.mgr.DataDir(), "bin", "mihomo.exe"))
+	return s.RestartKernel()
+}
+
+// CoreCustomized 磁盘上的内核是否已被手动升级（而非内置版本）。
+func (s *CoreService) CoreCustomized() bool {
+	if s.mgr == nil {
+		return false
+	}
+	return kernel.IsCustomCore(s.mgr.DataDir())
+}
+
+// ---------- 开机自启 ----------
+
+func (s *CoreService) AutoStart() bool {
+	return autostart.Enabled()
+}
+
+func (s *CoreService) SetAutoStart(on bool) error {
+	if err := autostart.Set(on); err != nil {
+		return fmt.Errorf("设置开机自启失败: %w", err)
+	}
+	return nil
+}
+
+// IsAdmin 让界面知道当前有没有管理员权限。
+func (s *CoreService) IsAdmin() bool {
+	return elevate.IsElevated()
+}
+
+// RelaunchElevated 以管理员身份重启自己。成功后当前进程退出。
+func (s *CoreService) RelaunchElevated() error {
+	if elevate.IsElevated() {
+		return fmt.Errorf("已经是管理员权限")
+	}
+	if err := elevate.RelaunchAsAdmin(); err != nil {
+		return err
+	}
+	// 先停内核、还原系统代理，再退出，把单实例锁让给新进程。
+	s.Shutdown()
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		os.Exit(0)
+	}()
+	return nil
+}
+
+// ---------- 连接 ----------
+
+func (s *CoreService) Connections() ([]ConnView, error) {
+	out := []ConnView{}
+	if s.api == nil {
+		return out, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	resp, err := s.api.Connections(ctx)
+	if err != nil {
+		return out, err
+	}
+	for _, c := range resp.Connections {
+		host := c.Metadata.Host
+		if host == "" {
+			host = c.Metadata.DestinationIP
+		}
+		proc := c.Metadata.Process
+		if proc == "" && c.Metadata.ProcessPath != "" {
+			proc = filepath.Base(c.Metadata.ProcessPath)
+		}
+		if proc == "" {
+			proc = "—"
+		}
+		dest := c.Metadata.DestinationIP
+		if c.Metadata.DestinationPort != "" {
+			dest = net.JoinHostPort(c.Metadata.DestinationIP, c.Metadata.DestinationPort)
+		}
+		out = append(out, ConnView{
+			ID:          c.ID,
+			Host:        host,
+			Dest:        dest,
+			DestIP:      c.Metadata.DestinationIP,
+			Process:     proc,
+			ProcessPath: c.Metadata.ProcessPath,
+			Chains:      strings.Join(c.Chains, " → "),
+			Rule:        c.Rule,
+			Upload:      c.Upload,
+			Download:    c.Download,
+			Start:       c.Start,
+			Network:     c.Metadata.Network,
+		})
+	}
+	return out, nil
+}
+
+func (s *CoreService) CloseConnection(id string) error {
+	if s.api == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return s.api.CloseConnection(ctx, id)
+}
+
+// CloseAllConnections 断开全部活动连接。
+// 改完进程策略后想让老连接立刻套用新规则时，这是唯一的手段——
+// mihomo 只在建连时匹配规则，已经建立的连接不会自动改道。
+func (s *CoreService) CloseAllConnections() error {
+	if s.api == nil {
+		return fmt.Errorf("内核未就绪")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.api.CloseAllConnections(ctx)
+}
+
+// ---------- 流量 ----------
+
+// Traffic 返回累计流量与瞬时速率。速率由两次采样差分得出。
+func (s *CoreService) Traffic() TrafficView {
+	out := TrafficView{}
+	if s.api == nil {
+		return out
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err := s.api.Connections(ctx)
+	if err != nil {
+		return out
+	}
+	now := time.Now()
+	s.trafficMu.Lock()
+	if !s.lastTick.IsZero() {
+		dt := now.Sub(s.lastTick).Seconds()
+		if dt > 0.2 {
+			s.rateUp = int64(float64(resp.UploadTotal-s.lastUp) / dt)
+			s.rateDown = int64(float64(resp.DownloadTotal-s.lastDown) / dt)
+			if s.rateUp < 0 {
+				s.rateUp = 0
+			}
+			if s.rateDown < 0 {
+				s.rateDown = 0
+			}
+		}
+	}
+	s.lastUp = resp.UploadTotal
+	s.lastDown = resp.DownloadTotal
+	s.lastTick = now
+	up, down := s.rateUp, s.rateDown
+	s.trafficMu.Unlock()
+
+	out.UpTotal = resp.UploadTotal
+	out.DownTotal = resp.DownloadTotal
+	out.UpRate = up
+	out.DownRate = down
+	return out
+}
+
+// ---------- 流量历史 ----------
+
+// TrafficSample 是一分钟的流量样本。
+type TrafficSample struct {
+	Time int64 `json:"t"` // 该分钟起点的 Unix 秒
+	Up   int64 `json:"u"` // 上行字节
+	Down int64 `json:"d"` // 下行字节
+}
+
+// historyKeep 最多保留 7 天的分钟样本：7*24*60 = 10080 条。
+const historyKeep = 7 * 24 * 60
+
+// TrafficHistory 返回最近的分钟级流量样本，按时间升序。
+func (s *CoreService) TrafficHistory() []TrafficSample {
+	s.histMu.Lock()
+	defer s.histMu.Unlock()
+	out := make([]TrafficSample, len(s.history))
+	copy(out, s.history)
+	return out
+}
+
+// historyPath 流量历史的落盘路径。
+func (s *CoreService) historyPath() string {
+	return filepath.Join(dataDir(), "traffic-history.json")
+}
+
+// loadHistory 启动时读历史。
+func (s *CoreService) loadHistory() {
+	data, err := os.ReadFile(s.historyPath())
+	if err != nil {
+		return
+	}
+	var list []TrafficSample
+	if err := json.Unmarshal(data, &list); err != nil {
+		return
+	}
+	s.histMu.Lock()
+	s.history = list
+	s.histMu.Unlock()
+}
+
+// saveHistory 落盘。数据量不大（最多 1 万条），直接整体写。
+func (s *CoreService) saveHistory() {
+	s.histMu.Lock()
+	data, err := json.Marshal(s.history)
+	s.histMu.Unlock()
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(s.historyPath(), data, 0o644)
+}
+
+// appendSample 追加一条样本，并裁剪到保留窗口内。
+func (s *CoreService) appendSample(sample TrafficSample) {
+	s.histMu.Lock()
+	s.history = append(s.history, sample)
+	if len(s.history) > historyKeep {
+		s.history = s.history[len(s.history)-historyKeep:]
+	}
+	s.histMu.Unlock()
+}
+
+// startHistorySampler 每分钟从 mihomo 读累计流量，差分出这一分钟的实际用量。
+// 用累计值而不是瞬时速率累加，更准、也更省资源。
+func (s *CoreService) startHistorySampler() {
+	s.loadHistory()
+
+	var lastUp, lastDown int64
+	var lastMin int64
+
+	ticker := time.NewTicker(time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for range ticker.C {
+			if s.Quitting() {
+				return
+			}
+			if s.api == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resp, err := s.api.Connections(ctx)
+			cancel()
+			if err != nil {
+				continue
+			}
+
+			now := time.Now()
+			min := now.Truncate(time.Minute).Unix()
+
+			// 第一次只记基线，不出样本
+			if lastMin == 0 {
+				lastUp, lastDown, lastMin = resp.UploadTotal, resp.DownloadTotal, min
+				continue
+			}
+
+			up := resp.UploadTotal - lastUp
+			down := resp.DownloadTotal - lastDown
+			// mihomo 重启会把累计值清零，差值变负 —— 记 0 重新开始
+			if up < 0 {
+				up = 0
+			}
+			if down < 0 {
+				down = 0
+			}
+
+			// 如果中间空了几分钟（比如睡眠），补空样本，避免曲线断层
+			for t := lastMin + 60; t < min; t += 60 {
+				s.appendSample(TrafficSample{Time: t, Up: 0, Down: 0})
+			}
+
+			s.appendSample(TrafficSample{Time: min, Up: up, Down: down})
+			lastUp, lastDown, lastMin = resp.UploadTotal, resp.DownloadTotal, min
+
+			// 检查当日流量告警（用今日累计值）
+			s.checkTrafficAlertToday()
+
+			s.saveHistory()
+		}
+	}()
+}
+
+// ---------- 模式与日志 ----------
+
+func (s *CoreService) SetMode(mode string) error {
+	if s.api == nil {
+		return fmt.Errorf("内核未就绪")
+	}
+	switch mode {
+	case "rule", "global", "direct":
+	default:
+		return fmt.Errorf("不支持的模式: %s", mode)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 切到全局模式前检查 GLOBAL 组的出口。
+	//
+	// GLOBAL 是 mihomo 内置组，默认指向 DIRECT——直接切过去等于全机断网，
+	// 用户看到的就是"点了没反应"（其实是网没了）。
+	// 但只在它还是 DIRECT 时才兜底：用户自己选过出口就尊重他的选择，
+	// 这也是 Clash Verge 的处理方式（他们把 GLOBAL 组置顶让用户自己挑）。
+	if mode == "global" {
+		if px, err := s.api.Proxies(ctx); err == nil {
+			if g, ok := px["GLOBAL"]; ok && strings.EqualFold(g.Now, "DIRECT") {
+				s.mu.RLock()
+				group := configgen.MainProxyGroup(s.subConfig)
+				s.mu.RUnlock()
+				if group != "" {
+					_ = s.api.Select(ctx, "GLOBAL", group)
+				}
+			}
+		}
+	}
+
+	if err := s.api.SetMode(ctx, mode); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.mode = mode
+	s.mu.Unlock()
+	s.saveAppState()
+	return nil
+}
+
+func (s *CoreService) Logs() []string {
+	if s.mgr == nil {
+		return []string{}
+	}
+	return s.mgr.Logs.Snapshot()
+}
+
+// LogDelta 是增量日志的一次返回：新增行 + 最新序号 + 是否截断。
+type LogDelta struct {
+	Lines []string `json:"lines"`
+	Seq   uint64   `json:"seq"`
+	// Truncated 为 true 表示游标之后的部分已经被滚出缓冲区，
+	// 本次返回的是当前全部残留，前端可据此提示"更早日志已丢弃"。
+	Truncated bool `json:"truncated"`
+}
+
+// LogsSince 增量拉取日志。since 传 0 表示首次全量。
+// 前端下一轮把上次的 Seq 带回来即可，避免每轮重复传整个缓冲。
+func (s *CoreService) LogsSince(since uint64) LogDelta {
+	if s.mgr == nil {
+		return LogDelta{Lines: []string{}}
+	}
+	lines, seq, truncated := s.mgr.Logs.Since(since)
+	return LogDelta{Lines: lines, Seq: seq, Truncated: truncated}
+}
+
+func (s *CoreService) ClearLogs() {
+	if s.mgr != nil {
+		s.mgr.Logs.Clear()
+	}
+}
+
+// OpenDataDir 在资源管理器里打开数据目录，方便看配置文件。
+func (s *CoreService) OpenDataDir() error {
+	dir := dataDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return exec.Command("explorer", dir).Start()
+}
+
+// ---------- 订阅 ----------
+
+const (
+	subConfigFile = "subscription.yaml"
+	subMetaFile   = "subscription.json"
+	subsFile      = "subs.json" // 多订阅列表
+	appStateFile  = "app-state.json"
+)
+
+// appState 是用户上次退出时的运行状态，重启后自动恢复。
+//
+// 注意 TUN 的特殊性：开启它需要管理员权限，所以保存了 true
+// 但这次是普通权限启动的，就只能保持关闭、提示用户以管理员重启。
+type appState struct {
+	TUN      bool             `json:"tun"`
+	ProxyOn  bool             `json:"proxyOn"`
+	Mode     string           `json:"mode"`
+	WinX     int              `json:"winX"`
+	WinY     int              `json:"winY"`
+	WinW     int              `json:"winW"`
+	WinH     int              `json:"winH"`
+	Favorites map[string]bool `json:"favorites"`
+
+	// 地图本机位置（不填则用默认值）
+	HomeLon   *float64 `json:"homeLon,omitempty"`
+	HomeLat   *float64 `json:"homeLat,omitempty"`
+	HomeLabel string   `json:"homeLabel,omitempty"`
+}
+
+type subMeta struct {
+	URL       string `json:"url"`
+	Name      string `json:"name"`
+	FetchedAt int64  `json:"fetchedAt"`
+	Insecure  bool   `json:"insecure"`
+	Upload    int64  `json:"upload"`
+	Download  int64  `json:"download"`
+	Total     int64  `json:"total"`
+	Expire    int64  `json:"expire"`
+	WebPage   string `json:"webPage"`
+	UpdateHrs int    `json:"updateHrs"`
+}
+
+func countArray(cfg map[string]any, key string) int {
+	if arr, ok := cfg[key].([]any); ok {
+		return len(arr)
+	}
+	return 0
+}
+
+// ---------- 多订阅 ----------
+
+// subsStore 是订阅列表的磁盘格式。
+type subsStore struct {
+	Items  []subMeta `json:"items"`
+	Active int       `json:"active"`
+}
+
+// subFileName 为每个订阅的原始配置起个稳定文件名。
+// 用 URL 的哈希，用户换 URL 之后旧文件不会撞名。
+func subFileName(rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return "sub-" + hex.EncodeToString(sum[:8]) + ".yaml"
+}
+
+func (s *CoreService) loadSubs() {
+	dir := dataDir()
+	b, err := os.ReadFile(filepath.Join(dir, subsFile))
+	if err != nil {
+		// 没有多订阅文件：看有没有旧的单订阅文件，有就迁移成列表的第 0 个。
+		s.migrateSingleSub()
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var st subsStore
+	if err := json.Unmarshal(b, &st); err != nil {
+		return
+	}
+	if len(st.Items) == 0 {
+		return
+	}
+	if st.Active < 0 || st.Active >= len(st.Items) {
+		st.Active = 0
+	}
+	s.mu.Lock()
+	s.subs = st.Items
+	s.activeIdx = st.Active
+	s.mu.Unlock()
+}
+
+// migrateSingleSub 把旧版的单订阅文件搬到新的多订阅列表里，
+// 让升级后不用重新填一遍地址。
+func (s *CoreService) migrateSingleSub() {
+	dir := dataDir()
+	mb, err := os.ReadFile(filepath.Join(dir, subMetaFile))
+	if err != nil {
+		return
+	}
+	mb = bytes.TrimPrefix(mb, []byte{0xEF, 0xBB, 0xBF})
+	var m subMeta
+	if err := json.Unmarshal(mb, &m); err != nil || m.URL == "" {
+		return
+	}
+	// 把当前那份原始配置搬到 per-subscription 文件。
+	if cb, err := os.ReadFile(filepath.Join(dir, subConfigFile)); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, subFileName(m.URL)), cb, 0o600)
+	}
+	s.mu.Lock()
+	s.subs = []subMeta{m}
+	s.activeIdx = 0
+	s.mu.Unlock()
+	s.saveSubs()
+}
+
+func (s *CoreService) saveSubs() {
+	s.mu.RLock()
+	st := subsStore{Items: s.subs, Active: s.activeIdx}
+	s.mu.RUnlock()
+	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), subsFile), mb, 0o600)
+	}
+}
+
+// ListSubscriptions 返回所有订阅及当前激活的是哪个。
+func (s *CoreService) ListSubscriptions() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]map[string]any, 0, len(s.subs))
+	for _, m := range s.subs {
+		out = append(out, map[string]any{
+			"url":       m.URL,
+			"name":      m.Name,
+			"fetchedAt": m.FetchedAt,
+			"upload":    m.Upload,
+			"download":  m.Download,
+			"total":     m.Total,
+			"expire":    m.Expire,
+			// 缺这个字段前端就永远看不到"恢复证书校验"按钮，
+			// 一旦点过忽略证书就无法再关掉——安全设置单项锁死。
+			"insecure":  m.Insecure,
+			"active":    m.URL == s.subURL,
+		})
+	}
+	return map[string]any{"items": out, "active": s.activeIdx}
+}
+
+// SwitchSubscription 切到另一个已保存的订阅。
+func (s *CoreService) SwitchSubscription(idx int) error {
+	s.mu.RLock()
+	if idx < 0 || idx >= len(s.subs) {
+		s.mu.RUnlock()
+		return fmt.Errorf("订阅序号越界: %d", idx)
+	}
+	meta := s.subs[idx]
+	s.mu.RUnlock()
+
+	b, err := os.ReadFile(filepath.Join(dataDir(), subFileName(meta.URL)))
+	if err != nil {
+		return fmt.Errorf("找不到该订阅的本地配置，请点刷新重新拉取: %w", err)
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var cfg map[string]any
+	if err := yaml.Unmarshal(b, &cfg); err != nil || cfg == nil {
+		return fmt.Errorf("订阅配置损坏: %w", err)
+	}
+
+	s.mu.Lock()
+	s.activeIdx = idx
+	s.subURL = meta.URL
+	s.subConfig = cfg
+	s.subRaw = b
+	s.subInfo = subInfoFromMeta(meta)
+	s.mu.Unlock()
+
+	s.saveSubs()
+	_ = s.writeProcRulesYAML()
+	if s.mgr != nil && s.mgr.IsRunning() {
+		return s.RestartKernel()
+	}
+	return nil
+}
+
+// SwitchSubscriptionByURL 按 URL 切换订阅。理由同 RemoveSubscriptionByURL：
+// 下标会漂移，URL 才是稳定标识。
+func (s *CoreService) SwitchSubscriptionByURL(url string) error {
+	url = strings.TrimSpace(url)
+	s.mu.RLock()
+	idx := -1
+	for i, m := range s.subs {
+		if m.URL == url {
+			idx = i
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if idx < 0 {
+		return fmt.Errorf("找不到该订阅（可能已被删除）")
+	}
+	return s.SwitchSubscription(idx)
+}
+
+// SetSubInsecure 为某个订阅开启/关闭"忽略证书校验"。
+// 只改标记不重新拉取，调用方需要自己再触发一次刷新。
+func (s *CoreService) SetSubInsecure(url string, insecure bool) error {
+	url = strings.TrimSpace(url)
+	s.mu.Lock()
+	found := false
+	for i := range s.subs {
+		if s.subs[i].URL == url {
+			s.subs[i].Insecure = insecure
+			found = true
+			break
+		}
+	}
+	if s.subURL == url {
+		s.subInfo.Insecure = insecure
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("找不到该订阅")
+	}
+	s.saveSubs()
+	s.persistSubMeta()
+	return nil
+}
+
+// CopySubscriptionURL 把订阅地址写进剪贴板。
+// 手机端（iOS/Android）的代理客户端都是靠这条链接导入节点的，
+// 手动从 UI 里选中复制很费劲，这里给个一键复制。
+func (s *CoreService) CopySubscriptionURL(url string) error {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return fmt.Errorf("订阅地址为空")
+	}
+	if s.app == nil || s.app.Clipboard == nil {
+		return fmt.Errorf("剪贴板不可用")
+	}
+	if !s.app.Clipboard.SetText(url) {
+		return fmt.Errorf("写入剪贴板失败")
+	}
+	return nil
+}
+
+// RemoveSubscription 删掉一个订阅。删的正好是激活的那个就自动切到剩余的第一个。
+func (s *CoreService) RemoveSubscription(idx int) error {
+	return s.removeSubscription(idx, "")
+}
+
+// RemoveSubscriptionByURL 按 URL 删除订阅。
+// 下标会随列表变化（自动更新追加、别处删除）而失效，前端应优先用 URL 定位。
+func (s *CoreService) RemoveSubscriptionByURL(url string) error {
+	return s.removeSubscription(-1, strings.TrimSpace(url))
+}
+
+// removeSubscription 是删除的统一实现。expectURL 非空时在同一个锁内按 URL
+// 重新定位下标，彻底避开"校验完到删除之间列表变了"的竞态。
+func (s *CoreService) removeSubscription(idx int, expectURL string) error {
+	s.mu.Lock()
+	if expectURL != "" {
+		idx = -1
+		for i, m := range s.subs {
+			if m.URL == expectURL {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			s.mu.Unlock()
+			return fmt.Errorf("找不到该订阅（可能已被删除）")
+		}
+	}
+	if idx < 0 || idx >= len(s.subs) {
+		n := len(s.subs)
+		s.mu.Unlock()
+		return fmt.Errorf("订阅序号越界: %d（当前共 %d 个）", idx, n)
+	}
+	removed := s.subs[idx]
+	wasActive := removed.URL == s.subURL
+
+	s.subs = append(s.subs[:idx], s.subs[idx+1:]...)
+	if len(s.subs) == 0 {
+		s.activeIdx = 0
+		s.subURL = ""
+		s.subConfig = nil
+		s.subRaw = nil
+		s.subInfo = SubInfo{}
+	} else if wasActive {
+		s.activeIdx = 0
+	} else if idx < s.activeIdx {
+		// 删掉排在激活订阅前面的条目，后面的都往前挪一位，
+		// 不修这个下标就会指向另一个订阅。
+		s.activeIdx--
+	}
+	remaining := len(s.subs)
+	s.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(dataDir(), subFileName(removed.URL)))
+	s.saveSubs()
+
+	// 删掉的不是激活订阅，当前配置不受影响，不用重启。
+	if !wasActive {
+		return nil
+	}
+
+	// 删的是当前订阅：切到剩余的第一个。
+	if remaining > 0 {
+		return s.SwitchSubscription(0)
+	}
+	_ = os.Remove(filepath.Join(dataDir(), subConfigFile))
+	_ = os.Remove(filepath.Join(dataDir(), subMetaFile))
+	s.mu.Lock()
+	s.subs = []subMeta{}
+	s.activeIdx = 0
+	s.subURL = ""
+	s.subConfig = nil
+	s.subRaw = nil
+	s.subInfo = SubInfo{}
+	s.mu.Unlock()
+	if s.mgr != nil && s.mgr.IsRunning() {
+		return s.RestartKernel()
+	}
+	return nil
+}
+
+func subInfoFromMeta(m subMeta) SubInfo {
+	return SubInfo{
+		URL:       m.URL,
+		Name:      m.Name,
+		FetchedAt: m.FetchedAt,
+		Insecure:  m.Insecure,
+		Upload:    m.Upload,
+		Download:  m.Download,
+		Total:     m.Total,
+		Expire:    m.Expire,
+		WebPage:   m.WebPage,
+		UpdateHrs: m.UpdateHrs,
+	}
+}
+
+// loadSavedSubscription 读取上次落盘的订阅，让应用离线也能直接起。
+func (s *CoreService) loadSavedSubscription() {
+	dir := dataDir()
+
+	// 先把订阅列表载进来（含旧格式迁移）。
+	s.loadSubs()
+
+	s.mu.RLock()
+	var meta subMeta
+	if len(s.subs) > 0 {
+		if s.activeIdx < 0 || s.activeIdx >= len(s.subs) {
+			s.activeIdx = 0
+		}
+		meta = s.subs[s.activeIdx]
+	}
+	s.mu.RUnlock()
+
+	// 列表为空就退回旧的单订阅文件。
+	if meta.URL == "" {
+		mb, err := os.ReadFile(filepath.Join(dir, subMetaFile))
+		if err != nil {
+			return
+		}
+		mb = bytes.TrimPrefix(mb, []byte{0xEF, 0xBB, 0xBF})
+		if json.Unmarshal(mb, &meta) != nil || meta.URL == "" {
+			return
+		}
+	}
+
+	cb, err := os.ReadFile(filepath.Join(dir, subFileName(meta.URL)))
+	if err != nil {
+		// 旧布局：配置直接放在 subscription.yaml。
+		cb, err = os.ReadFile(filepath.Join(dir, subConfigFile))
+		if err != nil {
+			return
+		}
+	}
+	cb = bytes.TrimPrefix(cb, []byte{0xEF, 0xBB, 0xBF})
+	var cfg map[string]any
+	if err := yaml.Unmarshal(cb, &cfg); err != nil || cfg == nil {
+		return
+	}
+
+	info := subInfoFromMeta(meta)
+	info.Nodes = countArray(cfg, "proxies")
+	info.Groups = countArray(cfg, "proxy-groups")
+	info.Rules = countArray(cfg, "rules")
+
+	s.mu.Lock()
+	s.subURL = meta.URL
+	s.subConfig = cfg
+	s.subRaw = cb
+	s.subInfo = info
+	s.mu.Unlock()
+}
+
+// Subscribe 拉取订阅、落盘，并重启内核让新节点生效。
+func (s *CoreService) Subscribe(url string) error {
+	url = strings.TrimSpace(url)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// 只有用户为这个订阅主动开过"忽略证书校验"才降级，默认走严格校验。
+	s.mu.RLock()
+	allowInsecure := false
+	for _, m := range s.subs {
+		if m.URL == url {
+			allowInsecure = m.Insecure
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	res, err := subscription.Fetch(ctx, url, allowInsecure)
+	if err != nil {
+		s.mu.Lock()
+		s.subInfo.Error = err.Error()
+		s.mu.Unlock()
+		return err
+	}
+
+	dir := dataDir()
+	// 每个订阅有自己的配置文件，多订阅切换时靠它还原。
+	if err := os.WriteFile(filepath.Join(dir, subFileName(url)), res.Raw, 0o600); err != nil {
+		return fmt.Errorf("保存订阅配置失败: %w", err)
+	}
+	// 同时维护一份"当前订阅"，兼容旧路径与迁移。
+	_ = os.WriteFile(filepath.Join(dir, subConfigFile), res.Raw, 0o600)
+
+	meta := subMeta{
+		URL:       url,
+		Name:      res.Name,
+		FetchedAt: res.FetchedAt,
+		Insecure:  res.Insecure,
+		Upload:    res.Upload,
+		Download:  res.Download,
+		Total:     res.Total,
+		Expire:    res.Expire,
+		WebPage:   res.WebPage,
+		UpdateHrs: res.UpdateHrs,
+	}
+	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dir, subMetaFile), mb, 0o600)
+	}
+
+	s.mu.Lock()
+	// 已存在就更新，不存在就追加为新订阅并设为激活。
+	idx := -1
+	for i, m := range s.subs {
+		if m.URL == url {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		s.subs[idx] = meta
+	} else {
+		s.subs = append(s.subs, meta)
+		idx = len(s.subs) - 1
+	}
+	s.activeIdx = idx
+	s.subURL = url
+	s.subConfig = res.Config
+	s.subRaw = res.Raw
+	s.subInfo = SubInfo{
+		URL:       url,
+		Name:      res.Name,
+		Nodes:     len(res.Nodes),
+		Groups:    len(res.Groups),
+		Rules:     res.Rules,
+		FetchedAt: res.FetchedAt,
+		Insecure:  res.Insecure,
+		Upload:    res.Upload,
+		Download:  res.Download,
+		Total:     res.Total,
+		Expire:    res.Expire,
+		WebPage:   res.WebPage,
+		UpdateHrs: res.UpdateHrs,
+	}
+	s.mu.Unlock()
+
+	s.saveSubs()
+
+	// 订阅里的组名可能变了，进程规则的出口要跟着重写。
+	_ = s.writeProcRulesYAML()
+
+	// 内核没在跑就只落盘，等用户自己启动。
+	if s.mgr != nil && s.mgr.IsRunning() {
+		return s.RestartKernel()
+	}
+	return nil
+}
+
+// Subscription 返回当前订阅的元信息。
+func (s *CoreService) Subscription() SubInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.subInfo
+}
+
+// RefreshSubscription 用已保存的地址重新拉取。订阅内容会变（换节点、改规则），
+// 所以这个操作是必需的而不是锦上添花。
+func (s *CoreService) RefreshSubscription() error {
+	s.mu.RLock()
+	url := s.subURL
+	s.mu.RUnlock()
+	if url == "" {
+		return fmt.Errorf("还没有添加订阅")
+	}
+	return s.Subscribe(url)
+}
+
+// ClearSubscription 移除订阅，回到内置的直连配置。
+func (s *CoreService) ClearSubscription() error {
+	dir := dataDir()
+	_ = os.Remove(filepath.Join(dir, subConfigFile))
+	_ = os.Remove(filepath.Join(dir, subMetaFile))
+
+	s.mu.Lock()
+	s.subURL = ""
+	s.subConfig = nil
+	s.subInfo = SubInfo{}
+	s.mu.Unlock()
+
+	if s.mgr != nil && s.mgr.IsRunning() {
+		return s.RestartKernel()
+	}
+	return nil
+}
+
+// Nodes 从内核读取实时节点与策略组，附带最近一次延迟。
+func (s *CoreService) Nodes() ([]NodeView, error) {
+	out := []NodeView{}
+	if s.api == nil {
+		return out, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	proxies, err := s.api.Proxies(ctx)
+	if err != nil {
+		return out, err
+	}
+
+	groupTypes := map[string]bool{
+		"Selector": true, "URLTest": true, "Fallback": true, "LoadBalance": true,
+	}
+	for _, p := range proxies {
+		delay := 0
+		if len(p.History) > 0 {
+			delay = p.History[len(p.History)-1].Delay
+		}
+		out = append(out, NodeView{
+			Name:  p.Name,
+			Type:  p.Type,
+			Delay: delay,
+			Group: groupTypes[p.Type],
+			Now:   p.Now,
+			Count: len(p.All),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// SelectNode 在策略组里切到指定节点。
+func (s *CoreService) SelectNode(group, name string) error {
+	if s.api == nil {
+		return fmt.Errorf("内核未就绪")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	return s.api.Select(ctx, group, name)
+}
+
+// TestNode 对单个节点发起延迟测试，返回毫秒；失败返回 -1。
+func (s *CoreService) TestNode(name string) int {
+	if s.api == nil {
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	d, err := s.api.Delay(ctx, name, "https://www.gstatic.com/generate_204", 5000)
+	if err != nil {
+		return -1
+	}
+	return d
+}
+
+// TestAllNodes 并发测试所有叶子节点的延迟，返回 节点名 → 毫秒（-1 表示不通）。
+//
+// 并发度限制在 8：机场一般有 30+ 节点，全放开会把本地连接表打满，
+// 而且测出来的延迟也不准（互相抢带宽）。
+func (s *CoreService) TestAllNodes() map[string]int {
+	out := map[string]int{}
+	if s.api == nil {
+		return out
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	proxies, err := s.api.Proxies(ctx)
+	cancel()
+	if err != nil {
+		return out
+	}
+
+	var names []string
+	for name, p := range proxies {
+		if builtinGroupNames[name] {
+			continue
+		}
+		switch p.Type {
+		case "Selector", "URLTest", "Fallback", "LoadBalance":
+			continue // 策略组不是节点
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	const concurrency = 8
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, name := range names {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(n string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			c, cc := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cc()
+			d, err := s.api.Delay(c, n, "https://www.gstatic.com/generate_204", 5000)
+			mu.Lock()
+			var v int
+			if err != nil || d <= 0 {
+				v = -1
+			} else {
+				v = d
+			}
+			out[n] = v
+			mu.Unlock()
+			s.recordDelay(n, int32(v))
+		}(name)
+	}
+	wg.Wait()
+	return out
+}
+
+// ResolveTargets 把一批 IP 解析成地理位置，给地图标注连接目标用。
+// 返回 {ip: {"country": "US", "lon": -98, "lat": 39}}，查不到的不含在内。
+func (s *CoreService) ResolveTargets(ips []string) map[string]any {
+	out := map[string]any{}
+	if s.geoDB == nil || len(ips) == 0 {
+		return out
+	}
+	// 去重。一批连接经常指向同一个 CDN IP，没必要查多次。
+	seen := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+
+		cc := s.geoDB.Country(ip)
+		if cc == "" {
+			continue
+		}
+		lon, lat, ok := geoip.Location(cc)
+		if !ok {
+			continue
+		}
+		out[ip] = map[string]any{"country": cc, "lon": lon, "lat": lat}
+	}
+	return out
+}
+
+// ---------- 按程序分流 ----------
+
+const (
+	procRulesJSON   = "process-rules.json"
+	procIgnoredJSON = "process-ignored.json"
+	procDirectYAML  = "process-direct.yaml"
+	procProxyYAML   = "process-proxy.yaml"
+	procDirectProv  = "pp-direct"
+	procProxyProv   = "pp-proxy"
+)
+
+// 常见系统进程，永远不用提示。
+// 用户对 svchost.exe 做选择没有意义，只会制造噪音。
+var systemProcWhitelist = map[string]bool{
+	"system": true, "svchost.exe": true, "services.exe": true,
+	"lsass.exe": true, "csrss.exe": true, "wininit.exe": true,
+	"winlogon.exe": true, "dllhost.exe": true, "runtimebroker.exe": true,
+	"smartscreen.exe": true, "msedgewebview2.exe": true, "conhost.exe": true,
+	"fontdrvhost.exe": true, "audiodg.exe": true, "sihost.exe": true,
+	"dwm.exe": true, "securityhealthservice.exe": true, "msmpeng.exe": true,
+	"searchindexer.exe": true, "wermgr.exe": true, "taskhostw.exe": true,
+	"explorer.exe": true, "ctfmon.exe": true,
+}
+
+// mihomo 内置的组/节点名，测速和分流时都要排除掉。
+var builtinGroupNames = map[string]bool{
+	"GLOBAL": true, "DIRECT": true, "REJECT": true, "REJECT-DROP": true,
+	"COMPATIBLE": true, "PASS": true, "PASS-RULE": true, "PROXY": true,
+}
+
+// 策略组识别放在 configgen 里，配置生成和规则渲染都要用同一套判断。
+
+func (s *CoreService) loadProcRules() {
+	b, err := os.ReadFile(filepath.Join(dataDir(), procRulesJSON))
+	if err != nil {
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var m map[string]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.procRules = m
+	s.mu.Unlock()
+}
+
+// loadIgnored 读取"用户已经选择不再提示"的进程列表。
+// 这个列表是必要的：否则每次开机重启应用，老进程又会被当成新的问一遍。
+func (s *CoreService) loadIgnored() {
+	b, err := os.ReadFile(filepath.Join(dataDir(), procIgnoredJSON))
+	if err != nil {
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var m []string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.ignored = make(map[string]bool, len(m))
+	for _, p := range m {
+		s.ignored[p] = true
+	}
+	s.mu.Unlock()
+}
+
+// IgnoreProcess 把某个程序加入忽略名单，之后不再提示。
+func (s *CoreService) IgnoreProcess(proc string) error {
+	proc = sanitizeProcName(proc)
+	if proc == "" {
+		return fmt.Errorf("进程名为空或含有非法字符")
+	}
+	s.mu.Lock()
+	if s.ignored == nil {
+		s.ignored = map[string]bool{}
+	}
+	s.ignored[proc] = true
+	snapshot := make([]string, 0, len(s.ignored))
+	for p := range s.ignored {
+		snapshot = append(snapshot, p)
+	}
+	s.mu.Unlock()
+	sort.Strings(snapshot)
+	if mb, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644)
+	}
+	return nil
+}
+
+func (s *CoreService) IgnoredProcesses() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.ignored))
+	for p := range s.ignored {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sanitizeProcName 校验进程名是否能安全地写进 PROCESS-NAME 规则。
+//
+// 规则格式是逗号分隔的（PROCESS-NAME,<name>,<policy>），所以进程名里
+// 不能有逗号和换行。Windows 文件名是**允许**逗号的，`a,b.exe` 是合法
+// 文件名——如果直接拼进规则文件，会被解析成三段，规则结构就毁了。
+//
+// 返回空串表示这个进程名不能用。
+func sanitizeProcName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if strings.ContainsAny(name, ",\n\r\t\x00") {
+		return ""
+	}
+	// 进程名不该带路径分隔符，带了说明来源异常。
+	if strings.ContainsAny(name, `/\`) {
+		return ""
+	}
+	return name
+}
+
+// writeProcRulesYAML 把进程策略渲染成两个 rule-provider 文件。
+//
+// 为什么拆成两个：mihomo 的 classical provider 里 payload **不能自带出口策略**，
+// 实测把 `PROCESS-NAME,curl.exe,REJECT` 写进去会被完全忽略、一律走外层的策略。
+// 所以按"直连 / 代理"分文件，出口由配置里的 RULE-SET 指定。
+func (s *CoreService) writeProcRulesYAML() error {
+	s.mu.RLock()
+	snapshot := make(map[string]string, len(s.procRules))
+	for k, v := range s.procRules {
+		snapshot[k] = v
+	}
+	s.mu.RUnlock()
+
+	var proxyList, directList []string
+	for proc, policy := range snapshot {
+		if policy == "proxy" {
+			proxyList = append(proxyList, proc)
+		} else {
+			directList = append(directList, proc)
+		}
+	}
+	sort.Strings(proxyList)
+	sort.Strings(directList)
+
+	render := func(names []string) string {
+		lines := make([]string, 0, len(names))
+		for _, n := range names {
+			// 再校验一次。规则文件是拼字符串的，脏数据进去会破坏整张表。
+			if sanitizeProcName(n) == "" {
+				continue
+			}
+			lines = append(lines, "  - PROCESS-NAME,"+n)
+		}
+		if len(lines) == 0 {
+			return "payload: []\n"
+		}
+		return "payload:\n" + strings.Join(lines, "\n") + "\n"
+	}
+
+	dir := dataDir()
+	if err := os.WriteFile(filepath.Join(dir, procProxyYAML), []byte(render(proxyList)), 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, procDirectYAML), []byte(render(directList)), 0o644)
+}
+
+// ---------- 运行状态持久化 ----------
+
+func (s *CoreService) loadAppState() {
+	b, err := os.ReadFile(filepath.Join(dataDir(), appStateFile))
+	if err != nil {
+		s.mu.Lock()
+		s.mode = "rule"
+		s.mu.Unlock()
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var st appState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.restoreTUN = st.TUN
+	// tunOn 是配置生成的实际依据，启动时必须跟着恢复态同步，
+	// 否则上次开着 TUN 的用户这次启动配置里会没有 TUN。
+	s.tunOn = st.TUN
+	// 非管理员启动建不了虚拟网卡，界面不能显示"TUN 已开启"。
+	// restoreTUN 保留原意，等用户提权重启后仍能按上次的意图恢复。
+	if !elevate.IsElevated() {
+		s.tunOn = false
+	}
+	s.restoreProxy = st.ProxyOn
+	s.winX, s.winY, s.winW, s.winH = st.WinX, st.WinY, st.WinW, st.WinH
+	if st.HomeLon != nil && st.HomeLat != nil {
+		s.homeLon, s.homeLat = *st.HomeLon, *st.HomeLat
+	}
+	if st.HomeLabel != "" {
+		s.homeLabel = st.HomeLabel
+	}
+	if st.Favorites != nil {
+		s.favorites = st.Favorites
+	} else {
+		s.favorites = make(map[string]bool)
+	}
+	switch st.Mode {
+	case "rule", "global", "direct":
+		s.mode = st.Mode
+	default:
+		s.mode = "rule"
+	}
+	s.mu.Unlock()
+}
+
+// dbg 把关键生命周期事件追加到 debug.log。
+// GUI 进程没有控制台，内核反复重启这类问题事后只能靠这份记录定位。
+func (s *CoreService) dbg(format string, a ...any) {
+	line := fmt.Sprintf("[%s] %s\n", time.Now().Format("01-02 15:04:05"), fmt.Sprintf(format, a...))
+	f, err := os.OpenFile(filepath.Join(dataDir(), "debug.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > 2<<20 {
+		// 超过 2MB 重置，避免无限增长
+		_ = f.Truncate(0)
+	}
+	_, _ = f.WriteString(line)
+}
+
+// saveAppState 实时落盘。不攒到退出时再写——崩溃也能恢复上次的状态。
+func (s *CoreService) saveAppState() {
+	s.mu.RLock()
+	lon, lat := s.homeLon, s.homeLat
+	st := appState{
+		TUN:       s.tunOn,
+		ProxyOn:   s.proxyOn,
+		Mode:      s.mode,
+		WinX:      s.winX,
+		WinY:      s.winY,
+		WinW:      s.winW,
+		WinH:      s.winH,
+		Favorites: s.favorites,
+		HomeLon:   &lon,
+		HomeLat:   &lat,
+		HomeLabel: s.homeLabel,
+	}
+	s.mu.RUnlock()
+	if st.Mode == "" {
+		st.Mode = "rule"
+	}
+	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), appStateFile), mb, 0o644)
+	}
+}
+
+// SaveWindowBounds 记住窗口位置和大小。
+func (s *CoreService) SaveWindowBounds(x, y, w, h int) {
+	s.mu.Lock()
+	s.winX, s.winY, s.winW, s.winH = x, y, w, h
+	s.mu.Unlock()
+	s.saveAppState()
+}
+
+// WindowBounds 返回上次保存的窗口位置和大小。
+func (s *CoreService) WindowBounds() (x, y, w, h int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.winX, s.winY, s.winW, s.winH
+}
+
+// ---------- 订阅自动更新 ----------
+
+// persistSubMeta 把订阅元信息写盘。自动更新时不拉配置、也要刷新已用流量，
+// 所以这条路径必须能单独写 meta。
+func (s *CoreService) persistSubMeta() {
+	s.mu.RLock()
+	m := subMeta{
+		URL:       s.subURL,
+		Name:      s.subInfo.Name,
+		FetchedAt: s.subInfo.FetchedAt,
+		Insecure:  s.subInfo.Insecure,
+		Upload:    s.subInfo.Upload,
+		Download:  s.subInfo.Download,
+		Total:     s.subInfo.Total,
+		Expire:    s.subInfo.Expire,
+		WebPage:   s.subInfo.WebPage,
+		UpdateHrs: s.subInfo.UpdateHrs,
+	}
+	s.mu.RUnlock()
+	if mb, err := json.MarshalIndent(m, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), subMetaFile), mb, 0o600)
+	}
+}
+
+// startAutoUpdate 定期检查订阅是否该更新了。
+// 机场通过 profile-update-interval 头告诉我们拉取间隔（通常 24 小时），
+// 我们用 10 分钟的粗粒度去对表，够了。
+func (s *CoreService) startAutoUpdate() {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			s.maybeAutoRefresh()
+		}
+	}()
+}
+
+func (s *CoreService) maybeAutoRefresh() {
+	s.mu.RLock()
+	url := s.subURL
+	fetched := s.subInfo.FetchedAt
+	hours := s.subInfo.UpdateHrs
+	old := append([]byte(nil), s.subRaw...)
+	// 后台自动更新绝不自行降级证书校验：只有用户当初就为该订阅勾选过才沿用。
+	allowInsecure := s.subInfo.Insecure
+	s.mu.RUnlock()
+
+	if url == "" || hours <= 0 || fetched == 0 {
+		return
+	}
+	if time.Since(time.UnixMilli(fetched)) < time.Duration(hours)*time.Hour {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	res, err := subscription.Fetch(ctx, url, allowInsecure)
+	if err != nil {
+		s.dbg("auto refresh skipped: %v", err)
+		return
+	}
+
+	// 内容没变就只刷新流量和时间戳，不要重启内核——
+	// 白白断一次连接的代价比省这点流量数据大得多。
+	if bytes.Equal(old, res.Raw) {
+		s.mu.Lock()
+		s.subInfo.FetchedAt = res.FetchedAt
+		s.subInfo.Upload = res.Upload
+		s.subInfo.Download = res.Download
+		s.subInfo.Total = res.Total
+		s.mu.Unlock()
+		s.persistSubMeta()
+		return
+	}
+
+	_ = s.Subscribe(url)
+	// 让前端知道这次是自动更新，不是用户手动刷新。
+	if s.app != nil {
+		s.app.Event.Emit("sub-auto-updated", res.Name)
+	}
+}
+
+// ProcessRules 返回当前的进程分流表。
+func (s *CoreService) ProcessRules() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string, len(s.procRules))
+	for k, v := range s.procRules {
+		out[k] = v
+	}
+	return out
+}
+
+// SetProcessRule 设置某个程序的分流策略。
+// policy 取 "proxy" / "direct" / "follow"（follow 表示删除该记录、回到订阅规则）。
+//
+// 返回值是"补断开的旧连接条数"。mihomo 只在建连那一刻匹配规则，已建立的
+// 连接不会重新判定，所以改完策略必须把该进程的老连接掐掉，用户才能立刻看到效果。
+func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
+	proc = sanitizeProcName(proc)
+	if proc == "" {
+		return 0, fmt.Errorf("进程名为空或含有非法字符")
+	}
+	switch policy {
+	case "proxy", "direct":
+	case "follow", "":
+		policy = "follow"
+	default:
+		return 0, fmt.Errorf("不支持的策略: %s", policy)
+	}
+	if policy == "proxy" {
+		s.mu.RLock()
+		group := configgen.MainProxyGroup(s.subConfig)
+		s.mu.RUnlock()
+		if group == "" {
+			return 0, fmt.Errorf("还没有可用节点，请先添加订阅")
+		}
+	}
+
+	s.mu.Lock()
+	if s.procRules == nil {
+		s.procRules = map[string]string{}
+	}
+	if policy == "follow" {
+		delete(s.procRules, proc)
+	} else {
+		s.procRules[proc] = policy
+	}
+	snapshot := make(map[string]string, len(s.procRules))
+	for k, v := range s.procRules {
+		snapshot[k] = v
+	}
+	s.mu.Unlock()
+
+	if mb, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+	}
+	if err := s.writeProcRulesYAML(); err != nil {
+		return 0, fmt.Errorf("写规则文件失败: %w", err)
+	}
+
+	if s.api == nil || s.mgr == nil || !s.mgr.IsRunning() {
+		return 0, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// 热刷新：只重新加载这两个 rule-provider，不重载整个配置，
+	// 已经建立的连接一条都不会断。
+	for _, name := range []string{procDirectProv, procProxyProv} {
+		if err := s.api.UpdateRuleProvider(ctx, name); err != nil {
+			return 0, fmt.Errorf("规则已保存，但热刷新失败（重启内核可生效）: %w", err)
+		}
+	}
+
+	// 规则先生效，再把该进程的旧连接掐掉。这样浏览器自动重连时就是新规则，
+	// 用户基本无感——比让他自己点「全部断开」靠谱得多。
+	closed := 0
+	resp, err := s.api.Connections(ctx)
+	if err != nil {
+		return closed, nil
+	}
+	for _, c := range resp.Connections {
+		name := c.Metadata.Process
+		if name == "" && c.Metadata.ProcessPath != "" {
+			name = filepath.Base(c.Metadata.ProcessPath)
+		}
+		if !strings.EqualFold(name, proc) {
+			continue
+		}
+		if err := s.api.CloseConnection(ctx, c.ID); err == nil {
+			closed++
+		}
+	}
+	return closed, nil
+}

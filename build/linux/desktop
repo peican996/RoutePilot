@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=ProxDeck
+Comment=A proxdeck application
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/proxdeck.exe %u
+Terminal=false
+Type=Application
+Icon=proxdeck.exe
+Categories=Utility;
+StartupWMClass=proxdeck.exe
+
+ 

@@ -1,0 +1,27 @@
+# golangci-lint 配置。安装后跑 `golangci-lint run ./...`。
+# 只开对这类桌面应用真正有用的检查，避免一上来几百条噪音没人看。
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    - errcheck      # 未处理的 error
+    - govet         # 标准 vet
+    - ineffassign   # 无效赋值
+    - staticcheck   # 静态分析主力
+    - unused        # 未使用的标识符
+    - misspell      # 拼写
+    - revive        # 风格（比 golint 现代）
+
+linters-settings:
+  revive:
+    rules:
+      # 注释规范对内部项目价值有限，关掉避免满屏提示
+      - name: exported
+        disabled: true
+
+issues:
+  exclude-rules:
+    # 测试文件里忽略错误检查是常见且可接受的
+    - path: _test\.go
+      linters: [errcheck]

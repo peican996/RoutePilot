@@ -1,0 +1,41 @@
+{
+  "_comment": "内嵌资源的版本清单。文件本身不进版本库，由 scripts/fetch-assets.py 按 sha256 校验获取。升级资源时同步更新 version/sha256。",
+  "assets": [
+    {
+      "path": "assets/mihomo.exe",
+      "name": "mihomo",
+      "version": "v1.19.33",
+      "sha256": "926bfea2ce48a247d6a7ce4cf641980e416202d5e40fe4ee5c949089ace0e197",
+      "license": "GPL-3.0",
+      "source": "https://github.com/MetaCubeX/mihomo/releases",
+      "note": "下载 mihomo-windows-amd64 的 zip 后解压出 mihomo.exe；已去除 compatible 变体"
+    },
+    {
+      "path": "assets/wintun.dll",
+      "name": "wintun",
+      "version": "0.14.1",
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+      "license": "GPL-2.0 OR WireGuard commercial",
+      "source": "https://www.wintun.net/",
+      "note": "TUN 模式的虚拟网卡驱动，取 amd64/wintun.dll"
+    },
+    {
+      "path": "assets/geo/geoip.metadb",
+      "name": "geoip.metadb",
+      "version": "meta-rules-dat latest",
+      "sha256": "bcd87b9d2ec40d3264032f7f6381650a100300fdc94d5e574913d0513eb13779",
+      "license": "见上游仓库",
+      "source": "https://github.com/MetaCubeX/meta-rules-dat/releases",
+      "note": "断网可用的内置 GeoIP 库；上游持续更新，换版本后 sha256 会不同"
+    },
+    {
+      "path": "assets/geo/geosite.dat",
+      "name": "geosite.dat",
+      "version": "meta-rules-dat latest",
+      "sha256": "e4fa530c3f58593e78d20edf6563947a4257d1903e741871cacffc5a8a09d706",
+      "license": "见上游仓库",
+      "source": "https://github.com/MetaCubeX/meta-rules-dat/releases",
+      "note": "分流规则域名库"
+    }
+  ]
+}

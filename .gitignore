@@ -1,0 +1,26 @@
+# ---- 构建产物 ----
+bin/
+dist-release/
+release/
+NexusLink-v*.zip
+*.syso
+*.exe~
+*.exe
+frontend/dist/
+frontend/node_modules/
+node_modules/
+
+# ---- 内嵌第三方二进制（约 71MB，不进版本库）----
+# 用 scripts/fetch-assets.py 按 assets/manifest.json 里的 sha256 获取，
+# 详见 README「准备内核与数据」一节。
+assets/mihomo.exe
+assets/wintun.dll
+assets/geo/geoip.metadb
+assets/geo/geosite.dat
+
+# ---- 工具缓存 ----
+.task
+.wails
+
+# ---- 运行时日志 ----
+*.log
