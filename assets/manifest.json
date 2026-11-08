@@ -1,5 +1,10 @@
 {
-  "_comment": "内嵌资源的版本清单。文件本身不进版本库，由 scripts/fetch-assets.py 按 sha256 校验获取。升级资源时同步更新 version/sha256。",
+  "_comment": "内嵌资源的版本清单。文件本身不进版本库，由 scripts/fetch-assets.py 按 url + sha256 获取。升级资源时同步更新 version/url/sha256。",
+  "_fields": {
+    "url": "下载地址；zip 压缩包用 member 指定包内路径",
+    "member": "zip 包内的文件路径，取出后按 path 的最后一段命名",
+    "sha256_policy": "strict（默认，哈希不符即失败）或 warn（不符仅告警，用于跟随上游 latest 的数据文件）"
+  },
   "assets": [
     {
       "path": "assets/mihomo.exe",
@@ -8,7 +13,9 @@
       "sha256": "926bfea2ce48a247d6a7ce4cf641980e416202d5e40fe4ee5c949089ace0e197",
       "license": "GPL-3.0",
       "source": "https://github.com/MetaCubeX/mihomo/releases",
-      "note": "下载 mihomo-windows-amd64 的 zip 后解压出 mihomo.exe；已去除 compatible 变体"
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-windows-amd64-compatible-v1.19.33.zip",
+      "member": "mihomo-windows-amd64-compatible.exe",
+      "note": "用 compatible 变体（GOAMD64=v1），老 CPU 也能跑；从 zip 里取出该 exe 重命名为 mihomo.exe"
     },
     {
       "path": "assets/wintun.dll",
@@ -17,6 +24,8 @@
       "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
       "license": "GPL-2.0 OR WireGuard commercial",
       "source": "https://www.wintun.net/",
+      "url": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+      "member": "wintun/bin/amd64/wintun.dll",
       "note": "TUN 模式的虚拟网卡驱动，取 amd64/wintun.dll"
     },
     {
@@ -24,18 +33,22 @@
       "name": "geoip.metadb",
       "version": "meta-rules-dat latest",
       "sha256": "bcd87b9d2ec40d3264032f7f6381650a100300fdc94d5e574913d0513eb13779",
+      "sha256_policy": "warn",
       "license": "见上游仓库",
       "source": "https://github.com/MetaCubeX/meta-rules-dat/releases",
-      "note": "断网可用的内置 GeoIP 库；上游持续更新，换版本后 sha256 会不同"
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+      "note": "断网可用的内置 GeoIP 库；上游 latest 每日更新，这里的哈希只是当初取用时的快照"
     },
     {
       "path": "assets/geo/geosite.dat",
       "name": "geosite.dat",
       "version": "meta-rules-dat latest",
       "sha256": "e4fa530c3f58593e78d20edf6563947a4257d1903e741871cacffc5a8a09d706",
+      "sha256_policy": "warn",
       "license": "见上游仓库",
       "source": "https://github.com/MetaCubeX/meta-rules-dat/releases",
-      "note": "分流规则域名库"
+      "url": "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+      "note": "分流规则域名库；同上，跟随上游 latest"
     }
   ]
 }

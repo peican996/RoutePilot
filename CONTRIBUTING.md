@@ -42,5 +42,6 @@ expire 是 Unix 秒，之前按毫秒解析，全部显示 1970 年。
 
 ## 新增内嵌资源
 
-不要直接提交二进制。把版本、sha256、来源写进 `assets/manifest.json`，
-并在 `THIRD_PARTY_NOTICES.md` 里补上许可证信息。
+不要直接提交二进制。把版本、下载地址（`url`，zip 包还要写 `member`）、sha256、来源写进 `assets/manifest.json`，并在 `THIRD_PARTY_NOTICES.md` 里补上许可证信息。
+
+`url` 一律指向带版本号的上游地址，别用 `latest`；确实只能跟 `latest` 的数据文件，把 `sha256_policy` 设为 `warn`，其余保持默认的 `strict`——发布流程靠它拦住被投毒或被替换的二进制。

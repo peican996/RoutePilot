@@ -1,0 +1,78 @@
+name: Release
+
+# 打 tag（如 v1.8.1）即发布：拉齐第三方资源 → 构建 → 生成便携 zip → 上传到 GitHub Release。
+# 也可以在 Actions 页面手动指定一个已有 tag 重跑。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v1.8.1）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      # Windows runner 默认 cp1252，脚本里的中文输出会直接崩
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # tag 是 v1.8.1，版本号要 1.8.1
+      - name: 解析版本号
+        id: ver
+        shell: bash
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      # 前端产物被 go:embed 引用，必须先于 go 编译生成
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      # 内嵌的 mihomo / wintun / geo 数据不进版本库，这里按 manifest 拉齐并逐个校验哈希
+      - name: 下载内嵌资源
+        run: python scripts/fetch-assets.py --download
+
+      - name: 打包
+        run: python package.py ${{ steps.ver.outputs.version }}
+
+      # 让用户能自己校验下载到的 zip
+      - name: 生成校验和
+        shell: bash
+        run: |
+          cd release
+          sha256sum ./*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 上传到 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.ver.outputs.tag }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "NexusLink $tag" --generate-notes
+          gh release upload "$tag" release/*.zip release/SHA256SUMS.txt --clobber

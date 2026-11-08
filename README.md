@@ -1,5 +1,9 @@
 # NexusLink
 
+[![CI](https://github.com/peican996/nexuslink/actions/workflows/ci.yml/badge.svg)](https://github.com/peican996/nexuslink/actions/workflows/ci.yml)
+[![Release](https://github.com/peican996/nexuslink/actions/workflows/release.yml/badge.svg)](https://github.com/peican996/nexuslink/releases)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+
 > 一个把**「按程序分流」**做到位的代理控制台。Go + Wails v3 + React，内核复用 [mihomo](https://github.com/MetaCubeX/mihomo)。
 
 **English TL;DR** — NexusLink is a Windows desktop proxy console built with Go + Wails v3 + React, wrapping the mihomo core. Unlike generic Clash GUIs that route by domain only, it exposes **per-process routing** as a first-class feature: every connection is tagged with its owning process, and you can pin any program to "always direct" or "always proxy". Licensed GPL-3.0.
@@ -52,14 +56,14 @@ NexusLink 把进程名直接暴露到界面上：连接列表带进程、进程�
 `assets/` 下的第三方二进制合计约 71MB，不进版本库，缺了会编译失败（`go:embed` 要求文件存在）：
 
 ```bash
-# 从已有的一份构建复制（最快）
-python scripts/fetch-assets.py --from-dir /path/to/another/checkout/assets
+# 直接按 assets/manifest.json 里的地址下载，逐个校验 sha256（推荐）
+python scripts/fetch-assets.py --download
 
-# 或者只校验现状，按提示手动下载
-python scripts/fetch-assets.py
+# 从已有的一份构建复制（换机器、断网时最快）
+python scripts/fetch-assets.py --from-dir /path/to/another/checkout/assets
 ```
 
-版本与哈希记录在 `assets/manifest.json`，来源见 `THIRD_PARTY_NOTICES.md`。
+版本、下载地址与哈希都记录在 `assets/manifest.json`，来源见 `THIRD_PARTY_NOTICES.md`。geo 数据跟随上游 `latest`，哈希只作为当初取用时的快照，校验按告警处理。
 
 ### 构建
 
@@ -73,6 +77,8 @@ python package.py 1.0.0
 
 产物：`bin/NexusLink.exe`、`release/NexusLink-v1.0.0-win64-portable.zip`。
 也可以直接跑 `.\build.ps1`。
+
+发版走 CI：把 tag 推上去（`git tag v1.0.0 && git push --tags`），`.github/workflows/release.yml` 会重新拉资源、构建、算好 sha256 并挂到 Release 页。构建好的版本也可以直接从 [Releases](https://github.com/peican996/nexuslink/releases) 下，不用自己编。
 
 ### 开发
 
