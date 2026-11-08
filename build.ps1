@@ -1,30 +1,61 @@
-# ProxDeck 构建脚本
-# 用法：右键「使用 PowerShell 运行」，或在本目录执行  .\build.ps1
+﻿# NexusLink 本地构建脚本（只生成 exe，不打 zip）
+# 用法：.\build.ps1                 默认走官方源
+#       .\build.ps1 -ChinaMirror    走国内镜像（goproxy.cn / npmmirror）
+param([switch]$ChinaMirror)
+
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
+# 找 go：优先 PATH，其次常见安装位置。不再硬编码单一路径。
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    foreach ($p in @(
+            "C:\Program Files\Go\bin",
+            "$env:LOCALAPPDATA\Programs\Go\bin",
+            "$env:USERPROFILE\go\bin")) {
+        if (Test-Path (Join-Path $p "go.exe")) {
+            $env:Path = "$p;" + $env:Path
+            break
+        }
+    }
+}
+if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    throw "找不到 go。请安装 Go 1.26+，或把它加入 PATH。"
+}
 
-# 兜底：winget 安装的 Go 不在当前会话 PATH 里时补上
-$goBin = "C:\Program Files\Go\bin"
-if (Test-Path $goBin) { $env:Path = "$goBin;" + $env:Path }
+# 镜像只在显式指定时启用，避免海外贡献者被指向国内源
+$npmArgs = @()
+if ($ChinaMirror) {
+    $env:GOPROXY = "https://goproxy.cn,direct"
+    $npmArgs += "--registry=https://registry.npmmirror.com"
+}
 
-$env:GOPROXY = "https://goproxy.cn,direct"
+# go:embed 要求 assets 下的文件存在，缺了会在这里先说清楚
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    python scripts/fetch-assets.py
+    if ($LASTEXITCODE -ne 0) { throw "内嵌资源不完整，按上面的提示补齐后重试。" }
+}
 
 Write-Host "[1/3] 构建前端..." -ForegroundColor Cyan
 Push-Location frontend
-if (-not (Test-Path node_modules)) {
-    npm install --registry=https://registry.npmmirror.com --no-audit --no-fund
+try {
+    if (Test-Path package-lock.json) {
+        npm ci @npmArgs --no-audit --no-fund
+    } else {
+        npm install @npmArgs --no-audit --no-fund
+    }
+    if ($LASTEXITCODE -ne 0) { throw "依赖安装失败" }
+    npm run build
+    if ($LASTEXITCODE -ne 0) { throw "前端构建失败" }
+} finally {
+    Pop-Location
 }
-npm run build
-if ($LASTEXITCODE -ne 0) { Pop-Location; throw "前端构建失败" }
-Pop-Location
 
 Write-Host "[2/3] 编译 Go 应用..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path bin | Out-Null
-go build -ldflags "-s -w -H windowsgui" -o bin\ProxDeck.exe .
+go build -ldflags "-s -w -H windowsgui" -o bin\NexusLink.exe .
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
-$size = [math]::Round((Get-Item bin\ProxDeck.exe).Length / 1MB, 1)
-Write-Host "[3/3] 完成 -> bin\ProxDeck.exe ($size MB)" -ForegroundColor Green
+Write-Host "[3/3] 完成 -> bin\NexusLink.exe" -ForegroundColor Green
+$size = [math]::Round((Get-Item bin\NexusLink.exe).Length / 1MB, 1)
+Write-Host "      体积 $size MB" -ForegroundColor Green

@@ -1,6 +1,10 @@
 # 源码统一用 LF，避免 Windows 贡献者提交时把整个仓库变成 CRLF
 * text=auto eol=lf
 
+# Windows 脚本与安装器保持 CRLF，老版本 PowerShell / 记事本才不会出问题
+*.ps1 text eol=crlf
+*.nsi text eol=crlf
+
 # 明确按二进制处理，避免被当成文本做换行转换
 *.png binary
 *.jpg binary
