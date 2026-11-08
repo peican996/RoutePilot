@@ -1125,6 +1125,19 @@ func (s *CoreService) startKernelWatchdog() {
 	}
 }
 
+// probeTwice 对同一目标测两次：第一次失败隔 3 秒复测，两次都失败才算失败。
+// 探测要求「5 秒内完成建连+TLS+HTTP」，节点繁忙时会偶发顶满超时，
+// 而真实流量走长连接根本不受影响——实测约 20% 偶发 Timeout 却曾
+// 连续两次撞线触发"网络不通"误报。复测一次过滤这种抖动。
+func probeTwice(probe func() (int, error), retryDelay time.Duration) bool {
+	if d, err := probe(); err == nil && d > 0 {
+		return true
+	}
+	time.Sleep(retryDelay)
+	d, err := probe()
+	return err == nil && d > 0
+}
+
 // startNetworkHealthCheck 每 2 分钟测一次代理链路是否通。
 // 连续 2 次失败才告警（避免瞬时波动误报）；告警只在恢复前发一次，
 // 不再每 4 分钟重复弹窗。
@@ -1163,10 +1176,12 @@ func (s *CoreService) startNetworkHealthCheck() {
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			d, err := s.api.Delay(ctx, group, "https://www.gstatic.com/generate_204", 5000)
-			cancel()
-			if err != nil || d <= 0 {
+			ok := probeTwice(func() (int, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				return s.api.Delay(ctx, group, "https://www.gstatic.com/generate_204", 5000)
+			}, 3*time.Second)
+			if !ok {
 				failCount++
 				if failCount >= 2 && !alerted {
 					alerted = true
