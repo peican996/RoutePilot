@@ -1,0 +1,2019 @@
+diff --git a/C1.1-R1-REVIEW.md b/C1.1-R1-REVIEW.md
+new file mode 100644
+index 0000000..11a2976
+--- /dev/null
++++ b/C1.1-R1-REVIEW.md
+@@ -0,0 +1,194 @@
++# C1.1-R1 代码审查整改报告
++
++基线：`main` @ `e8b7eca`（`fix: 加固系统代理恢复与内核生命周期并发一致性`）
++
++本轮只处理三组 P1 问题：`reconcileProxy` 恢复事务不完整、Watchdog 重启期间重复调度竞态、
++系统代理事务未统一串行化。未改动 Manager 状态机、C3 安全策略与任何 UI 功能，未进入 C4。
++
++---
++
++## 1. P1：恢复事务完整性（service.go）
++
++### 1.1 原实现的问题
++
++`reconcileProxy` 在「用户手动关闭系统代理」分支里手写了一段还原逻辑，与
++`restoreSystemProxy` 是两份实现，行为不一致：
++
++1. 没有调用 `verifyProxySnapshot`，写入报错即视为成功；
++2. `removeProxyState` 的错误被 `_ =` 丢弃；
++3. 即使删除备份失败，也照样清空内存 `backup`，下次退出/启动失去还原依据；
++4. 没有先把 `Pending` 持久化，恢复中途崩溃后下次启动可能把旧端口当成有效接管；
++5. 没有"外部已接管"的判定，恢复失败后用户新设置的代理会被下一次重试覆盖。
++
++### 1.2 统一为单一事务
++
++新增 `restoreProxyTransactionLocked`，`restoreSystemProxy` 与 `reconcileProxy`
++都只走这一条路径：
++
++```
++判定是否仍属于本程序
++  → 持久化 Pending（记录 PendingServer）
++  → applyProxySnapshot（检查全部写入错误）
++  → verifyProxySnapshot（回读校验）
++  → removeProxyState（删除失败必须报错）
++  → 提交内存状态
++```
++
++要点：
++
++- **先写 Pending 再动注册表**：`proxyBackup.PendingServer` 记录"开始恢复那一刻"的地址；
++  恢复失败后若用户/外部软件又改了代理，当前地址既不是 `Addr`、`Server`，也不是
++  `PendingServer`，则判定外部已接管，`relinquishProxyLocked` 直接撤掉还原点而不写注册表。
++- **任何失败都保留两份依据**：磁盘 `proxy.json`（`Pending=true`）与内存 `s.backup`
++  都保留；只有校验通过并成功删除备份后才清空内存。
++- **删除失败明确报错**：返回 `删除系统代理备份失败（恢复已完成，下次将继续校验）`，
++  内存备份继续保留，下次启动 `recoverPendingProxyRestore` 会再次执行校验。
++- **幂等**：备份已删除时再次调用直接返回 nil，不产生任何注册表写入。
++- **同会话可重试**：`reconcileProxy` 遇到 `Pending` 状态时会重试一次完整事务，
++  而不是像以前一样直接跳过；重试前先做外部接管判定，因此不会覆盖用户新设置。
++
++新增/修改的辅助函数：
++
++| 函数 | 职责 |
++| --- | --- |
++| `restoreProxyTransactionLocked` | 唯一还原事务 |
++| `proxyStillOurs` | 外部接管判定（Addr / Server / PendingServer 三值比对） |
++| `relinquishProxyLocked` | 放弃接管；删除失败时把磁盘记录标记 Pending，保证下次仍先做外部判定 |
++| `retryPendingRestoreLocked` | reconcile 的待恢复重试入口 |
++
++---
++
++## 2. P1：Watchdog 重启期间重复调度（internal/kernel/watchdog.go）
++
++### 2.1 原实现的问题
++
++- `ReportExit` 不区分 `restarting`，在重启回调执行期间收到退出事件会立刻再排一个 timer；
++- `fire` 无条件 `w.timer = nil`，会覆盖/丢失另一个仍在等待的 timer 指针；
++- `Restart` 返回错误时再记一次失败，而期间 `OnExit` 已经记过一次，同一次故障被放大；
++- 没有"recover 期间新进程崩溃"的合并处理，崩溃事件可能被吞掉或多排一次重启。
++
++### 2.2 新的状态机
++
++状态字段：`stopped` / `paused` / `exhausted` / `restarting` / `timer`，全部由 `w.mu` 保护。
++
++关键规则：
++
++1. **至多一个 timer**：`scheduleLocked` 排新 timer 前先 `stopTimerLocked`；
++   timer 带自增序号 `timerSeq`，`fire(seq)` 发现序号不匹配立即返回。
++   Stop/Pause/重排都会递增序号，所以"已被替换的旧 timer"不可能再启动内核。
++2. **restarting 期间不排 timer**：`ReportExit` 只记录崩溃（`pendingAgain=true`），
++   由本轮 `fire` 结束后统一决定下一次退避。
++3. **去重策略**：`Restart` 返回错误时，若 `pendingAgain` 为真（期间 `OnExit` 已上报），
++   不再追加第二次失败，避免一次故障消耗两次重试额度；若期间没有 `OnExit` 才补记。
++4. **重启成功但新进程立即崩溃**：`fire` 结束前检查 `pendingAgain`，继续按窗口计数安排恢复，
++   事件不会被吞掉。
++5. **Stop/Pause 与正在执行的 Restart 并发**：`fire` 在回调返回后重新检查
++   `stopped/paused/exhausted`，满足则清空 `pendingAgain` 并直接返回，不再排任何恢复。
++6. **OnExhausted 与 Shutdown 并发**：服务层回调先检查 `IsShuttingDown`，
++   且恢复动作走 `proxyMu`（见第 3 节），不会与用户操作交错写注册表。
++
++没有用 Sleep 或吞事件的方式规避竞态：所有分支都由锁内状态显式判定。
++
++---
++
++## 3. P1：系统代理事务统一串行化（service.go）
++
++### 3.1 锁模型
++
++新增 `proxyMu`，明确锁顺序：
++
++```
++lifeMu → proxyMu → s.mu
++```
++
++- `lifeMu`：内核生命周期事务（Start/Stop/Restart/Shutdown）串行；
++- `proxyMu`：系统代理事务串行（用户开关、启动端口校正、待恢复重试、Stop/Shutdown 还原、看门狗熔断恢复）；
++- `s.mu`：只保护内存状态快照，持有期间**禁止**注册表 I/O。
++
++### 3.2 统一入口
++
++| 入口 | 行为 |
++| --- | --- |
++| `withProxyTx(gen, ctx, fn)` | 取 `proxyMu` → 校验代际 → 执行 I/O |
++| `SetSystemProxy(on)` | `withProxyTx(0, ...)` → `setSystemProxyLocked` |
++| `setSystemProxyForGeneration(gen, ctx)` | 启动恢复专用，代际校验 + 写入前二次校验 |
++| `restoreSystemProxy()` | `withProxyTx(0, ...)` → `restoreSystemProxyLocked` |
++| `restoreWinHTTPIfPending()` | 同样纳入代理事务 |
++| `reconcileProxy()` / `reconcileProxyForGeneration` | 纳入代理事务 |
++| `updateSystemProxyPort(gen, ctx, port)` | 端口漂移校正，纳入代理事务 |
++| `setSystemProxyLocked` / `restoreSystemProxyLocked` / `reconcileProxyLocked` | 已持锁内部实现，禁止再取 `proxyMu` |
++
++### 3.3 代际竞态的处理
++
++`withProxyTx` 在**拿到 `proxyMu` 之后**才校验代际，因此：
++
++- 代理事务已持锁：它会先完成，随后 Stop/Shutdown 再取锁执行还原，最终状态正确；
++- 事务在代际失效后才拿到锁：直接返回 `errProxyStale`，不写注册表；
++- `setSystemProxyLocked` 在 `ops.Enable` 前、`persistProxyState` 前再各校验一次
++  `genOK()`；若在写入过程中被失效，会把刚写入的接管回滚（`applyProxySnapshot`）后返回错误。
++
++`StopKernel` / `RestartKernel` / `Shutdown` 的流程保持不变：先失效代际 → 等待 afterStart 任务 →
++再执行代理还原。由于所有代理写入都必须持 `proxyMu`，且 afterStart 任务不允许取 `lifeMu`，
++不存在 `lifeMu ↔ proxyMu` 的反向获取，不会死锁。
++
++### 3.4 必须证明的结论
++
++`StopKernel` 返回成功后，系统代理不会被任何旧操作重新打开：
++
++1. 旧 `afterStart` 已被代际失效；
++2. 任何代际相关的代理写入在 `proxyMu` 内二次校验代际，失败即放弃；
++3. `StopKernel` 的还原在 `proxyMu` 内完成，晚到的旧事务只能拿到失效代际；
++4. 看门狗在 Stop 后被 `Pause`，不会再有自动重启路径写代理。
++
++对应测试：`TestR1StaleGenerationCannotOpenProxy`、
++`TestR1GenerationInvalidatedWhileWaitingForProxyLock`、
++`TestR1StopKernelWaitsForProxyTx`。
++
++---
++
++## 4. 变更文件
++
++| 文件 | 变更 |
++| --- | --- |
++| `service.go` | `proxyMu`、`withProxyTx`、统一恢复事务、外部接管判定、代际感知的代理入口、Watchdog 熔断回调加 `IsShuttingDown` 检查 |
++| `internal/kernel/watchdog.go` | 状态机重写：timer 序号、restarting/pendingAgain、失败去重、Stop/Pause 一致性 |
++| `internal/kernel/watchdog_r1_test.go` | 新增 7 个确定性 barrier 测试 |
++| `c1_1_r1_proxy_test.go` | 新增 13 个代理事务/并发测试（含 4 个子用例） |
++| `c1_proxy_test.go` | 测试替身新增故障注入点：`failSetServer`、`readbackServer`、`enableHook`、`disableHook` |
++
++未修改：Manager 状态机、Job Object、订阅 SSRF、内核升级、UI 组件、C3 相关逻辑。
++
++---
++
++## 5. 管理员实机验证步骤（真实注册表）
++
++普通自动化测试只使用 `fakeRegistry`，不会改动本机设置。需要真实验证时按下面步骤，
++每一步都可恢复到初始状态。建议先用 `reg query` 备份：
++
++```powershell
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyOverride
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v AutoConfigURL
++```
++
++1. 以管理员身份启动 RoutePilot，记录上述四项原值。
++2. 启动内核 → 打开「系统代理」，确认 `ProxyServer=127.0.0.1:17890`、`AutoConfigURL` 为空。
++3. 在设置里关闭系统代理，确认四项完全回到第 1 步的值，且数据目录下 `proxy.json` 已删除。
++4. 再次打开系统代理，然后手动把注册表 `ProxyServer` 改成 `127.0.0.1:8888`（模拟外部接管），
++   点击「停止内核」；确认程序**没有**把地址改回去（放弃接管），并且 `proxy.json` 被清理。
++5. 重新打开系统代理，用任务管理器强杀 RoutePilot 进程（模拟崩溃），再启动：
++   确认启动后系统代理指向当前内核端口；退出程序后恢复为第 1 步原值。
++6. 重复第 5 步，但在强杀后先把 `ProxyServer` 改为 `127.0.0.1:9999` 再启动：
++   确认程序放弃还原、不覆盖 9999，并输出 `恢复待完成期间系统代理已被外部修改` 调试日志。
++7. 用 `Get-Process` / `netstat -ano` 确认停止内核后没有残留监听端口。
++
++---
++
++## 6. 遗留说明
++
++- `go test -race` 需要 CGO 编译器；本机未安装 gcc，无法执行（详见测试报告）。
++  相关并发路径已用确定性 barrier 测试覆盖，建议在装有 MinGW-w64 的机器上补跑。
++- `setTUN` 的注册表写入仍沿用原有顺序执行路径，未在本轮范围内重构；它与
++  `SetSystemProxy` 的并发窗口在改造前就存在，本轮未扩大。
++- TUN 与系统代理的互斥仍由 `s.tunOn` 状态判定，未改变既有产品语义。
+diff --git a/C1.1-R1-TEST-REPORT.md b/C1.1-R1-TEST-REPORT.md
+new file mode 100644
+index 0000000..0270208
+--- /dev/null
++++ b/C1.1-R1-TEST-REPORT.md
+@@ -0,0 +1,156 @@
++# C1.1-R1 测试报告
++
++- 基线：`main` @ `e8b7eca`
++- 环境：Windows 10/11 amd64，Go 1.27.3（`go version go1.27.3 windows/amd64`）
++- 原则：真实注册表操作只通过 `fakeRegistry` 故障注入执行，普通自动化测试不修改本机设置。
++
++---
++
++## 1. 执行结果汇总
++
++| 命令 | 结果 |
++| --- | --- |
++| `go test -count=1 ./...` | 通过 |
++| `go test -count=5 ./internal/kernel .` | 通过 |
++| `go test -count=1 -tags repro ./...` | 通过 |
++| `go vet ./...` | 通过（无输出） |
++| `gofmt -l .` | 通过（无输出） |
++| `GOOS=windows GOARCH=amd64 go build ./...` | 通过 |
++| `go test -race ./...` | **未执行成功**：`-race requires cgo`，`CGO_ENABLED=1` 后报 `cgo: C compiler "gcc" not found` |
++
++原始输出（节选）：
++
++```
++ok  	routepilot	1.405s
++ok  	routepilot/internal/autostart	0.904s
++ok  	routepilot/internal/configgen	0.922s
++?   	routepilot/internal/elevate	[no test files]
++?   	routepilot/internal/geoip	[no test files]
++ok  	routepilot/internal/kernel	11.211s
++ok  	routepilot/internal/procid	0.829s
++ok  	routepilot/internal/subscription	2.579s
++?   	routepilot/internal/sysproxy	[no test files]
++```
++
++```
++ok  	routepilot/internal/kernel	45.030s
++ok  	routepilot	2.062s
++```
++
++```
++ok  	routepilot	2.091s
++ok  	routepilot/internal/autostart	0.981s
++ok  	routepilot/internal/configgen	0.974s
++?   	routepilot/internal/elevate	[no test files]
++?   	routepilot/internal/geoip	[no test files]
++ok  	routepilot/internal/kernel	11.433s
++ok  	routepilot/internal/procid	1.014s
++ok  	routepilot/internal/subscription	2.608s
++?   	routepilot/internal/sysproxy	[no test files]
++```
++
++race 失败原始输出：
++
++```
++go: -race requires cgo; enable cgo by setting CGO_ENABLED=1
++```
++```
++# runtime/cgo
++cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in %PATH%
++FAIL	routepilot/internal/kernel [build failed]
++FAIL	routepilot [build failed]
++```
++
++> 结论：竞态检测未能在本机执行，这是工具链缺失，不是测试失败。
++> 建议在安装 MinGW-w64 / TDM-GCC 的机器上运行 `go test -race -count=1 ./...` 补验。
++
++---
++
++## 2. 新增测试清单
++
++### 2.1 代理恢复事务（`c1_1_r1_proxy_test.go`）
++
++| 测试 | 覆盖点 |
++| --- | --- |
++| `TestR1RestoreWriteFailuresKeepBackup/SetServer` | `SetServer` 失败 → 保留磁盘 + 内存备份、标记 Pending |
++| `TestR1RestoreWriteFailuresKeepBackup/SetOverride` | `SetOverride` 失败 → 同上 |
++| `TestR1RestoreWriteFailuresKeepBackup/SetAutoConfigURL` | `SetAutoConfigURL` 失败 → 同上 |
++| `TestR1RestoreWriteFailuresKeepBackup/ClearAutoConfigURL` | `ClearAutoConfigURL` 失败 → 同上 |
++| `TestR1ReadbackMismatchKeepsBackup` | 写入成功但回读不一致 → 校验失败、保留备份 |
++| `TestR1RemoveFailureKeepsMemoryBackup` | 恢复成功但删除备份失败 → 明确报错、内存备份不清空 |
++| `TestR1BootRetriesPendingRestore` | 失败后重启 → 启动阶段优先完成还原、清除旧恢复意图 |
++| `TestR1ExternalChangeAfterFailedRestoreIsNotOverwritten` | 失败后外部改代理 → 放弃还原、不写注册表、不覆盖用户配置 |
++| `TestR1RestoreIsIdempotent` | 重复恢复不产生额外注册表写入 |
++
++### 2.2 代理事务串行化（`c1_1_r1_proxy_test.go`）
++
++| 测试 | 覆盖点 |
++| --- | --- |
++| `TestR1StopKernelWaitsForProxyTx` | `SetSystemProxy(true)` 与 `StopKernel` 并发；Stop 必须等事务结束，返回后代理已还原 |
++| `TestR1ShutdownWaitsForProxyTx` | `SetSystemProxy(true)` 与 `Shutdown` 并发；Shutdown 后拒绝再开代理 |
++| `TestR1SetProxyFalseAndRestartConcurrent` | `SetSystemProxy(false)` 与 `RestartKernel` 并发不死锁 |
++| `TestR1ReconcileAndUserToggleSerialized` | `reconcileProxy` 与用户关闭代理并发，最终还原到原始配置 |
++| `TestR1WatchdogExhaustedRestoreSerializedWithUser` | 看门狗熔断恢复与用户开启代理并发，串行且熔断恢复最终生效 |
++| `TestR1StaleGenerationCannotOpenProxy` | 代际失效后旧任务不能打开代理 |
++| `TestR1GenerationInvalidatedWhileWaitingForProxyLock` | 等待 `proxyMu` 期间代际失效 → 拿锁后重新校验并放弃 |
++
++### 2.3 Watchdog 重启竞态（`internal/kernel/watchdog_r1_test.go`）
++
++| 测试 | 覆盖点 |
++| --- | --- |
++| `TestWatchdogR1ReportExitDuringRestart` | Restart 回调阻塞期间连续两次 `ReportExit`：全部记账，只额外安排一次重启 |
++| `TestWatchdogR1RestartFailureAndOnExitDeduplicated` | Restart 返回失败且回调内已触发 OnExit：同一次故障只计一次，按真实次数熔断 |
++| `TestWatchdogR1StopDuringRestart` | Stop 与正在执行的重启并发：不阻塞、不再排下一次、无残留 timer |
++| `TestWatchdogR1StopBeforeTimerFires` | Stop 后旧 timer 不得启动内核 |
++| `TestWatchdogR1BurstKeepsSingleTimer` | 两个连续崩溃 + 单个 timer：只触发一次重启 |
++| `TestWatchdogR1NewProcessCrashAfterSuccessfulRestart` | 重启"成功"后新进程立即崩溃：事件不丢失，继续安排恢复 |
++| `TestWatchdogR1PauseCancelsTimerAndIgnoresExit` | Pause 取消 timer、忽略后续退出；Resume 后可恢复 |
++
++### 2.4 测试替身改动（`c1_proxy_test.go`）
++
++新增故障注入点，便于确定性并发测试：
++
++- `failSetServer`：`SetServer` 写入失败；
++- `readbackServer`：写入成功但回读返回不一致值；
++- `enableHook` / `disableHook`：在写注册表前后插入 barrier；
++- 原有 `failEnable / failDisable / failSetOverride / failSetPAC / failClearPAC` 保留。
++
++---
++
++## 3. 逐条需求对照
++
++| 需求 | 结论 |
++| --- | --- |
++| 先将原始快照持久化为 Pending | `restoreProxyTransactionLocked` 第 1 步 |
++| 检查所有注册表写入错误 | `applyProxySnapshot` 使用 `errors.Join`，事务直接返回 |
++| 写入后调用 `verifyProxySnapshot` | 第 3 步 |
++| 验证成功后才删除 `proxy.json` | 第 4 步 |
++| 删除失败必须报错且不能清空内存备份 | `TestR1RemoveFailureKeepsMemoryBackup` |
++| 任何失败保留磁盘 + 内存依据 | `TestR1RestoreWriteFailuresKeepBackup`、`TestR1ReadbackMismatchKeepsBackup` |
++| 下次启动优先恢复 | `recoverPendingProxyRestore` + `TestR1BootRetriesPendingRestore` |
++| 重复恢复幂等 | `TestR1RestoreIsIdempotent` |
++| 不覆盖恢复失败后用户新设置 | `proxyStillOurs` + `TestR1ExternalChangeAfterFailedRestoreIsNotOverwritten` |
++| 明确区分 restarting / pending / stopped / paused / exhausted | Watchdog 字段与 `fire`/`ReportExit` 分支 |
++| 不允许多个 timer 并存 | `scheduleLocked` 先 `stopTimerLocked`；`TestWatchdogR1BurstKeepsSingleTimer` |
++| 旧 timer 在 Stop 后不能启动内核 | `timerSeq` + `stopped`；`TestWatchdogR1StopBeforeTimerFires` |
++| 重启期间新崩溃不丢、不重复安排 | `pendingAgain`；`TestWatchdogR1ReportExitDuringRestart`、`TestWatchdogR1NewProcessCrashAfterSuccessfulRestart` |
++| Restart 错误与 OnExit 去重 | `TestWatchdogR1RestartFailureAndOnExitDeduplicated` |
++| 不用 Sleep/忽略事件掩盖问题 | 实现无 Sleep；所有判定基于锁内状态 |
++| SetSystemProxy 串行化 | `withProxyTx` |
++| reconcileProxy 参与协调 | `reconcileProxy` / `reconcileProxyForGeneration` |
++| Stop 期间禁止并发开启代理 | `TestR1StopKernelWaitsForProxyTx` |
++| Shutdown 与熔断恢复不与用户操作交错 | `TestR1ShutdownWaitsForProxyTx`、`TestR1WatchdogExhaustedRestoreSerializedWithUser` |
++| afterStart 调 SetSystemProxy 不死锁 | `lifeMu → proxyMu` 单向顺序；`TestR1StopKernelWaitsForProxyTx` |
++| 明确锁顺序 | 见 `service.go` 结构体注释 |
++| 不持 `s.mu` 做注册表 I/O | 所有 I/O 前均已释放 `s.mu` |
++| 避免代际检查与写入之间的 Stop 竞态 | `withProxyTx` 锁内校验 + 写前二次校验；`TestR1GenerationInvalidatedWhileWaitingForProxyLock` |
++
++---
++
++## 4. 未覆盖项与建议
++
++1. **`go test -race`**：本机无 gcc，未执行；需要在具备 CGO 编译器环境补跑。
++2. **真实注册表 / WinHTTP 路径**：自动化测试全部使用 `fakeRegistry`；管理员实机验证步骤见
++   `C1.1-R1-REVIEW.md` 第 5 节。
++3. **长时间稳定性**：熔断/退避的单元测试使用毫秒级延迟；生产参数（2s→60s、10 分钟窗口、
++   最多 5 次）未做分钟级实机 soak，建议后续在预发布环境观察一轮。
+diff --git a/c1_1_r1_proxy_test.go b/c1_1_r1_proxy_test.go
+new file mode 100644
+index 0000000..5894fce
+--- /dev/null
++++ b/c1_1_r1_proxy_test.go
+@@ -0,0 +1,535 @@
++package main
++
++import (
++	"errors"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"routepilot/internal/kernel"
++)
++
++// r1Service 在指定数据目录上构造可注入故障的 CoreService。
++// 重启恢复测试需要在同一目录上先后创建两个实例。
++func r1Service(t *testing.T, fake *fakeRegistry, dir string) *CoreService {
++	t.Helper()
++	old := dataDirOverride
++	dataDirOverride = dir
++	t.Cleanup(func() { dataDirOverride = old })
++
++	svc := NewCoreService()
++	svc.sys = fake.ops()
++	svc.elevated = func() bool { return true }
++	svc.kernelRunningFn = func() bool { return true }
++	svc.mixedPort = 17890
++	return svc
++}
++
++func r1NewService(t *testing.T, fake *fakeRegistry) *CoreService {
++	return r1Service(t, fake, t.TempDir())
++}
++
++// ---------- P1：恢复事务完整性 ----------
++
++// 还原过程中任何一步注册表写入失败，都必须保留磁盘与内存备份，并标记 Pending。
++func TestR1RestoreWriteFailuresKeepBackup(t *testing.T) {
++	cases := []struct {
++		name    string
++		enabled bool
++		pac     string
++		apply   func(*fakeRegistry)
++	}{
++		{"SetServer", false, "", func(f *fakeRegistry) { f.failSetServer = true }},
++		{"SetOverride", true, "", func(f *fakeRegistry) { f.failSetOverride = true }},
++		{"SetAutoConfigURL", true, "http://old/pac", func(f *fakeRegistry) { f.failSetPAC = true }},
++		{"ClearAutoConfigURL", true, "", func(f *fakeRegistry) { f.failClearPAC = true }},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++			tc.apply(fake)
++			svc := r1NewService(t, fake)
++
++			cp := proxyBackup{
++				Addr:          "127.0.0.1:17890",
++				Server:        "127.0.0.1:8080",
++				Override:      "old-bypass",
++				AutoConfigURL: tc.pac,
++				Enabled:       tc.enabled,
++				Saved:         true,
++			}
++			svc.backup = cp
++			writeState(t, svc, cp)
++
++			if err := svc.restoreSystemProxy(); err == nil {
++				t.Fatal("注册表写入失败时恢复必须报错")
++			}
++			st, ok := readState(t, svc)
++			if !ok || !st.Saved || !st.Pending {
++				t.Fatalf("失败后磁盘备份必须保留并标记 Pending: %+v", st)
++			}
++			svc.mu.RLock()
++			mem := svc.backup
++			svc.mu.RUnlock()
++			if !mem.Saved || !mem.Pending {
++				t.Fatalf("失败后内存备份不能清空: %+v", mem)
++			}
++		})
++	}
++}
++
++// 写入成功但回读不一致：不能当作恢复完成，备份必须保留。
++func TestR1ReadbackMismatchKeepsBackup(t *testing.T) {
++	fake := &fakeRegistry{
++		server:   "127.0.0.1:17890",
++		enabled:  true,
++		override: "ours",
++		// 写入成功但注册表读出来是别的地址，模拟设置未生效。
++		readbackServer: "172.16.0.9:1",
++	}
++	svc := r1NewService(t, fake)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	svc.backup = cp
++	writeState(t, svc, cp)
++
++	err := svc.restoreSystemProxy()
++	if err == nil || !strings.Contains(err.Error(), "校验失败") {
++		t.Fatalf("回读不一致必须返回校验失败，实际 %v", err)
++	}
++	if _, ok := readState(t, svc); !ok {
++		t.Fatal("回读校验失败后必须保留备份")
++	}
++	svc.mu.RLock()
++	mem := svc.backup
++	svc.mu.RUnlock()
++	if !mem.Saved {
++		t.Fatal("回读校验失败后内存备份不能清空")
++	}
++}
++
++// 恢复与校验都成功、仅删除备份失败：必须返回明确错误且保留内存备份。
++func TestR1RemoveFailureKeepsMemoryBackup(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := r1NewService(t, fake)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	svc.backup = cp
++	writeState(t, svc, cp)
++
++	orig := removeProxyState
++	removeProxyState = func(string) error { return errors.New("injected remove failure") }
++	t.Cleanup(func() { removeProxyState = orig })
++
++	err := svc.restoreSystemProxy()
++	if err == nil || !strings.Contains(err.Error(), "删除系统代理备份失败") {
++		t.Fatalf("应返回删除失败，实际 %v", err)
++	}
++	if _, ok := readState(t, svc); !ok {
++		t.Fatal("删除失败时磁盘备份必须保留")
++	}
++	svc.mu.RLock()
++	mem := svc.backup
++	svc.mu.RUnlock()
++	if !mem.Saved {
++		t.Fatal("删除失败时不能清空内存备份，否则失去恢复依据")
++	}
++	if fake.server != "127.0.0.1:8080" || fake.override != "old-bypass" {
++		t.Fatalf("注册表应已还原: %+v", fake)
++	}
++}
++
++// 恢复失败后重新启动：必须在启动阶段优先完成还原，并清除旧的恢复意图。
++func TestR1BootRetriesPendingRestore(t *testing.T) {
++	fake := &fakeRegistry{
++		server:          "127.0.0.1:17890",
++		enabled:         true,
++		override:        "ours",
++		failSetOverride: true,
++	}
++	dir := t.TempDir()
++	svc := r1Service(t, fake, dir)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", AutoConfigURL: "http://old/pac",
++		Enabled: true, Saved: true,
++	}
++	svc.backup = cp
++	writeState(t, svc, cp)
++
++	if err := svc.restoreSystemProxy(); err == nil {
++		t.Fatal("故障未解除时恢复必须失败")
++	}
++
++	// 模拟进程重启：注册表故障消失，新实例读同一数据目录。
++	fake.failSetOverride = false
++	svc2 := r1Service(t, fake, dir)
++	svc2.restoreProxy = true
++	svc2.recoverPendingProxyRestore()
++
++	if _, ok := readState(t, svc2); ok {
++		t.Fatal("启动阶段重试成功后应删除备份")
++	}
++	if fake.server != "127.0.0.1:8080" || fake.override != "old-bypass" || fake.pac != "http://old/pac" {
++		t.Fatalf("启动重试未完整还原: %+v", fake)
++	}
++	svc2.mu.RLock()
++	restore := svc2.restoreProxy
++	svc2.mu.RUnlock()
++	if restore {
++		t.Fatal("恢复成功后必须清除旧恢复意图，避免再次自动接管")
++	}
++}
++
++// 恢复失败后用户又设置了新的代理：再次恢复必须放弃，不得覆盖用户配置。
++func TestR1ExternalChangeAfterFailedRestoreIsNotOverwritten(t *testing.T) {
++	fake := &fakeRegistry{
++		server:          "127.0.0.1:17890",
++		enabled:         true,
++		override:        "ours",
++		failSetOverride: true,
++	}
++	svc := r1NewService(t, fake)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	svc.backup = cp
++	writeState(t, svc, cp)
++
++	if err := svc.restoreSystemProxy(); err == nil {
++		t.Fatal("第一次恢复应失败")
++	}
++
++	// 用户/外部软件在失败后接管了系统代理。
++	fake.failSetOverride = false
++	fake.server = "10.0.0.5:7890"
++	fake.enabled = true
++	fake.override = "external-bypass"
++	beforeEnable := fake.enableCalls
++
++	if err := svc.restoreSystemProxy(); err != nil {
++		t.Fatalf("外部接管后应放弃还原而不是报错: %v", err)
++	}
++	if fake.server != "10.0.0.5:7890" || fake.override != "external-bypass" {
++		t.Fatalf("用户新设置被覆盖: %+v", fake)
++	}
++	if fake.enableCalls != beforeEnable {
++		t.Fatal("放弃还原时不应再写注册表")
++	}
++	if _, ok := readState(t, svc); ok {
++		t.Fatal("放弃接管后应撤销本地还原点")
++	}
++	svc.mu.RLock()
++	on := svc.proxyOn
++	svc.mu.RUnlock()
++	if on {
++		t.Fatal("放弃接管后不能声称系统代理仍由本程序控制")
++	}
++}
++
++// 重复恢复必须幂等：第二次调用不产生任何注册表写入。
++func TestR1RestoreIsIdempotent(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := r1NewService(t, fake)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	svc.backup = cp
++	writeState(t, svc, cp)
++
++	if err := svc.restoreSystemProxy(); err != nil {
++		t.Fatalf("首次恢复失败: %v", err)
++	}
++	enables := fake.enableCalls
++	overrides := fake.override
++
++	if err := svc.restoreSystemProxy(); err != nil {
++		t.Fatalf("重复恢复必须幂等: %v", err)
++	}
++	if fake.enableCalls != enables {
++		t.Fatal("重复恢复不应再次写注册表")
++	}
++	if fake.override != overrides {
++		t.Fatal("重复恢复不应改变绕过列表")
++	}
++}
++
++// ---------- P1：代理事务串行化 ----------
++
++// StopKernel 必须等待正在进行的代理启用事务完成，并在返回前把代理还原。
++func TestR1StopKernelWaitsForProxyTx(t *testing.T) {
++	fake := &fakeRegistry{}
++	svc := r1NewService(t, fake)
++	svc.mgr = kernel.NewManager(t.TempDir())
++
++	enableStarted := make(chan struct{})
++	releaseEnable := make(chan struct{})
++	var once sync.Once
++	fake.enableHook = func() {
++		once.Do(func() {
++			close(enableStarted)
++			<-releaseEnable
++		})
++	}
++
++	userDone := make(chan error, 1)
++	go func() { userDone <- svc.SetSystemProxy(true) }()
++	<-enableStarted
++
++	stopDone := make(chan error, 1)
++	go func() { stopDone <- svc.StopKernel() }()
++
++	// 代理事务还握着 proxyMu，StopKernel 不可能在此刻返回。
++	select {
++	case <-stopDone:
++		t.Fatal("StopKernel 在代理事务完成前返回")
++	case <-time.After(100 * time.Millisecond):
++	}
++	close(releaseEnable)
++
++	if err := <-userDone; err != nil {
++		t.Fatalf("开启系统代理失败: %v", err)
++	}
++	if err := <-stopDone; err != nil {
++		t.Fatalf("停止内核失败: %v", err)
++	}
++	if fake.enabled {
++		t.Fatal("StopKernel 返回成功后系统代理必须已关闭")
++	}
++	svc.mu.RLock()
++	on := svc.proxyOn
++	svc.mu.RUnlock()
++	if on {
++		t.Fatal("StopKernel 返回成功后 proxyOn 必须为 false")
++	}
++}
++
++// Shutdown 与用户开启代理并发：串行执行，最终代理必须被还原。
++func TestR1ShutdownWaitsForProxyTx(t *testing.T) {
++	fake := &fakeRegistry{}
++	svc := r1NewService(t, fake)
++	svc.mgr = kernel.NewManager(t.TempDir())
++
++	enableStarted := make(chan struct{})
++	releaseEnable := make(chan struct{})
++	var once sync.Once
++	fake.enableHook = func() {
++		once.Do(func() {
++			close(enableStarted)
++			<-releaseEnable
++		})
++	}
++
++	userDone := make(chan error, 1)
++	go func() { userDone <- svc.SetSystemProxy(true) }()
++	<-enableStarted
++
++	shutdownDone := make(chan struct{})
++	go func() {
++		svc.Shutdown()
++		close(shutdownDone)
++	}()
++	close(releaseEnable)
++
++	if err := <-userDone; err != nil {
++		t.Fatalf("开启系统代理失败: %v", err)
++	}
++	select {
++	case <-shutdownDone:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Shutdown 未能在代理事务结束后完成")
++	}
++	if fake.enabled {
++		t.Fatal("Shutdown 后系统代理必须已还原")
++	}
++	if err := svc.SetSystemProxy(true); err == nil {
++		t.Fatal("Shutdown 后必须拒绝再次开启系统代理")
++	}
++	if fake.enabled {
++		t.Fatal("Shutdown 后的拒绝不能写注册表")
++	}
++}
++
++// SetSystemProxy(false) 与 RestartKernel 并发：不能死锁或交错。
++func TestR1SetProxyFalseAndRestartConcurrent(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := r1NewService(t, fake)
++	svc.mgr = kernel.NewManager(t.TempDir())
++	svc.backup = proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	writeState(t, svc, svc.backup)
++
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		_ = svc.SetSystemProxy(false)
++	}()
++	go func() {
++		defer wg.Done()
++		_ = svc.RestartKernel()
++	}()
++
++	done := make(chan struct{})
++	go func() {
++		wg.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("SetSystemProxy(false) 与 RestartKernel 并发时死锁")
++	}
++	if fake.server != "127.0.0.1:8080" {
++		t.Fatalf("并发后仍应完成还原，实际 %s", fake.server)
++	}
++}
++
++// reconcileProxy 与用户手动关闭代理并发：串行执行，最终还原到原始配置。
++func TestR1ReconcileAndUserToggleSerialized(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := r1NewService(t, fake)
++	svc.mixedPort = 17891
++	st := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	writeState(t, svc, st)
++
++	enableStarted := make(chan struct{})
++	releaseEnable := make(chan struct{})
++	var once sync.Once
++	fake.enableHook = func() {
++		once.Do(func() {
++			close(enableStarted)
++			<-releaseEnable
++		})
++	}
++
++	reconcileDone := make(chan struct{})
++	go func() {
++		svc.reconcileProxy()
++		close(reconcileDone)
++	}()
++	<-enableStarted
++
++	userDone := make(chan error, 1)
++	go func() { userDone <- svc.SetSystemProxy(false) }()
++	close(releaseEnable)
++
++	select {
++	case <-reconcileDone:
++	case <-time.After(3 * time.Second):
++		t.Fatal("reconcileProxy 未完成")
++	}
++	if err := <-userDone; err != nil {
++		t.Fatalf("关闭系统代理失败: %v", err)
++	}
++	if fake.server != "127.0.0.1:8080" || fake.override != "old-bypass" {
++		t.Fatalf("并发后未还原到原始配置: %+v", fake)
++	}
++}
++
++// Watchdog 熔断恢复与用户开启代理并发：串行执行，熔断恢复必须最终生效。
++func TestR1WatchdogExhaustedRestoreSerializedWithUser(t *testing.T) {
++	fake := &fakeRegistry{}
++	svc := r1NewService(t, fake)
++	svc.mgr = kernel.NewManager(t.TempDir())
++	svc.startKernelWatchdog()
++	wd := svc.watchdog
++	t.Cleanup(wd.Stop)
++
++	enableStarted := make(chan struct{})
++	releaseEnable := make(chan struct{})
++	var enableOnce sync.Once
++	fake.enableHook = func() {
++		enableOnce.Do(func() {
++			close(enableStarted)
++			<-releaseEnable
++		})
++	}
++	restored := make(chan struct{})
++	var restoreOnce sync.Once
++	fake.disableHook = func() { restoreOnce.Do(func() { close(restored) }) }
++
++	userDone := make(chan error, 1)
++	go func() { userDone <- svc.SetSystemProxy(true) }()
++	<-enableStarted
++
++	// 连续退出达到上限，触发熔断恢复（与用户操作并发）。
++	for i := 0; i < 6; i++ {
++		wd.ReportExit(kernel.ExitInfo{Reason: "boom", At: time.Now()})
++	}
++	close(releaseEnable)
++
++	if err := <-userDone; err != nil {
++		t.Fatalf("开启系统代理失败: %v", err)
++	}
++	select {
++	case <-restored:
++	case <-time.After(3 * time.Second):
++		t.Fatal("熔断恢复未在用户操作结束后执行")
++	}
++	if fake.enabled {
++		t.Fatal("熔断恢复后系统代理必须关闭")
++	}
++}
++
++// 代际失效后，启动恢复任务绝不能再打开系统代理。
++func TestR1StaleGenerationCannotOpenProxy(t *testing.T) {
++	fake := &fakeRegistry{}
++	svc := r1NewService(t, fake)
++
++	gen, ctx := svc.beginKernelGeneration()
++	svc.invalidateKernelGeneration()
++
++	err := svc.setSystemProxyForGeneration(gen, ctx)
++	if !errors.Is(err, errProxyStale) {
++		t.Fatalf("旧代际必须被拒绝，实际 %v", err)
++	}
++	if fake.enableCalls != 0 {
++		t.Fatal("旧代际任务写入了注册表")
++	}
++	if _, statErr := os.Stat(svc.proxyStatePath()); !os.IsNotExist(statErr) {
++		t.Fatal("旧代际任务写入了代理备份")
++	}
++}
++
++// 事务在等待 proxyMu 期间代际失效：拿到锁后必须重新校验并放弃。
++func TestR1GenerationInvalidatedWhileWaitingForProxyLock(t *testing.T) {
++	fake := &fakeRegistry{}
++	svc := r1NewService(t, fake)
++
++	gen, ctx := svc.beginKernelGeneration()
++	svc.proxyMu.Lock()
++
++	done := make(chan error, 1)
++	go func() { done <- svc.setSystemProxyForGeneration(gen, ctx) }()
++
++	// 先失效代际再释放锁，保证事务拿到锁时已是旧代际。
++	svc.invalidateKernelGeneration()
++	svc.proxyMu.Unlock()
++
++	select {
++	case err := <-done:
++		if !errors.Is(err, errProxyStale) {
++			t.Fatalf("期望 errProxyStale，实际 %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("代理事务未返回")
++	}
++	if fake.enableCalls != 0 {
++		t.Fatal("失效代际不应写注册表")
++	}
++}
+diff --git a/c1_proxy_test.go b/c1_proxy_test.go
+index 2bcd118..fb13e55 100644
+--- a/c1_proxy_test.go
++++ b/c1_proxy_test.go
+@@ -17,10 +17,18 @@ type fakeRegistry struct {
+ 
+ 	failEnable      bool
+ 	failDisable     bool
++	failSetServer   bool
+ 	failSetOverride bool
+ 	failSetPAC      bool
+ 	failClearPAC    bool
+ 
++	// readbackServer 非空时 Current 返回该值，用于模拟"写入成功但注册表未生效"。
++	readbackServer string
++	// enableHook 在 Enable 真正写值之前调用，供并发测试插入确定性 barrier。
++	enableHook func()
++	// disableHook 在 Disable 成功之后调用，供测试等待事务真正落地。
++	disableHook func()
++
+ 	enableCalls  int
+ 	disableCalls int
+ 	winHTTPCalls int
+@@ -28,9 +36,17 @@ type fakeRegistry struct {
+ 
+ func (f *fakeRegistry) ops() systemProxyOps {
+ 	return systemProxyOps{
+-		Current: func() (string, bool) { return f.server, f.enabled },
++		Current: func() (string, bool) {
++			if f.readbackServer != "" {
++				return f.readbackServer, f.enabled
++			}
++			return f.server, f.enabled
++		},
+ 		Enable: func(addr string) error {
+ 			f.enableCalls++
++			if f.enableHook != nil {
++				f.enableHook()
++			}
+ 			if f.failEnable {
+ 				return errors.New("injected enable failure")
+ 			}
+@@ -46,9 +62,15 @@ func (f *fakeRegistry) ops() systemProxyOps {
+ 				return errors.New("injected disable failure")
+ 			}
+ 			f.enabled = false
++			if f.disableHook != nil {
++				f.disableHook()
++			}
+ 			return nil
+ 		},
+ 		SetServer: func(addr string) error {
++			if f.failSetServer {
++				return errors.New("injected set-server failure")
++			}
+ 			f.server = addr
+ 			return nil
+ 		},
+diff --git a/internal/kernel/watchdog.go b/internal/kernel/watchdog.go
+index a2a419c..3a8d631 100644
+--- a/internal/kernel/watchdog.go
++++ b/internal/kernel/watchdog.go
+@@ -30,19 +30,33 @@ type WatchdogOptions struct {
+ 
+ // Watchdog 负责在进程异常退出后按策略重启。
+ //
+-// 并发安全：ReportExit 可能来自进程收尾 goroutine，Stop/Reset 来自 UI 线程；
+-// 所有状态都在 mu 内维护。同一时刻最多只有一个待执行的重启定时器，多个退出
+-// 事件不会叠加出多个重启流程。
++// 状态（全部受 mu 保护，互斥且明确）：
++//
++//	stopped    —— 永久停止（Shutdown/MarkQuitting），之后不再做任何事
++//	paused     —— 用户手动停止内核，等待 Resume
++//	exhausted  —— 超过重启上限，等待用户手动启动后 Resume 清除
++//	restarting —— Restart 回调正在执行
++//	timer      —— 至多一个待执行的重启定时器
++//
++// 并发约束：
++//   - 同一时刻最多一个定时器。定时器带序号，被 Stop/Pause/重排替换后，
++//     旧回调即使已经触发也会因序号不匹配而被丢弃，绝不会启动内核。
++//   - restarting 期间收到的新退出事件只记账（pendingAgain），不另排定时器；
++//     本轮重启结束后由 fire 统一决定是否继续恢复，避免一次故障叠加多次重启。
++//   - Restart 返回错误与期间 OnExit 报告的退出视为同一次故障，只计一次。
+ type Watchdog struct {
+ 	opts WatchdogOptions
+ 
+ 	mu         sync.Mutex
+ 	crashes    []time.Time
+ 	timer      *time.Timer
++	timerSeq   uint64
+ 	stopped    bool
+ 	paused     bool
+ 	exhausted  bool
+ 	restarting bool
++	// pendingAgain 表示 restarting 期间又收到了退出事件，需在本轮结束后处理。
++	pendingAgain bool
+ }
+ 
+ // NewWatchdog 创建看门狗。未配置的字段使用保守默认值。
+@@ -77,39 +91,34 @@ func NewWatchdog(opts WatchdogOptions) *Watchdog {
+ func (w *Watchdog) ReportExit(info ExitInfo) {
+ 	w.mu.Lock()
+ 	defer w.mu.Unlock()
+-	if w.stopped || w.paused {
++
++	if w.stopped || w.paused || w.exhausted {
++		w.logf("看门狗已停止/暂停/熔断，忽略退出事件: %s", info.Reason)
+ 		return
+ 	}
+-	w.recordLocked(info)
+-}
+ 
+-// recordLocked 记录一次失败并决定是否安排重启。调用方必须持有 w.mu。
+-func (w *Watchdog) recordLocked(info ExitInfo) {
+-	now := info.At
+-	if now.IsZero() {
+-		now = time.Now()
+-	}
++	w.recordCrashLocked(info)
+ 
+-	// 长稳运行后的崩溃是新账，不继承旧窗口内的失败次数。
+-	if info.Uptime >= w.opts.Config.StableAfter {
+-		w.crashes = nil
++	if w.restarting {
++		// 重启回调执行期间新内核又崩了：先记账，本轮结束后再统一安排。
++		// 这里绝不能排定时器，否则会与正在进行的重启叠加成两条恢复链。
++		w.pendingAgain = true
++		w.logf("重启进行中收到新的退出事件，合并到本轮处理: %s", info.Reason)
++		return
+ 	}
+-	w.pruneLocked(now)
+-	w.crashes = append(w.crashes, now)
+ 
+-	if len(w.crashes) > w.opts.Config.MaxRestarts {
++	if w.overLimitLocked() {
+ 		w.exhaustLocked(info.Reason)
+ 		return
+ 	}
+-	// 已有待执行的重启：说明这是同一次故障的重复退出事件，不再叠加。
+ 	if w.timer != nil {
++		// 已有待执行的重启：这是同一次故障的重复退出事件，不叠加。
+ 		w.logf("忽略重复退出事件：已有待执行的重启（窗口内第 %d 次）", len(w.crashes))
+ 		return
+ 	}
+ 
+ 	attempt := len(w.crashes)
+-	delay := backoffDelay(w.opts.Config, attempt)
+-	w.scheduleLocked(delay)
++	delay := w.scheduleLocked(attempt)
+ 	w.logf("内核异常退出，第 %d 次自动重启将在 %s 后执行: %s", attempt, delay, info.Reason)
+ 	if w.opts.OnRetry != nil {
+ 		cb := w.opts.OnRetry
+@@ -117,16 +126,36 @@ func (w *Watchdog) recordLocked(info ExitInfo) {
+ 	}
+ }
+ 
++// recordCrashLocked 记录一次失败。调用方必须持有 w.mu。
++func (w *Watchdog) recordCrashLocked(info ExitInfo) {
++	now := info.At
++	if now.IsZero() {
++		now = time.Now()
++	}
++	// 长稳运行后的崩溃是新账，不继承旧窗口内的失败次数。
++	if info.Uptime >= w.opts.Config.StableAfter {
++		w.crashes = nil
++	}
++	w.pruneLocked(now)
++	w.crashes = append(w.crashes, now)
++}
++
+ // fire 执行一次重启。失败会作为一次新失败继续退避，直到上限。
+-func (w *Watchdog) fire() {
++func (w *Watchdog) fire(seq uint64) {
+ 	w.mu.Lock()
+-	if w.stopped || w.paused || w.exhausted {
+-		w.timer = nil
++	// 旧定时器（已被 Stop/Pause/重排替换）不得再启动内核。
++	if seq != w.timerSeq {
+ 		w.mu.Unlock()
+ 		return
+ 	}
+ 	w.timer = nil
++	w.timerSeq++ // 让本次定时器彻底失效
++	if w.stopped || w.paused || w.exhausted {
++		w.mu.Unlock()
++		return
++	}
+ 	if w.restarting {
++		// 理论不可达：restarting 期间不排定时器。保守放弃本次触发。
+ 		w.mu.Unlock()
+ 		return
+ 	}
+@@ -140,29 +169,46 @@ func (w *Watchdog) fire() {
+ 	}
+ 
+ 	w.mu.Lock()
++	defer w.mu.Unlock()
+ 	w.restarting = false
+-	if w.stopped || w.paused {
+-		w.mu.Unlock()
++
++	// 重启期间被 Stop/Pause/熔断：不得再安排任何恢复。
++	if w.stopped || w.paused || w.exhausted {
++		w.pendingAgain = false
+ 		return
+ 	}
+-	if err == nil {
+-		w.mu.Unlock()
++
++	if err != nil {
++		w.logf("自动重启失败: %v", err)
++		// 重启期间若已经收到 OnExit，说明同一次故障已经记过一次，
++		// 这里不能再记，否则一次故障会被放大成两次、提前耗尽重试额度。
++		if !w.pendingAgain {
++			now := time.Now()
++			w.pruneLocked(now)
++			w.crashes = append(w.crashes, now)
++		}
++		w.pendingAgain = false
++		if w.overLimitLocked() {
++			w.exhaustLocked(err.Error())
++			return
++		}
++		attempt := len(w.crashes)
++		delay := w.scheduleLocked(attempt)
++		w.logf("将在 %s 后重试启动（窗口内第 %d 次）", delay, attempt)
+ 		return
+ 	}
+ 
+-	now := time.Now()
+-	w.logf("自动重启失败: %v", err)
+-	w.pruneLocked(now)
+-	w.crashes = append(w.crashes, now)
+-	if len(w.crashes) > w.opts.Config.MaxRestarts {
+-		w.exhaustLocked(err.Error())
+-		w.mu.Unlock()
+-		return
++	// 重启成功，但期间新进程已经崩溃：必须继续恢复，不能把事件吞掉。
++	if w.pendingAgain {
++		w.pendingAgain = false
++		if w.overLimitLocked() {
++			w.exhaustLocked("重启后立即再次退出")
++			return
++		}
++		attempt := len(w.crashes)
++		delay := w.scheduleLocked(attempt)
++		w.logf("新内核启动后再次退出，将在 %s 后重试（窗口内第 %d 次）", delay, attempt)
+ 	}
+-	delay := backoffDelay(w.opts.Config, len(w.crashes))
+-	w.scheduleLocked(delay)
+-	w.logf("将在 %s 后重试启动（窗口内第 %d 次）", delay, len(w.crashes))
+-	w.mu.Unlock()
+ }
+ 
+ // Stop 永久停止看门狗。用户主动退出时必须先调用，避免退出过程触发重启。
+@@ -170,10 +216,8 @@ func (w *Watchdog) Stop() {
+ 	w.mu.Lock()
+ 	defer w.mu.Unlock()
+ 	w.stopped = true
+-	if w.timer != nil {
+-		w.timer.Stop()
+-		w.timer = nil
+-	}
++	w.pendingAgain = false
++	w.stopTimerLocked()
+ }
+ 
+ // Pause 暂停自动恢复并取消待执行的重启。用户手动停止内核时调用：
+@@ -185,10 +229,8 @@ func (w *Watchdog) Pause() {
+ 		return
+ 	}
+ 	w.paused = true
+-	if w.timer != nil {
+-		w.timer.Stop()
+-		w.timer = nil
+-	}
++	w.pendingAgain = false
++	w.stopTimerLocked()
+ }
+ 
+ // Resume 在用户手动启动成功后恢复自动恢复，并清除旧的失败记录。
+@@ -202,10 +244,8 @@ func (w *Watchdog) Resume() {
+ 	w.paused = false
+ 	w.exhausted = false
+ 	w.crashes = nil
+-	if w.timer != nil {
+-		w.timer.Stop()
+-		w.timer = nil
+-	}
++	w.pendingAgain = false
++	w.stopTimerLocked()
+ }
+ 
+ // Exhausted 返回是否已因超过上限而停止自动恢复。
+@@ -215,6 +255,10 @@ func (w *Watchdog) Exhausted() bool {
+ 	return w.exhausted
+ }
+ 
++func (w *Watchdog) overLimitLocked() bool {
++	return len(w.crashes) > w.opts.Config.MaxRestarts
++}
++
+ func (w *Watchdog) pruneLocked(now time.Time) {
+ 	cutoff := now.Add(-w.opts.Config.Window)
+ 	kept := w.crashes[:0]
+@@ -231,10 +275,8 @@ func (w *Watchdog) exhaustLocked(reason string) {
+ 		return
+ 	}
+ 	w.exhausted = true
+-	if w.timer != nil {
+-		w.timer.Stop()
+-		w.timer = nil
+-	}
++	w.pendingAgain = false
++	w.stopTimerLocked()
+ 	msg := fmt.Sprintf(
+ 		"内核在 %s 内连续异常退出 %d 次，已停止自动重启：%s",
+ 		w.opts.Config.Window, len(w.crashes), reason,
+@@ -247,8 +289,23 @@ func (w *Watchdog) exhaustLocked(reason string) {
+ 	}
+ }
+ 
+-func (w *Watchdog) scheduleLocked(delay time.Duration) {
+-	w.timer = time.AfterFunc(delay, w.fire)
++// stopTimerLocked 停掉并作废当前定时器。递增序号确保已经触发的旧回调失效。
++func (w *Watchdog) stopTimerLocked() {
++	if w.timer != nil {
++		w.timer.Stop()
++		w.timer = nil
++	}
++	w.timerSeq++
++}
++
++// scheduleLocked 安排下一次重启，返回等待时长。
++// 排新定时器前一定先作废旧定时器，保证同一时刻最多一个。
++func (w *Watchdog) scheduleLocked(attempt int) time.Duration {
++	w.stopTimerLocked()
++	seq := w.timerSeq
++	delay := backoffDelay(w.opts.Config, attempt)
++	w.timer = time.AfterFunc(delay, func() { w.fire(seq) })
++	return delay
+ }
+ 
+ func (w *Watchdog) logf(format string, args ...any) {
+diff --git a/internal/kernel/watchdog_r1_test.go b/internal/kernel/watchdog_r1_test.go
+new file mode 100644
+index 0000000..e25b474
+--- /dev/null
++++ b/internal/kernel/watchdog_r1_test.go
+@@ -0,0 +1,304 @@
++package kernel
++
++import (
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// watchdogR1Config 返回适合确定性测试的策略：窗口足够长、
++// StableAfter 足够长，避免退避/稳定窗口把测试结果搅乱。
++func watchdogR1Config(max int) WatchdogConfig {
++	return WatchdogConfig{
++		Window:      time.Hour,
++		MaxRestarts: max,
++		BaseDelay:   5 * time.Millisecond,
++		MaxDelay:    20 * time.Millisecond,
++		StableAfter: time.Hour,
++	}
++}
++
++func watchdogCrashes(w *Watchdog) int {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return len(w.crashes)
++}
++
++func watchdogHasTimer(w *Watchdog) bool {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return w.timer != nil
++}
++
++// Restart 回调阻塞期间收到新的退出事件：只记账一次，本轮结束后只安排一个重启。
++func TestWatchdogR1ReportExitDuringRestart(t *testing.T) {
++	calls := make(chan struct{}, 8)
++	started := make(chan struct{})
++	release := make(chan struct{})
++	var first int32
++
++	w := NewWatchdog(WatchdogOptions{
++		Config: watchdogR1Config(5),
++		Restart: func() error {
++			calls <- struct{}{}
++			if atomic.CompareAndSwapInt32(&first, 0, 1) {
++				close(started)
++				<-release
++			}
++			return nil
++		},
++	})
++	defer w.Stop()
++
++	w.ReportExit(ExitInfo{Reason: "first", At: time.Now()})
++	<-started
++
++	// 重启回调仍在执行，新内核又退出（连续两次）。
++	w.ReportExit(ExitInfo{Reason: "second", At: time.Now()})
++	w.ReportExit(ExitInfo{Reason: "third", At: time.Now()})
++
++	if got := watchdogCrashes(w); got != 3 {
++		t.Fatalf("重启期间的退出事件都必须记账，实际 %d 次", got)
++	}
++	close(release)
++
++	// 第一次 + 合并后的一次，共两次；不能因为连续两条退出排三次重启。
++	waitCalls(t, calls, 2)
++	select {
++	case <-calls:
++		t.Fatal("重启期间的事件被重复安排")
++	case <-time.After(80 * time.Millisecond):
++	}
++}
++
++// Restart 返回失败且回调内已触发 OnExit：同一次故障只能计一次。
++func TestWatchdogR1RestartFailureAndOnExitDeduplicated(t *testing.T) {
++	var calls int32
++	exhausted := make(chan string, 1)
++
++	var w *Watchdog
++	w = NewWatchdog(WatchdogOptions{
++		Config: watchdogR1Config(2),
++		Restart: func() error {
++			n := atomic.AddInt32(&calls, 1)
++			if n == 1 {
++				// 模拟新进程刚启动就退出：Manager.OnExit 同步回调。
++				w.ReportExit(ExitInfo{Reason: "new process crashed", At: time.Now()})
++			}
++			return errors.New("restart failed")
++		},
++		OnExhausted: func(_ int, msg string) { exhausted <- msg },
++	})
++	defer w.Stop()
++
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	select {
++	case <-exhausted:
++	case <-time.After(2 * time.Second):
++		t.Fatal("持续失败后应熔断")
++	}
++	// 初始崩溃 1 次 + 重启内 OnExit 1 次 + 第二次重启失败 1 次 = 3。
++	// 若未去重会多记一次导致计数为 4。
++	if got := watchdogCrashes(w); got != 3 {
++		t.Fatalf("同一次故障被重复计数，实际 %d 次", got)
++	}
++	if !w.Exhausted() {
++		t.Fatal("应已熔断")
++	}
++}
++
++// Stop 与正在执行的重启并发：重启返回后不得再安排下一次，且没有待执行定时器。
++func TestWatchdogR1StopDuringRestart(t *testing.T) {
++	started := make(chan struct{})
++	release := make(chan struct{})
++	var calls int32
++
++	w := NewWatchdog(WatchdogOptions{
++		Config: watchdogR1Config(5),
++		Restart: func() error {
++			atomic.AddInt32(&calls, 1)
++			close(started)
++			<-release
++			return nil
++		},
++	})
++
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	<-started
++
++	// 重启进行中用户退出。
++	done := make(chan struct{})
++	go func() {
++		w.Stop()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("Stop 被进行中的重启阻塞")
++	}
++	close(release)
++
++	time.Sleep(80 * time.Millisecond)
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("Stop 后仍执行了重启：%d 次", got)
++	}
++	if watchdogHasTimer(w) {
++		t.Fatal("Stop 后不应残留待执行的重启定时器")
++	}
++}
++
++// Stop 之后即便定时器已经到点，也不允许启动内核。
++func TestWatchdogR1StopBeforeTimerFires(t *testing.T) {
++	var calls int32
++	w := NewWatchdog(WatchdogOptions{
++		Config: WatchdogConfig{
++			Window:      time.Hour,
++			MaxRestarts: 5,
++			BaseDelay:   50 * time.Millisecond,
++			MaxDelay:    50 * time.Millisecond,
++			StableAfter: time.Hour,
++		},
++		Restart: func() error {
++			atomic.AddInt32(&calls, 1)
++			return nil
++		},
++	})
++
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	w.Stop()
++
++	time.Sleep(120 * time.Millisecond)
++	if got := atomic.LoadInt32(&calls); got != 0 {
++		t.Fatalf("Stop 后仍启动了 %d 次内核", got)
++	}
++	if watchdogHasTimer(w) {
++		t.Fatal("Stop 后仍有待执行定时器")
++	}
++}
++
++// 两个连续崩溃事件与定时器并发：始终只保留一个定时器、只触发一次重启。
++func TestWatchdogR1BurstKeepsSingleTimer(t *testing.T) {
++	var calls int32
++	fired := make(chan struct{}, 8)
++	w := NewWatchdog(WatchdogOptions{
++		Config: WatchdogConfig{
++			Window:      time.Hour,
++			MaxRestarts: 5,
++			BaseDelay:   80 * time.Millisecond,
++			MaxDelay:    time.Second,
++			StableAfter: time.Hour,
++		},
++		Restart: func() error {
++			atomic.AddInt32(&calls, 1)
++			fired <- struct{}{}
++			return nil
++		},
++	})
++	defer w.Stop()
++
++	w.ReportExit(ExitInfo{Reason: "a", At: time.Now()})
++	timer1 := watchdogHasTimer(w)
++	w.ReportExit(ExitInfo{Reason: "b", At: time.Now()})
++	timer2 := watchdogHasTimer(w)
++	if !timer1 || !timer2 {
++		t.Fatal("崩溃后应存在待执行的重启定时器")
++	}
++
++	select {
++	case <-fired:
++	case <-time.After(time.Second):
++		t.Fatal("定时器未触发重启")
++	}
++	time.Sleep(40 * time.Millisecond)
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("连续崩溃叠加出 %d 次重启", got)
++	}
++}
++
++// 重启成功但新内核立即崩溃：必须继续恢复，不能吞掉事件。
++func TestWatchdogR1NewProcessCrashAfterSuccessfulRestart(t *testing.T) {
++	var calls int32
++	second := make(chan struct{}, 1)
++	var w *Watchdog
++	w = NewWatchdog(WatchdogOptions{
++		Config: watchdogR1Config(5),
++		Restart: func() error {
++			n := atomic.AddInt32(&calls, 1)
++			if n == 1 {
++				// 第一次重启"成功"后新进程立刻崩溃。
++				w.ReportExit(ExitInfo{Reason: "crashed immediately", At: time.Now()})
++				second <- struct{}{}
++			}
++			return nil
++		},
++	})
++	defer w.Stop()
++
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	<-second
++
++	// 新进程的崩溃应安排下一次重启。
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if atomic.LoadInt32(&calls) >= 2 {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatalf("新进程崩溃事件被吞掉，重启次数 %d", atomic.LoadInt32(&calls))
++}
++
++// 暂停（用户停止内核）与定时器并发：暂停后不再重启。
++func TestWatchdogR1PauseCancelsTimerAndIgnoresExit(t *testing.T) {
++	var calls int32
++	w := NewWatchdog(WatchdogOptions{
++		Config: WatchdogConfig{
++			Window:      time.Hour,
++			MaxRestarts: 5,
++			BaseDelay:   40 * time.Millisecond,
++			MaxDelay:    time.Second,
++			StableAfter: time.Hour,
++		},
++		Restart: func() error {
++			atomic.AddInt32(&calls, 1)
++			return nil
++		},
++	})
++	defer w.Stop()
++
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	w.Pause()
++	w.ReportExit(ExitInfo{Reason: "boom again", At: time.Now()})
++	time.Sleep(90 * time.Millisecond)
++	if got := atomic.LoadInt32(&calls); got != 0 {
++		t.Fatalf("Pause 后仍重启了 %d 次", got)
++	}
++	if watchdogHasTimer(w) {
++		t.Fatal("Pause 后不应残留定时器")
++	}
++
++	// Resume 后必须能重新恢复。
++	w.Resume()
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if atomic.LoadInt32(&calls) == 1 {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatal("Resume 后未恢复自动重启")
++}
++
++func waitCalls(t *testing.T, calls <-chan struct{}, n int) {
++	t.Helper()
++	for i := 0; i < n; i++ {
++		select {
++		case <-calls:
++		case <-time.After(2 * time.Second):
++			t.Fatalf("等待第 %d 次重启超时", i+1)
++		}
++	}
++}
+diff --git a/service.go b/service.go
+index c864c95..319d865 100644
+--- a/service.go
++++ b/service.go
+@@ -48,6 +48,10 @@ type proxyBackup struct {
+ 	// Pending 表示恢复动作已经开始但尚未确认成功。下次启动必须优先重试，
+ 	// 不能再把注册表里的旧地址当作"仍然由本程序接管"而去改写。
+ 	Pending bool `json:"pending,omitempty"`
++	// PendingServer 记录"开始恢复那一刻"注册表里的地址。恢复失败后如果
++	// 用户/外部软件又改了代理，当前地址既不是它、也不是本程序接管值，
++	// 说明外部已接管：必须放弃还原，绝不能覆盖用户的新设置。
++	PendingServer string `json:"pendingServer,omitempty"`
+ }
+ 
+ // systemProxyOps 把注册表操作抽成可替换的函数集合。
+@@ -178,6 +182,17 @@ type CoreService struct {
+ 	lifeMu       sync.Mutex
+ 	shuttingDown bool
+ 
++	// proxyMu 串行化所有系统代理事务：用户手动开关、启动后的端口校正、
++	// Stop/Shutdown 的还原、看门狗熔断恢复。
++	//
++	// 锁顺序（必须遵守，否则会死锁）：
++	//
++	//	lifeMu → proxyMu → s.mu
++	//
++	// 反例：afterStart 在代理事务里绝不能再取 lifeMu；它只持有 proxyMu。
++	// 持有 s.mu 期间禁止做注册表 I/O——那可能耗时数十毫秒并阻塞 Status 轮询。
++	proxyMu sync.Mutex
++
+ 	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
+ 	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
+ 	gen       uint64
+@@ -1050,11 +1065,15 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
+ 		s.mu.Unlock()
+ 
+ 		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
++		// 这次写入同样在代理事务锁内，并再次校验代际。
+ 		if changed && proxyOn {
+ 			if !s.generationCurrent(gen, ctx) {
+ 				return
+ 			}
+-			if err := sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)); err != nil {
++			if err := s.updateSystemProxyPort(gen, ctx, cfg.MixedPort); err != nil {
++				if errors.Is(err, errProxyStale) {
++					return
++				}
+ 				s.dbg("afterStart: update proxy port failed: %v", err)
+ 				s.appendBootErr("系统代理端口校正失败: " + err.Error())
+ 			}
+@@ -1063,7 +1082,7 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
+ 		if !s.generationCurrent(gen, ctx) {
+ 			return
+ 		}
+-		s.reconcileProxy()
++		s.reconcileProxyForGeneration(gen, ctx)
+ 
+ 		// 恢复上次退出时的接管状态。
+ 		// TUN 的配置在生成阶段已经带上，这里只同步标记；
+@@ -1091,7 +1110,10 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
+ 				s.mu.Unlock()
+ 			}
+ 		} else if wantProxy && s.generationCurrent(gen, ctx) {
+-			if err := s.SetSystemProxy(true); err != nil {
++			if err := s.setSystemProxyForGeneration(gen, ctx); err != nil {
++				if errors.Is(err, errProxyStale) {
++					return
++				}
+ 				s.dbg("afterStart: restore system proxy failed: %v", err)
+ 				s.appendBootErr("恢复系统代理失败: " + err.Error())
+ 			}
+@@ -1437,13 +1459,51 @@ func (s *CoreService) captureProxySnapshot(addr string) proxyBackup {
+ 	}
+ }
+ 
++// errProxyStale 表示本次代理事务属于已经失效的内核代际，必须放弃。
++var errProxyStale = errors.New("启动代际已失效，放弃系统代理操作")
++
++// withProxyTx 是所有系统代理事务的唯一入口：先取 proxyMu，再校验代际，
++// 最后执行注册表 I/O。生命周期操作（Stop/Restart/Shutdown）在 proxyMu
++// 之外先失效代际，因此：
++//   - 事务已持有 proxyMu：它先完成，随后生命周期操作再还原，最终状态正确；
++//   - 事务在失效后才拿到 proxyMu：代际校验失败，直接放弃，不会写注册表。
++//
++// 这消除了"检查 generation 通过 → Stop 失效代际 → 事务仍写入"的窗口。
++func (s *CoreService) withProxyTx(gen uint64, ctx context.Context, fn func() error) error {
++	s.proxyMu.Lock()
++	defer s.proxyMu.Unlock()
++	if gen != 0 {
++		if ctx == nil || !s.generationCurrent(gen, ctx) {
++			return errProxyStale
++		}
++	}
++	return fn()
++}
++
++// SetSystemProxy 是用户可见的开关，必须与其他代理事务串行。
+ func (s *CoreService) SetSystemProxy(on bool) error {
++	return s.withProxyTx(0, nil, func() error { return s.setSystemProxyLocked(on, nil) })
++}
++
++// setSystemProxyForGeneration 负责启动后恢复接管状态。genOK 用于在真正
++// 写注册表前再次确认代际仍然有效，避免 Stop 已生效后又被旧任务打开。
++func (s *CoreService) setSystemProxyForGeneration(gen uint64, ctx context.Context) error {
++	genOK := func() bool { return s.generationCurrent(gen, ctx) }
++	return s.withProxyTx(gen, ctx, func() error { return s.setSystemProxyLocked(true, genOK) })
++}
++
++// setSystemProxyLocked 的调用方必须已持有 proxyMu。
++// genOK 为 nil 表示用户操作，不做代际校验。
++func (s *CoreService) setSystemProxyLocked(on bool, genOK func() bool) error {
+ 	ops := s.proxyOps()
+ 	s.mu.RLock()
+ 	addr := fmt.Sprintf("127.0.0.1:%d", s.mixedPort)
+ 	s.mu.RUnlock()
+ 
+ 	if on {
++		if s.IsShuttingDown() || s.Quitting() {
++			return fmt.Errorf("程序正在退出，拒绝开启系统代理")
++		}
+ 		if !s.kernelRunning() && s.mgr != nil {
+ 			return fmt.Errorf("请先启动内核再开启系统代理")
+ 		}
+@@ -1472,6 +1532,10 @@ func (s *CoreService) SetSystemProxy(on bool) error {
+ 			bk.Addr = addr
+ 		}
+ 
++		// 代际在等待注册表写入前可能已失效（Stop 已返回），必须再确认一次。
++		if genOK != nil && !genOK() {
++			return errProxyStale
++		}
+ 		if err := ops.Enable(addr); err != nil {
+ 			// 写了一半也要尽量把注册表拉回原状，不能留下半接管状态。
+ 			_ = s.applyProxySnapshot(bk)
+@@ -1485,6 +1549,11 @@ func (s *CoreService) SetSystemProxy(on bool) error {
+ 		}
+ 
+ 		// 备份必须落盘成功后才认为接管成功；否则崩溃后无法识别。
++		if genOK != nil && !genOK() {
++			// 已被 Stop 抢走代际：把刚写进去的接管撤销，回到原始状态。
++			_ = s.applyProxySnapshot(bk)
++			return errProxyStale
++		}
+ 		if err := s.persistProxyState(bk); err != nil {
+ 			_ = s.applyProxySnapshot(bk)
+ 			return fmt.Errorf("保存系统代理备份失败: %w", err)
+@@ -1500,16 +1569,41 @@ func (s *CoreService) SetSystemProxy(on bool) error {
+ 		return nil
+ 	}
+ 
+-	if err := s.restoreSystemProxy(); err != nil {
++	if err := s.restoreSystemProxyLocked(); err != nil {
+ 		return err
+ 	}
+-	if err := s.restoreWinHTTPIfPending(); err != nil {
++	if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
+ 		return err
+ 	}
+ 	s.saveAppState()
+ 	return nil
+ }
+ 
++// updateSystemProxyPort 在端口漂移后把接管地址校正到内核真实端口。
++// 必须走代理事务锁并重复校验代际，避免 Stop 之后又被旧任务写回。
++func (s *CoreService) updateSystemProxyPort(gen uint64, ctx context.Context, port int) error {
++	return s.withProxyTx(gen, ctx, func() error {
++		addr := fmt.Sprintf("127.0.0.1:%d", port)
++		if err := s.proxyOps().Enable(addr); err != nil {
++			return err
++		}
++		s.mu.RLock()
++		bk := s.backup
++		s.mu.RUnlock()
++		if !bk.Saved {
++			return nil
++		}
++		bk.Addr = addr
++		if err := s.persistProxyState(bk); err != nil {
++			return err
++		}
++		s.mu.Lock()
++		s.backup = bk
++		s.mu.Unlock()
++		return nil
++	})
++}
++
+ // applyProxySnapshot 把备份里的原始设置写回注册表。
+ // 每个字段都要写，包括空值：接管时我们覆盖了 Override/PAC，
+ // 原值为空时也必须显式清空，否则用户的自定义配置会被永久污染。
+@@ -1574,9 +1668,12 @@ func (s *CoreService) verifyProxySnapshot(bk proxyBackup) error {
+ // 关键前提：只还原「确实是我们接管过」的系统代理。
+ // 没有接管记录时什么都不做——否则用户机器上正在跑的 Clash Verge、
+ // v2rayN 之类会被我们顺手关掉，表现为"点了停止内核，整台机器断网"。
+-//
+-// 恢复失败时备份必须保留，并标记 Pending，下次启动优先重试。
+ func (s *CoreService) restoreSystemProxy() error {
++	return s.withProxyTx(0, nil, s.restoreSystemProxyLocked)
++}
++
++// restoreSystemProxyLocked 的调用方必须已持有 proxyMu。
++func (s *CoreService) restoreSystemProxyLocked() error {
+ 	s.mu.RLock()
+ 	bk := s.backup
+ 	s.mu.RUnlock()
+@@ -1590,10 +1687,37 @@ func (s *CoreService) restoreSystemProxy() error {
+ 	if !bk.Saved {
+ 		return nil
+ 	}
++	return s.restoreProxyTransactionLocked(bk)
++}
++
++// restoreProxyTransactionLocked 执行一次完整的还原事务：
++//
++//	判定是否仍属于本程序 → 落盘 Pending → 写注册表 → 回读校验 → 删除备份 → 提交内存
++//
++// 任何一步失败都保留磁盘与内存里的还原依据，并保持 Pending，供下次启动重试。
++// 调用方必须已持有 proxyMu。
++func (s *CoreService) restoreProxyTransactionLocked(bk proxyBackup) error {
++	if !bk.Saved {
++		return nil
++	}
++	ops := s.proxyOps()
++
++	// 上一次恢复失败后，用户/外部软件可能已经重新接管代理。
++	// 此时绝不能把我们的旧快照覆盖回去——先判定当前注册表是否还认识。
++	if bk.Pending {
++		cur, _ := ops.Current()
++		if !proxyStillOurs(bk, cur) {
++			s.dbg("恢复待完成期间系统代理已被外部修改为 %q，放弃还原", cur)
++			s.relinquishProxyLocked(bk)
++			return nil
++		}
++	}
+ 
+-	// 先持久化"恢复中"标记。这样即使恢复过程中崩溃，
+-	// 下次启动也只会重试恢复，而不会把旧端口当成仍然有效的接管。
++	// 1) 先把"恢复中"落盘。这样即使恢复过程中崩溃，下次启动也只会
++	//    重试恢复，而不会把旧端口当成仍然有效的接管。
+ 	bk.Pending = true
++	cur, _ := ops.Current()
++	bk.PendingServer = cur
+ 	if err := s.persistProxyState(bk); err != nil {
+ 		return fmt.Errorf("标记系统代理待恢复失败: %w", err)
+ 	}
+@@ -1601,16 +1725,21 @@ func (s *CoreService) restoreSystemProxy() error {
+ 	s.backup = bk
+ 	s.mu.Unlock()
+ 
++	// 2) 写回原始设置：所有注册表写入错误都必须暴露，不能当作成功。
+ 	if err := s.applyProxySnapshot(bk); err != nil {
+ 		return fmt.Errorf("恢复系统代理失败（备份已保留）: %w", err)
+ 	}
++	// 3) 回读校验：不能凭"写入没报错"就删除还原点。
+ 	if err := s.verifyProxySnapshot(bk); err != nil {
+ 		return fmt.Errorf("恢复系统代理后校验失败（备份已保留）: %w", err)
+ 	}
++	// 4) 校验通过后才删除备份。删除失败必须报错并保留内存里的恢复依据，
++	//    否则下次启动会失去"该还原成什么"的信息。
+ 	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
+ 		return fmt.Errorf("删除系统代理备份失败（恢复已完成，下次将继续校验）: %w", err)
+ 	}
+ 
++	// 5) 提交内存状态。
+ 	s.mu.Lock()
+ 	s.backup = proxyBackup{}
+ 	s.proxyOn = false
+@@ -1619,6 +1748,40 @@ func (s *CoreService) restoreSystemProxy() error {
+ 	return nil
+ }
+ 
++// proxyStillOurs 判断注册表当前地址是否仍可能是本程序接管/恢复过程中的值。
++// 已知值包括：本程序端口、用户原始地址、上次恢复开始时的地址。
++// 除此之外的非空地址说明外部已经接管，继续还原会覆盖用户的新设置。
++func proxyStillOurs(bk proxyBackup, cur string) bool {
++	if cur == "" {
++		return true
++	}
++	for _, known := range []string{bk.Addr, bk.Server, bk.PendingServer} {
++		if known != "" && strings.EqualFold(cur, known) {
++			return true
++		}
++	}
++	return false
++}
++
++// relinquishProxyLocked 放弃接管：不写注册表，只撤掉本地还原点。
++// 这是"外部已经接管"的主动让步，不是恢复失败，因此可以清空内存备份；
++// 如果磁盘备份删不掉，就把它标记为 Pending，确保下次一定先做外部判定。
++func (s *CoreService) relinquishProxyLocked(bk proxyBackup) {
++	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
++		s.dbg("放弃接管时删除备份失败，将标记 Pending 供下次判定: %v", err)
++		bk.Pending = true
++		if err := s.persistProxyState(bk); err != nil {
++			s.dbg("放弃接管后写入 Pending 标记失败: %v", err)
++		}
++	}
++	s.mu.Lock()
++	s.backup = proxyBackup{}
++	s.proxyOn = false
++	s.restoreProxy = false
++	s.mu.Unlock()
++	s.saveAppState()
++}
++
+ // takeOverWinHTTP 备份并接管 WinHTTP 代理。WinHTTP 是机器级设置，
+ // 只有管理员权限才能写；普通权限下直接跳过，不影响 WinINET 系统代理。
+ func (s *CoreService) takeOverWinHTTP(addr string) {
+@@ -1658,6 +1821,11 @@ func (s *CoreService) takeOverWinHTTP(addr string) {
+ // restoreWinHTTPIfPending 在管理员进程里还原 WinHTTP 设置。
+ // 普通权限下无法写 HKLM，返回错误并保留 pending 状态，等下次提权后继续还原。
+ func (s *CoreService) restoreWinHTTPIfPending() error {
++	return s.withProxyTx(0, nil, s.restoreWinHTTPIfPendingLocked)
++}
++
++// restoreWinHTTPIfPendingLocked 的调用方必须已持有 proxyMu。
++func (s *CoreService) restoreWinHTTPIfPendingLocked() error {
+ 	s.mu.RLock()
+ 	pending := s.winHTTPPending
+ 	backup := append([]byte(nil), s.winHTTPBackup...)
+@@ -1752,54 +1920,49 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+ // 只有“当前地址确实是我们上次写入的地址”才校正；如果用户或外部软件
+ // 已经把代理改成别的值，必须放弃接管，不能覆盖用户的新配置。
+ func (s *CoreService) reconcileProxy() {
++	_ = s.withProxyTx(0, nil, func() error {
++		s.reconcileProxyLocked()
++		return nil
++	})
++}
++
++// reconcileProxyForGeneration 是启动后的校正路径：只有当前代际仍然有效才写注册表。
++func (s *CoreService) reconcileProxyForGeneration(gen uint64, ctx context.Context) {
++	_ = s.withProxyTx(gen, ctx, func() error {
++		s.reconcileProxyLocked()
++		return nil
++	})
++}
++
++// reconcileProxyLocked 的调用方必须已持有 proxyMu。
++func (s *CoreService) reconcileProxyLocked() {
+ 	// TUN 已接管全部流量时，系统代理必须保持关闭。
+ 	if s.TUNState() {
+ 		return
+ 	}
++	// Pending 由启动恢复流程处理，这里不能把它当成有效接管。
+ 	st, err := readProxyState()
+ 	if err != nil {
+ 		s.dbg("read proxy state failed, leave registry untouched: %v", err)
+ 		return
+ 	}
+-	if !st.Saved || st.Pending {
+-		// Pending 由启动恢复流程处理，这里不能把它当成有效接管。
++	if !st.Saved {
++		return
++	}
++	if st.Pending {
++		// 上次恢复未完成：每次启动/端口校正都重试一次完整事务。
++		// 事务内部会先判定注册表是否已被外部接管，因此重试是幂等且安全的。
++		s.retryPendingRestoreLocked(st)
+ 		return
+ 	}
+ 
+ 	ops := s.proxyOps()
+ 	cur, enabled := ops.Current()
+ 	if !enabled {
+-		// 用户自己把系统代理关了：还原地址、bypass、PAC 后撤掉接管记录，
+-		// 并同步 restoreProxy，避免下次启动又擅自打开。
+-		var errs []error
+-		errs = append(errs, ops.SetServer(st.Server), ops.SetOverride(st.Override))
+-		if st.AutoConfigURL != "" {
+-			errs = append(errs, ops.SetAutoConfigURL(st.AutoConfigURL))
+-		} else {
+-			errs = append(errs, ops.ClearAutoConfigURL())
+-		}
+-		if err := errors.Join(errs...); err != nil {
+-			// 注册表写失败时保留备份，下次退出/启动继续尝试，
+-			// 不能把未完成的还原当成成功而丢掉还原点。
+-			s.dbg("reconcile: restore original proxy settings failed, backup kept: %v", err)
+-			s.mu.Lock()
+-			s.proxyOn = false
+-			s.restoreProxy = false
+-			s.mu.Unlock()
+-			s.saveAppState()
+-			return
+-		}
+-		_ = removeProxyState(s.proxyStatePath())
+-		s.mu.Lock()
+-		s.proxyOn = false
+-		s.backup = proxyBackup{}
+-		s.restoreProxy = false
+-		s.mu.Unlock()
+-		s.saveAppState()
+-		// 用户手动关掉系统代理时，WinHTTP 也应该跟着还原。
+-		if err := s.restoreWinHTTPIfPending(); err != nil {
+-			s.dbg("WinHTTP restore postponed: %v", err)
+-		}
++		// 用户自己把系统代理关了：完整走一次还原事务（落盘 Pending →
++		// 写注册表 → 回读校验 → 删备份），并同步 restoreProxy，
++		// 避免下次启动又擅自打开。
++		s.retryPendingRestoreLocked(st)
+ 		return
+ 	}
+ 
+@@ -1810,13 +1973,7 @@ func (s *CoreService) reconcileProxy() {
+ 		// 外部软件/用户改了系统代理。以当前注册表为准，放弃我们旧的备份，
+ 		// 否则退出时会把用户的新设置覆盖回接管前的值。
+ 		s.dbg("system proxy changed externally to %s, relinquish takeover", cur)
+-		_ = removeProxyState(s.proxyStatePath())
+-		s.mu.Lock()
+-		s.proxyOn = false
+-		s.backup = proxyBackup{}
+-		s.restoreProxy = false
+-		s.mu.Unlock()
+-		s.saveAppState()
++		s.relinquishProxyLocked(st)
+ 		return
+ 	}
+ 
+@@ -1845,6 +2002,27 @@ func (s *CoreService) reconcileProxy() {
+ 	}
+ }
+ 
++// retryPendingRestoreLocked 执行一次还原事务并同步内存意图。调用方必须已持有 proxyMu。
++func (s *CoreService) retryPendingRestoreLocked(st proxyBackup) {
++	if err := s.restoreProxyTransactionLocked(st); err != nil {
++		s.dbg("reconcile: 恢复用户原代理设置失败，备份已保留: %v", err)
++		s.mu.Lock()
++		s.proxyOn = false
++		s.restoreProxy = false
++		s.mu.Unlock()
++		s.saveAppState()
++		return
++	}
++	s.mu.Lock()
++	s.restoreProxy = false
++	s.mu.Unlock()
++	s.saveAppState()
++	// 用户手动关掉系统代理时，WinHTTP 也应该跟着还原。
++	if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
++		s.dbg("WinHTTP restore postponed: %v", err)
++	}
++}
++
+ func (s *CoreService) SystemProxyState() bool {
+ 	_, enabled := s.proxyOps().Current()
+ 	return enabled
+@@ -2206,11 +2384,13 @@ func (s *CoreService) startKernelWatchdog() {
+ 			}
+ 		},
+ 		OnExhausted: func(_ int, message string) {
+-			if s.Quitting() {
++			if s.Quitting() || s.IsShuttingDown() {
+ 				return
+ 			}
+ 			// 内核已无法自动恢复，系统代理若还指向它会让整台机器断网。
+-			// WinINET 与 WinHTTP 都要还原；失败时保留备份等下次启动重试。
++			// WinINET 与 WinHTTP 都要还原；恢复走代理事务锁，
++			// 与用户手动开关、Stop/Shutdown 串行，不会交错写注册表。
++			// 失败时保留备份等下次启动重试。
+ 			if err := s.restoreSystemProxy(); err != nil {
+ 				s.dbg("watchdog exhausted: restore system proxy failed: %v", err)
+ 			}

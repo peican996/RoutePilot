@@ -17,9 +17,17 @@ type fakeRegistry struct {
 
 	failEnable      bool
 	failDisable     bool
+	failSetServer   bool
 	failSetOverride bool
 	failSetPAC      bool
 	failClearPAC    bool
+
+	// readbackServer 非空时 Current 返回该值，用于模拟"写入成功但注册表未生效"。
+	readbackServer string
+	// enableHook 在 Enable 真正写值之前调用，供并发测试插入确定性 barrier。
+	enableHook func()
+	// disableHook 在 Disable 成功之后调用，供测试等待事务真正落地。
+	disableHook func()
 
 	enableCalls  int
 	disableCalls int
@@ -28,9 +36,17 @@ type fakeRegistry struct {
 
 func (f *fakeRegistry) ops() systemProxyOps {
 	return systemProxyOps{
-		Current: func() (string, bool) { return f.server, f.enabled },
+		Current: func() (string, bool) {
+			if f.readbackServer != "" {
+				return f.readbackServer, f.enabled
+			}
+			return f.server, f.enabled
+		},
 		Enable: func(addr string) error {
 			f.enableCalls++
+			if f.enableHook != nil {
+				f.enableHook()
+			}
 			if f.failEnable {
 				return errors.New("injected enable failure")
 			}
@@ -46,9 +62,15 @@ func (f *fakeRegistry) ops() systemProxyOps {
 				return errors.New("injected disable failure")
 			}
 			f.enabled = false
+			if f.disableHook != nil {
+				f.disableHook()
+			}
 			return nil
 		},
 		SetServer: func(addr string) error {
+			if f.failSetServer {
+				return errors.New("injected set-server failure")
+			}
 			f.server = addr
 			return nil
 		},

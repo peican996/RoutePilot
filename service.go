@@ -48,6 +48,10 @@ type proxyBackup struct {
 	// Pending 表示恢复动作已经开始但尚未确认成功。下次启动必须优先重试，
 	// 不能再把注册表里的旧地址当作"仍然由本程序接管"而去改写。
 	Pending bool `json:"pending,omitempty"`
+	// PendingServer 记录"开始恢复那一刻"注册表里的地址。恢复失败后如果
+	// 用户/外部软件又改了代理，当前地址既不是它、也不是本程序接管值，
+	// 说明外部已接管：必须放弃还原，绝不能覆盖用户的新设置。
+	PendingServer string `json:"pendingServer,omitempty"`
 }
 
 // systemProxyOps 把注册表操作抽成可替换的函数集合。
@@ -177,6 +181,17 @@ type CoreService struct {
 	// 串行，Manager 的进程锁不能保护 afterStart 这类异步副作用。
 	lifeMu       sync.Mutex
 	shuttingDown bool
+
+	// proxyMu 串行化所有系统代理事务：用户手动开关、启动后的端口校正、
+	// Stop/Shutdown 的还原、看门狗熔断恢复。
+	//
+	// 锁顺序（必须遵守，否则会死锁）：
+	//
+	//	lifeMu → proxyMu → s.mu
+	//
+	// 反例：afterStart 在代理事务里绝不能再取 lifeMu；它只持有 proxyMu。
+	// 持有 s.mu 期间禁止做注册表 I/O——那可能耗时数十毫秒并阻塞 Status 轮询。
+	proxyMu sync.Mutex
 
 	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
 	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
@@ -1050,11 +1065,15 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		s.mu.Unlock()
 
 		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
+		// 这次写入同样在代理事务锁内，并再次校验代际。
 		if changed && proxyOn {
 			if !s.generationCurrent(gen, ctx) {
 				return
 			}
-			if err := sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)); err != nil {
+			if err := s.updateSystemProxyPort(gen, ctx, cfg.MixedPort); err != nil {
+				if errors.Is(err, errProxyStale) {
+					return
+				}
 				s.dbg("afterStart: update proxy port failed: %v", err)
 				s.appendBootErr("系统代理端口校正失败: " + err.Error())
 			}
@@ -1063,7 +1082,7 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		if !s.generationCurrent(gen, ctx) {
 			return
 		}
-		s.reconcileProxy()
+		s.reconcileProxyForGeneration(gen, ctx)
 
 		// 恢复上次退出时的接管状态。
 		// TUN 的配置在生成阶段已经带上，这里只同步标记；
@@ -1091,7 +1110,10 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 				s.mu.Unlock()
 			}
 		} else if wantProxy && s.generationCurrent(gen, ctx) {
-			if err := s.SetSystemProxy(true); err != nil {
+			if err := s.setSystemProxyForGeneration(gen, ctx); err != nil {
+				if errors.Is(err, errProxyStale) {
+					return
+				}
 				s.dbg("afterStart: restore system proxy failed: %v", err)
 				s.appendBootErr("恢复系统代理失败: " + err.Error())
 			}
@@ -1437,13 +1459,51 @@ func (s *CoreService) captureProxySnapshot(addr string) proxyBackup {
 	}
 }
 
+// errProxyStale 表示本次代理事务属于已经失效的内核代际，必须放弃。
+var errProxyStale = errors.New("启动代际已失效，放弃系统代理操作")
+
+// withProxyTx 是所有系统代理事务的唯一入口：先取 proxyMu，再校验代际，
+// 最后执行注册表 I/O。生命周期操作（Stop/Restart/Shutdown）在 proxyMu
+// 之外先失效代际，因此：
+//   - 事务已持有 proxyMu：它先完成，随后生命周期操作再还原，最终状态正确；
+//   - 事务在失效后才拿到 proxyMu：代际校验失败，直接放弃，不会写注册表。
+//
+// 这消除了"检查 generation 通过 → Stop 失效代际 → 事务仍写入"的窗口。
+func (s *CoreService) withProxyTx(gen uint64, ctx context.Context, fn func() error) error {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	if gen != 0 {
+		if ctx == nil || !s.generationCurrent(gen, ctx) {
+			return errProxyStale
+		}
+	}
+	return fn()
+}
+
+// SetSystemProxy 是用户可见的开关，必须与其他代理事务串行。
 func (s *CoreService) SetSystemProxy(on bool) error {
+	return s.withProxyTx(0, nil, func() error { return s.setSystemProxyLocked(on, nil) })
+}
+
+// setSystemProxyForGeneration 负责启动后恢复接管状态。genOK 用于在真正
+// 写注册表前再次确认代际仍然有效，避免 Stop 已生效后又被旧任务打开。
+func (s *CoreService) setSystemProxyForGeneration(gen uint64, ctx context.Context) error {
+	genOK := func() bool { return s.generationCurrent(gen, ctx) }
+	return s.withProxyTx(gen, ctx, func() error { return s.setSystemProxyLocked(true, genOK) })
+}
+
+// setSystemProxyLocked 的调用方必须已持有 proxyMu。
+// genOK 为 nil 表示用户操作，不做代际校验。
+func (s *CoreService) setSystemProxyLocked(on bool, genOK func() bool) error {
 	ops := s.proxyOps()
 	s.mu.RLock()
 	addr := fmt.Sprintf("127.0.0.1:%d", s.mixedPort)
 	s.mu.RUnlock()
 
 	if on {
+		if s.IsShuttingDown() || s.Quitting() {
+			return fmt.Errorf("程序正在退出，拒绝开启系统代理")
+		}
 		if !s.kernelRunning() && s.mgr != nil {
 			return fmt.Errorf("请先启动内核再开启系统代理")
 		}
@@ -1472,6 +1532,10 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 			bk.Addr = addr
 		}
 
+		// 代际在等待注册表写入前可能已失效（Stop 已返回），必须再确认一次。
+		if genOK != nil && !genOK() {
+			return errProxyStale
+		}
 		if err := ops.Enable(addr); err != nil {
 			// 写了一半也要尽量把注册表拉回原状，不能留下半接管状态。
 			_ = s.applyProxySnapshot(bk)
@@ -1485,6 +1549,11 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 		}
 
 		// 备份必须落盘成功后才认为接管成功；否则崩溃后无法识别。
+		if genOK != nil && !genOK() {
+			// 已被 Stop 抢走代际：把刚写进去的接管撤销，回到原始状态。
+			_ = s.applyProxySnapshot(bk)
+			return errProxyStale
+		}
 		if err := s.persistProxyState(bk); err != nil {
 			_ = s.applyProxySnapshot(bk)
 			return fmt.Errorf("保存系统代理备份失败: %w", err)
@@ -1500,14 +1569,39 @@ func (s *CoreService) SetSystemProxy(on bool) error {
 		return nil
 	}
 
-	if err := s.restoreSystemProxy(); err != nil {
+	if err := s.restoreSystemProxyLocked(); err != nil {
 		return err
 	}
-	if err := s.restoreWinHTTPIfPending(); err != nil {
+	if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
 		return err
 	}
 	s.saveAppState()
 	return nil
+}
+
+// updateSystemProxyPort 在端口漂移后把接管地址校正到内核真实端口。
+// 必须走代理事务锁并重复校验代际，避免 Stop 之后又被旧任务写回。
+func (s *CoreService) updateSystemProxyPort(gen uint64, ctx context.Context, port int) error {
+	return s.withProxyTx(gen, ctx, func() error {
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		if err := s.proxyOps().Enable(addr); err != nil {
+			return err
+		}
+		s.mu.RLock()
+		bk := s.backup
+		s.mu.RUnlock()
+		if !bk.Saved {
+			return nil
+		}
+		bk.Addr = addr
+		if err := s.persistProxyState(bk); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.backup = bk
+		s.mu.Unlock()
+		return nil
+	})
 }
 
 // applyProxySnapshot 把备份里的原始设置写回注册表。
@@ -1574,9 +1668,12 @@ func (s *CoreService) verifyProxySnapshot(bk proxyBackup) error {
 // 关键前提：只还原「确实是我们接管过」的系统代理。
 // 没有接管记录时什么都不做——否则用户机器上正在跑的 Clash Verge、
 // v2rayN 之类会被我们顺手关掉，表现为"点了停止内核，整台机器断网"。
-//
-// 恢复失败时备份必须保留，并标记 Pending，下次启动优先重试。
 func (s *CoreService) restoreSystemProxy() error {
+	return s.withProxyTx(0, nil, s.restoreSystemProxyLocked)
+}
+
+// restoreSystemProxyLocked 的调用方必须已持有 proxyMu。
+func (s *CoreService) restoreSystemProxyLocked() error {
 	s.mu.RLock()
 	bk := s.backup
 	s.mu.RUnlock()
@@ -1590,10 +1687,37 @@ func (s *CoreService) restoreSystemProxy() error {
 	if !bk.Saved {
 		return nil
 	}
+	return s.restoreProxyTransactionLocked(bk)
+}
 
-	// 先持久化"恢复中"标记。这样即使恢复过程中崩溃，
-	// 下次启动也只会重试恢复，而不会把旧端口当成仍然有效的接管。
+// restoreProxyTransactionLocked 执行一次完整的还原事务：
+//
+//	判定是否仍属于本程序 → 落盘 Pending → 写注册表 → 回读校验 → 删除备份 → 提交内存
+//
+// 任何一步失败都保留磁盘与内存里的还原依据，并保持 Pending，供下次启动重试。
+// 调用方必须已持有 proxyMu。
+func (s *CoreService) restoreProxyTransactionLocked(bk proxyBackup) error {
+	if !bk.Saved {
+		return nil
+	}
+	ops := s.proxyOps()
+
+	// 上一次恢复失败后，用户/外部软件可能已经重新接管代理。
+	// 此时绝不能把我们的旧快照覆盖回去——先判定当前注册表是否还认识。
+	if bk.Pending {
+		cur, _ := ops.Current()
+		if !proxyStillOurs(bk, cur) {
+			s.dbg("恢复待完成期间系统代理已被外部修改为 %q，放弃还原", cur)
+			s.relinquishProxyLocked(bk)
+			return nil
+		}
+	}
+
+	// 1) 先把"恢复中"落盘。这样即使恢复过程中崩溃，下次启动也只会
+	//    重试恢复，而不会把旧端口当成仍然有效的接管。
 	bk.Pending = true
+	cur, _ := ops.Current()
+	bk.PendingServer = cur
 	if err := s.persistProxyState(bk); err != nil {
 		return fmt.Errorf("标记系统代理待恢复失败: %w", err)
 	}
@@ -1601,22 +1725,61 @@ func (s *CoreService) restoreSystemProxy() error {
 	s.backup = bk
 	s.mu.Unlock()
 
+	// 2) 写回原始设置：所有注册表写入错误都必须暴露，不能当作成功。
 	if err := s.applyProxySnapshot(bk); err != nil {
 		return fmt.Errorf("恢复系统代理失败（备份已保留）: %w", err)
 	}
+	// 3) 回读校验：不能凭"写入没报错"就删除还原点。
 	if err := s.verifyProxySnapshot(bk); err != nil {
 		return fmt.Errorf("恢复系统代理后校验失败（备份已保留）: %w", err)
 	}
+	// 4) 校验通过后才删除备份。删除失败必须报错并保留内存里的恢复依据，
+	//    否则下次启动会失去"该还原成什么"的信息。
 	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除系统代理备份失败（恢复已完成，下次将继续校验）: %w", err)
 	}
 
+	// 5) 提交内存状态。
 	s.mu.Lock()
 	s.backup = proxyBackup{}
 	s.proxyOn = false
 	s.mu.Unlock()
 	s.saveAppState()
 	return nil
+}
+
+// proxyStillOurs 判断注册表当前地址是否仍可能是本程序接管/恢复过程中的值。
+// 已知值包括：本程序端口、用户原始地址、上次恢复开始时的地址。
+// 除此之外的非空地址说明外部已经接管，继续还原会覆盖用户的新设置。
+func proxyStillOurs(bk proxyBackup, cur string) bool {
+	if cur == "" {
+		return true
+	}
+	for _, known := range []string{bk.Addr, bk.Server, bk.PendingServer} {
+		if known != "" && strings.EqualFold(cur, known) {
+			return true
+		}
+	}
+	return false
+}
+
+// relinquishProxyLocked 放弃接管：不写注册表，只撤掉本地还原点。
+// 这是"外部已经接管"的主动让步，不是恢复失败，因此可以清空内存备份；
+// 如果磁盘备份删不掉，就把它标记为 Pending，确保下次一定先做外部判定。
+func (s *CoreService) relinquishProxyLocked(bk proxyBackup) {
+	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
+		s.dbg("放弃接管时删除备份失败，将标记 Pending 供下次判定: %v", err)
+		bk.Pending = true
+		if err := s.persistProxyState(bk); err != nil {
+			s.dbg("放弃接管后写入 Pending 标记失败: %v", err)
+		}
+	}
+	s.mu.Lock()
+	s.backup = proxyBackup{}
+	s.proxyOn = false
+	s.restoreProxy = false
+	s.mu.Unlock()
+	s.saveAppState()
 }
 
 // takeOverWinHTTP 备份并接管 WinHTTP 代理。WinHTTP 是机器级设置，
@@ -1658,6 +1821,11 @@ func (s *CoreService) takeOverWinHTTP(addr string) {
 // restoreWinHTTPIfPending 在管理员进程里还原 WinHTTP 设置。
 // 普通权限下无法写 HKLM，返回错误并保留 pending 状态，等下次提权后继续还原。
 func (s *CoreService) restoreWinHTTPIfPending() error {
+	return s.withProxyTx(0, nil, s.restoreWinHTTPIfPendingLocked)
+}
+
+// restoreWinHTTPIfPendingLocked 的调用方必须已持有 proxyMu。
+func (s *CoreService) restoreWinHTTPIfPendingLocked() error {
 	s.mu.RLock()
 	pending := s.winHTTPPending
 	backup := append([]byte(nil), s.winHTTPBackup...)
@@ -1752,54 +1920,49 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // 只有“当前地址确实是我们上次写入的地址”才校正；如果用户或外部软件
 // 已经把代理改成别的值，必须放弃接管，不能覆盖用户的新配置。
 func (s *CoreService) reconcileProxy() {
+	_ = s.withProxyTx(0, nil, func() error {
+		s.reconcileProxyLocked()
+		return nil
+	})
+}
+
+// reconcileProxyForGeneration 是启动后的校正路径：只有当前代际仍然有效才写注册表。
+func (s *CoreService) reconcileProxyForGeneration(gen uint64, ctx context.Context) {
+	_ = s.withProxyTx(gen, ctx, func() error {
+		s.reconcileProxyLocked()
+		return nil
+	})
+}
+
+// reconcileProxyLocked 的调用方必须已持有 proxyMu。
+func (s *CoreService) reconcileProxyLocked() {
 	// TUN 已接管全部流量时，系统代理必须保持关闭。
 	if s.TUNState() {
 		return
 	}
+	// Pending 由启动恢复流程处理，这里不能把它当成有效接管。
 	st, err := readProxyState()
 	if err != nil {
 		s.dbg("read proxy state failed, leave registry untouched: %v", err)
 		return
 	}
-	if !st.Saved || st.Pending {
-		// Pending 由启动恢复流程处理，这里不能把它当成有效接管。
+	if !st.Saved {
+		return
+	}
+	if st.Pending {
+		// 上次恢复未完成：每次启动/端口校正都重试一次完整事务。
+		// 事务内部会先判定注册表是否已被外部接管，因此重试是幂等且安全的。
+		s.retryPendingRestoreLocked(st)
 		return
 	}
 
 	ops := s.proxyOps()
 	cur, enabled := ops.Current()
 	if !enabled {
-		// 用户自己把系统代理关了：还原地址、bypass、PAC 后撤掉接管记录，
-		// 并同步 restoreProxy，避免下次启动又擅自打开。
-		var errs []error
-		errs = append(errs, ops.SetServer(st.Server), ops.SetOverride(st.Override))
-		if st.AutoConfigURL != "" {
-			errs = append(errs, ops.SetAutoConfigURL(st.AutoConfigURL))
-		} else {
-			errs = append(errs, ops.ClearAutoConfigURL())
-		}
-		if err := errors.Join(errs...); err != nil {
-			// 注册表写失败时保留备份，下次退出/启动继续尝试，
-			// 不能把未完成的还原当成成功而丢掉还原点。
-			s.dbg("reconcile: restore original proxy settings failed, backup kept: %v", err)
-			s.mu.Lock()
-			s.proxyOn = false
-			s.restoreProxy = false
-			s.mu.Unlock()
-			s.saveAppState()
-			return
-		}
-		_ = removeProxyState(s.proxyStatePath())
-		s.mu.Lock()
-		s.proxyOn = false
-		s.backup = proxyBackup{}
-		s.restoreProxy = false
-		s.mu.Unlock()
-		s.saveAppState()
-		// 用户手动关掉系统代理时，WinHTTP 也应该跟着还原。
-		if err := s.restoreWinHTTPIfPending(); err != nil {
-			s.dbg("WinHTTP restore postponed: %v", err)
-		}
+		// 用户自己把系统代理关了：完整走一次还原事务（落盘 Pending →
+		// 写注册表 → 回读校验 → 删备份），并同步 restoreProxy，
+		// 避免下次启动又擅自打开。
+		s.retryPendingRestoreLocked(st)
 		return
 	}
 
@@ -1810,13 +1973,7 @@ func (s *CoreService) reconcileProxy() {
 		// 外部软件/用户改了系统代理。以当前注册表为准，放弃我们旧的备份，
 		// 否则退出时会把用户的新设置覆盖回接管前的值。
 		s.dbg("system proxy changed externally to %s, relinquish takeover", cur)
-		_ = removeProxyState(s.proxyStatePath())
-		s.mu.Lock()
-		s.proxyOn = false
-		s.backup = proxyBackup{}
-		s.restoreProxy = false
-		s.mu.Unlock()
-		s.saveAppState()
+		s.relinquishProxyLocked(st)
 		return
 	}
 
@@ -1842,6 +1999,27 @@ func (s *CoreService) reconcileProxy() {
 	st.Addr = want
 	if err := s.persistProxyState(st); err != nil {
 		s.dbg("update proxy state failed: %v", err)
+	}
+}
+
+// retryPendingRestoreLocked 执行一次还原事务并同步内存意图。调用方必须已持有 proxyMu。
+func (s *CoreService) retryPendingRestoreLocked(st proxyBackup) {
+	if err := s.restoreProxyTransactionLocked(st); err != nil {
+		s.dbg("reconcile: 恢复用户原代理设置失败，备份已保留: %v", err)
+		s.mu.Lock()
+		s.proxyOn = false
+		s.restoreProxy = false
+		s.mu.Unlock()
+		s.saveAppState()
+		return
+	}
+	s.mu.Lock()
+	s.restoreProxy = false
+	s.mu.Unlock()
+	s.saveAppState()
+	// 用户手动关掉系统代理时，WinHTTP 也应该跟着还原。
+	if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
+		s.dbg("WinHTTP restore postponed: %v", err)
 	}
 }
 
@@ -2206,11 +2384,13 @@ func (s *CoreService) startKernelWatchdog() {
 			}
 		},
 		OnExhausted: func(_ int, message string) {
-			if s.Quitting() {
+			if s.Quitting() || s.IsShuttingDown() {
 				return
 			}
 			// 内核已无法自动恢复，系统代理若还指向它会让整台机器断网。
-			// WinINET 与 WinHTTP 都要还原；失败时保留备份等下次启动重试。
+			// WinINET 与 WinHTTP 都要还原；恢复走代理事务锁，
+			// 与用户手动开关、Stop/Shutdown 串行，不会交错写注册表。
+			// 失败时保留备份等下次启动重试。
 			if err := s.restoreSystemProxy(); err != nil {
 				s.dbg("watchdog exhausted: restore system proxy failed: %v", err)
 			}
