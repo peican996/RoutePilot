@@ -51,6 +51,30 @@ func TestWatchdogSingleRestartForBurst(t *testing.T) {
 	}
 }
 
+// Stop 必须取消已经排队的重启，用于程序退出/Shutdown。
+func TestWatchdogStopCancelsPendingRestart(t *testing.T) {
+	var restarts int32
+	w := NewWatchdog(WatchdogOptions{
+		Config: WatchdogConfig{
+			Window:      time.Hour,
+			MaxRestarts: 5,
+			BaseDelay:   60 * time.Millisecond,
+			MaxDelay:    time.Second,
+			StableAfter: time.Hour,
+		},
+		Restart: func() error {
+			atomic.AddInt32(&restarts, 1)
+			return nil
+		},
+	})
+	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
+	w.Stop()
+	time.Sleep(150 * time.Millisecond)
+	if got := atomic.LoadInt32(&restarts); got != 0 {
+		t.Fatalf("Stop 后仍执行了 %d 次重启", got)
+	}
+}
+
 // 用户主动退出（Stop 之后）不得再触发重启。
 func TestWatchdogStopsOnUserExit(t *testing.T) {
 	var restarts int32

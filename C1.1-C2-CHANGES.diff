@@ -1,0 +1,1647 @@
+diff --git a/C1.1-REMEDIATION.md b/C1.1-REMEDIATION.md
+new file mode 100644
+index 0000000..1addeec
+--- /dev/null
++++ b/C1.1-REMEDIATION.md
+@@ -0,0 +1,153 @@
++# C1.1 系统代理恢复与异步任务生命周期整改报告
++
++- 日期：2026-11-10
++- 仓库：`peican996/RoutePilot`（本地 `nexuslink_review`）
++- 基线：`0c38642 feat: 支持国内外智能分流与按网站指定出口`
++- 范围：仅 C1.1（系统代理恢复事务 + afterStart 异步任务生命周期）
++- 状态：改动在工作区，未提交
++
++---
++
++## 1. 结论摘要
++
++C1.1 的两个核心问题已处理：
++
++1. **reconcileProxy 恢复失败不再删除备份**：用户手动关闭系统代理时，先逐项恢复 ProxyServer / ProxyOverride / PAC，全部成功并回读校验通过后才删除 `proxy.json`；任一步失败保留备份并记录日志，后续可幂等重试。
++2. **afterStart 引入启动代际与任务登记**：每次成功启动生成唯一 generation；Stop / Restart / Shutdown / MarkQuitting 会取消旧代际并使旧任务失效；Shutdown 关闭新任务入口并等待已登记任务退出，防止晚到任务修改新内核或恢复后的代理状态。
++3. **WinINET / WinHTTP 一起处理**：看门狗熔断时同时尝试还原 WinINET 与 WinHTTP，避免系统服务仍指向死端口。
++
++本轮没有降低校验、没有用 Sleep 掩盖并发，也没有修改 SSRF、升级、进程身份等下一阶段范围。
++
++---
++
++## 2. 问题与根因
++
++### 2.1 reconcileProxy 丢弃恢复依据
++
++- 用户手动关闭系统代理后，`reconcileProxy` 会尝试还原原始 ProxyServer / Override / PAC，但恢复调用错误被忽略。
++- 即使注册表写入失败，仍执行 `os.Remove(proxyStatePath())`，导致“代理没恢复 + 备份没了”。
++- 程序异常退出、`Shutdown`、启动恢复等路径缺少统一的任务级协调，旧异步任务可能在代理恢复后继续写入。
++
++### 2.2 afterStart 无实例身份
++
++- `afterStart` 只启动一个 goroutine，没有 generation/token。
++- Stop 后旧 afterStart 仍可能：
++  - 把旧的 mixedPort 写回；
++  - 重新启用系统代理；
++  - 调用 `selectProcessTargets` 影响新实例；
++  - 在 Shutdown 恢复代理后再次修改注册表。
++- Shutdown 只停看门狗和内核，不等待 afterStart 任务，存在退出阶段的副作用竞争。
++
++---
++
++## 3. 修复设计
++
++### 3.1 系统代理恢复事务
++
++涉及：`reconcileProxy`、`restoreSystemProxy`、`SetSystemProxy`、`Shutdown`、`failBoot`、Watchdog 熔断。
++
++- **备份优先**：恢复前读取/确认 `proxy.json` 或内存备份；损坏时保留文件并返回错误，不覆盖。
++- **逐项检查**：`SetServer`、`SetOverride`、`SetAutoConfigURL` / `ClearAutoConfigURL` 的错误通过 `errors.Join` 汇总。
++- **回读验证**：`verifyProxySnapshot` 校验启用状态、地址、Override、PAC；只有成功才删除备份。
++- **失败保留**：任一步失败不删除 `proxy.json`、不清理内存备份，并写 `debug.log`。
++- **幂等重试**：恢复写入包含空值字段；重复执行安全。测试覆盖“失败一次后再次启动成功恢复”。
++- **删除失败**：新增可注入的 `removeProxyState`，恢复成功但删除备份失败时返回错误并保留备份，下次启动继续校验/恢复。
++- **用户手动关闭**：只有恢复成功且回读通过才清理备份；不再因为 `ProxyEnable=0` 直接丢弃原始状态。
++- **WinHTTP 一致性**：看门狗熔断路径同时调用 `restoreSystemProxy` 与 `restoreWinHTTPIfPending`，失败只记录并保留备份。
++
++### 3.2 afterStart 代际与任务登记
++
++在 `CoreService` 中新增：
++
++- `gen` / `genCancel`：每次成功启动生成新代际；旧代际 context 被取消。
++- `lifeMu`：串行化 Service 层 Start / Stop / Restart / Shutdown，避免 Manager 进程锁之外的 afterStart 竞争。
++- `afterMu` / `afterWG` / `afterClosed`：登记异步任务；Shutdown 关闭入口并等待任务退出。
++
++流程：
++
++- `afterStart(gen, ctx)` 的每个关键步骤前检查 `generationCurrent(gen, ctx)`：
++  - 代际一致；
++  - `ctx` 未取消；
++  - 程序未 quitting / shuttingDown。
++- Stop / Restart / Shutdown / MarkQuitting：
++  - 先 `invalidateKernelGeneration()` 使旧任务失效；
++  - Stop/Restart 等待已登记任务退出，再操作代理/内核；
++  - Shutdown 设置 `afterClosed` 后等待全部任务，再恢复代理并关闭 Manager。
++- 写 `mixedPort`、`restoreTUN`、`restoreProxy` 前在 `s.mu` 内再次核对 `gen`，防止“检查后被 Stop”导致状态覆盖。
++- 端口校正、恢复系统代理、TUN 标记、隐藏组选中都受代际保护。
++- `MarkQuitting` 立即取消 afterStart；`Shutdown` 负责等待真正退出。
++
++### 3.3 为什么不是只加 context cancellation
++
++已进入执行阶段的注册表写入/代理接管无法被 context 回滚。因此 Shutdown 使用 WaitGroup 等待任务真正退出；代际检查只负责阻止**尚未进入副作用**的后续步骤。Stop 的顺序是：
++
++1. 使代际失效；
++2. 等待 afterStart 退出；
++3. 恢复系统代理；
++4. 停止内核。
++
++保证代理恢复完成后不会被旧任务重新打开。
++
++---
++
++## 4. 修改文件清单
++
++| 文件 | 说明 |
++|---|---|
++| `service.go` | generation/lifeMu/after 任务登记；Start/Stop/Restart/Shutdown/MarkQuitting 串行化；reconcileProxy 错误处理；removeProxyState 注入；看门狗熔断还原 WinHTTP |
++| `internal/kernel/manager.go` | 测试用 `hook`（process-started / before-running）；`jobAttached` 记录与 `JobAttached()` |
++| `internal/kernel/watchdog_test.go` | 新增 Stop 取消待执行重启测试 |
++| `c1_1_proxy_test.go` | 用户关闭代理恢复失败保留备份、成功后清理、删除失败保留并重试 |
++| `service_generation_test.go` | 代际失效、旧任务不能改新实例、Shutdown 等待/关闭入口、旧 afterStart 延迟返回 |
++| `internal/kernel/lifecycle_barrier_test.go` | 用 barrier 验证 Stop/Close 在 Starting 中等待、API 超时清理、Restart 等旧进程退出、Job 已绑定 |
++
++---
++
++## 5. 新增测试
++
++| 用例 | 覆盖点 |
++|---|---|
++| `TestReconcileClosedProxyFailureKeepsBackup` | 恢复失败保留 proxy.json；失败消失后幂等重试成功 |
++| `TestReconcileClosedProxySuccessClearsBackup` | 回读校验成功后清理备份，用户关闭的代理不被重新打开 |
++| `TestRestoreSuccessRemoveFailureKeepsBackup` | 恢复成功但删除备份失败：报错、保留、重试可清理 |
++| `TestGenerationInvalidation` | 旧 generation 失效，新 generation 有效 |
++| `TestStaleAfterTaskCannotMutateNewGeneration` | 旧任务延迟返回不能修改状态 |
++| `TestStaleAfterStartCannotReadNewInstance` | `/version` 成功后阻塞，新代际启动后旧任务不再读 `/configs`、不改端口 |
++| `TestShutdownWaitsForAfterTasksAndClosesGate` | Shutdown 取消并等待任务，之后拒绝新任务 |
++| `TestStopDuringStartingWaitsForTransaction` | Stop 在 Starting 中阻塞，最终进程被清理 |
++| `TestCloseDuringStartingLeavesNoProcess` | Close 等待 Start 事务，返回后无进程 |
++| `TestStopWhileWaitingAPIReady` | API 等待期间 Stop：超时清理、PID 清空、最终停止 |
++| `TestRestartWaitsForOldProcessExit` | 新进程创建前旧进程已退出 |
++| `TestJobAttachedForStartedProcess` | 成功启动明确记录 Job 绑定 |
++| `TestWatchdogStopCancelsPendingRestart` | Watchdog 停止后取消已排队重启 |
++
++---
++
++## 6. 尚未解决 / 已知风险
++
++1. **Race Detector 未执行成功**：环境没有 gcc，`CGO_ENABLED=1 go test -race ./...` 在 `runtime/cgo` 阶段失败。已记录在 TEST-REPORT.md，不能宣称 race 通过。
++2. **真实注册表代理恢复只做了可控替换测试**：`c1_*` 测试使用 fakeRegistry，避免修改本机网络；真实 WinINET/WinHTTP 恢复仍需管理员实机验收。
++3. **Shutdown 等待没有超时**：为保证副作用完成，Shutdown 会等待 afterStart；API 调用都有 15s 上限、注册表操作通常很快，但极端挂起时退出可能变慢。这是正确性优先的取舍。
++4. **看门狗熔断后的 WinHTTP 恢复**：代码路径已接入，但 UI 层未做真实断网实机演练。
++5. **系统代理恢复失败的分级提示**：目前写 debug.log 与 bootErr，未新增 UI 弹窗（本阶段不做 UI 优化）。
++
++---
++
++## 7. Git diff 摘要
++
++```
++ internal/kernel/manager.go        +34   hook/jobAttached/JobAttached
++ internal/kernel/watchdog_test.go  +24   Stop 取消待重启
++ service.go                        +266  generation/lifeMu/after 任务、代理事务加固
++ 新增 c1_1_proxy_test.go / service_generation_test.go / lifecycle_barrier_test.go
++```
++
++重要改动原因：
++
++- `service.go` 的生命周期串行化与代际令牌：解决 afterStart 晚到副作用。
++- `reconcileProxy` 的错误收集与备份保留：解决“恢复失败仍删备份”。
++- `removeProxyState` 注入：为删除失败路径提供可重复测试。
++- Watchdog 熔断同时恢复 WinHTTP：解决 WinINET/WinHTTP 不一致。
++- Manager 测试 hook：把并发测试从随机 Sleep 改为确定性 barrier。
++
++本阶段到此暂停，等待人工审查。
+diff --git a/C2-LIFECYCLE-REMEDIATION.md b/C2-LIFECYCLE-REMEDIATION.md
+new file mode 100644
+index 0000000..92d3e7e
+--- /dev/null
++++ b/C2-LIFECYCLE-REMEDIATION.md
+@@ -0,0 +1,228 @@
++# C2 内核生命周期统一串行化整改报告
++
++- 日期：2026-11-10
++- 仓库：`peican996/RoutePilot`（本地 `nexuslink_review`）
++- 基线：`0c38642`
++- 范围：仅 C2（内核生命周期状态机、并发协调、Watchdog、Job Object、API 就绪与回滚）
++- 状态：改动在工作区，未提交
++
++---
++
++## 1. 结论摘要
++
++上一轮已经建立了 `internal/kernel.Manager` 的状态机与串行化事务；本轮按任务书逐项复核，并补齐了 **Service 层的生命周期串行化与启动代际**，解决 Manager 进程锁保护不到的 afterStart 副作用。
++
++核心结论：
++
++1. Start / Stop / Restart / Close 由 Manager `opMu` 串行化；状态机为 Stopped / Starting / Running / Stopping / Failed。
++2. Start 只有在 API 探测成功后才进入 Running；失败会 Kill 进程、等待收尾并进入 Failed。
++3. Stop 在 Starting 中不会误判；测试用 hook 卡住“进程已创建”阶段验证 Stop/Close 会等待事务完成。
++4. Restart 是 `stopLocked + startLocked` 的完整事务，没有固定 Sleep；新进程创建前旧进程必须已退出。
++5. Watchdog 使用滑动窗口、指数退避、最大次数与稳定窗口，不会在重启成功后立即清零。
++6. Job Object 创建/配置/分配全部检查错误；分配失败直接阻止启动并返回 `ErrJobObjectFailed`。
++7. API 就绪与启动失败回滚：`ProcessStarted`、`APIReady`、`KernelReady` 三阶段在 Manager 内完成；失败清理进程、日志、临时资源和 Job 归属。
++8. Shutdown 与 Start/Stop/Restart 串行；Shutdown 关闭 afterStart 入口、等待任务、再恢复代理与关闭 Manager。
++
++---
++
++## 2. 状态机设计
++
++```
++Stopped ──Start──▶ Starting ──API Ready──▶ Running
++   ▲                  │                       │
++   │                  └──失败/超时──▶ Failed   ├──Stop──▶ Stopping ──进程退出──▶ Stopped
++   │                                          │
++   └────────────── Stop（幂等） ◀──────────────┘
++Running ──异常退出──▶ Failed
++Failed ──Start（人工/看门狗）──▶ Starting
++```
++
++合法转换：
++
++| 当前 | 允许操作 | 结果 |
++|---|---|---|
++| Stopped | Start | Starting → Running / Failed |
++| Failed | Start | Starting → Running / Failed |
++| Running | Start | `ErrAlreadyRunning` |
++| Starting | Start | `ErrAlreadyRunning`（串行等待后） |
++| Stopping | Start | `ErrLifecycleBusy` |
++| Running | Stop | Stopping → Stopped |
++| Starting | Stop | 等待 Start 事务结束，再停止 |
++| Running/Stopped | Restart | 完整 Stop + Start 事务 |
++| Starting/Running | Close | 等待事务结束、停止、关闭 Job |
++
++`IsRunning()` 只认 `Running`，不再用 `cmd != nil` 推断。
++
++---
++
++## 3. 锁与并发协调
++
++### 3.1 Manager 层
++
++- `opMu`：生命周期操作串行化锁，覆盖完整的 Start / Stop / Restart / Close。
++- `mu`：状态、当前 `processRun`、lastErr 的短临界区保护；不持锁执行进程启动、等待或回调。
++- `processRun`：每次启动独立的 cmd / pid / exited / done / intentional / exitErr，避免新旧实例字段互相覆盖。
++- `waitProcess` 是唯一 `cmd.Wait()` 调用点；回调在释放 `mu` 后执行，允许回调重入 Manager 而不会死锁（有测试）。
++- 启动期间 `rate readiness` 由 `awaitReady` 在 `opMu` 内等待；其他 Start 串行等待，不会创建第二个进程。
++- Stop 在 Starting 中通过 `opMu` 等待，不会因为 `run == nil` 或 `cmd == nil` 直接返回。
++
++### 3.2 Service 层（本轮补强）
++
++Manager 的锁保护不了 afterStart，因此在 `CoreService` 新增：
++
++- `lifeMu`：串行化 Service 的 StartKernel / StopKernel / restartKernel / Shutdown。
++- `gen` / `genCancel`：每次成功启动的唯一代际；旧代际取消。
++- `afterMu` / `afterWG` / `afterClosed`：afterStart 任务登记、Shutdown 入口关闭与等待。
++
++关键顺序：
++
++- StopKernel：`lifeMu` → 失效代际 → 等待 afterStart → 恢复系统代理 → Manager.Stop → 暂停 Watchdog。
++- RestartKernel：`lifeMu` → 失效代际 → 等待 afterStart → Manager.Restart → 新代际 → afterStart。
++- Shutdown：`lifeMu` → `shuttingDown=true` → 停止 Watchdog → 失效代际 → 关闭任务入口并等待 → 恢复 WinINET/WinHTTP → 关闭 API 连接 → Manager.Close。
++
++---
++
++## 4. Start / Stop / Restart / Shutdown 执行流程
++
++### Start
++
++1. 取得 `opMu`；检查 closed / state / exePath。
++2. 原子设置 Starting。
++3. 端口预检查（仅快速失败）。
++4. `cmd.Start()`。
++5. Job Object 分配；失败则 Kill + Wait + 关闭日志 + Failed。
++6. 创建 `processRun`，启动唯一 Wait goroutine。
++7. 如配置了 probe：轮询 API；超时/进程退出/API 不可达分别分类。
++8. 成功后才置 Running；探测成功但进程已退出则 Failed。
++
++### Stop
++
++1. 取得 `opMu`。
++2. 若已 Stopped/Failed 且无 run → 幂等返回。
++3. 标记 run.intentional，状态 Stopping。
++4. Kill；等待 `run.done`（真正回收 cmd/PID/日志）。
++5. 超时进入 Failed，返回 `ErrStopTimeout`，不伪造成功。
++
++### Restart
++
++1. 取得 `opMu`。
++2. `stopLocked` 完整停止并等待旧进程退出。
++3. 直接 `startLocked`，不插入固定 Sleep。
++4. 只有 API Ready 才 Running；失败清理并 Failed。
++
++### Shutdown
++
++1. 取得 `opMu`。
++2. `stopLocked` + 关闭 Job 句柄；之后 Start 返回 `ErrManagerClosed`。
++3. 无固定 Sleep。
++
++---
++
++## 5. Watchdog 设计
++
++`internal/kernel/watchdog.go`：
++
++- 滑动窗口（默认 10 分钟）统计失败，窗口外记录清理。
++- 指数退避 2s/4s/8s/16s/32s，封顶 60s。
++- 最大连续重启 5 次；超过即熔断，只通知一次。
++- 只有运行时间 ≥ 稳定窗口（1 分钟）后的下次退出才重置计数；**重启成功不立即清零**。
++- 单一 timer 防止多个退出事件叠加多个重启。
++- 看门狗自身重启失败也计入失败次数。
++- `Pause` / `Resume`：用户手动停止内核后暂停；手动启动恢复；看门狗自身重启不清零。
++- `Stop`：Shutdown/退出时取消等待中的重启。
++- 重启通过 `Service.restartKernel(false)` → Manager.Restart，不绕过 Manager。
++- 熔断后 Manager 保持 Failed，UI 通过事件与 status.error 获取状态。
++- 看门狗回调检查 `s.app != nil`、`s.Quitting()`；Shutdown 先 Stop 看门狗。
++
++---
++
++## 6. Windows Job Object 策略
++
++`internal/kernel/job_windows.go`：
++
++- `CreateJobObject` 失败 → 返回错误，启动中止。
++- `SetInformationJobObject`（KILL_ON_JOB_CLOSE）返回值检查；失败关闭句柄并返回错误。
++- `OpenProcess` / `AssignProcessToJobObject` 错误全部返回。
++- Job 由 Manager 独占，`Close()` 释放；不静默降级。
++- 分配失败时：Kill 本次进程、Wait、关闭日志、返回 `ErrJobObjectFailed`，状态 Failed。
++- `processRun.jobAttached` 记录绑定成功；`Manager.JobAttached()` 可供测试/诊断。
++- 兼容性：Windows 8+ 支持嵌套 Job；Win10/11 已实测启动成功。若宿主 Job 禁止嵌套，Assign 失败会明确阻止启动并写日志。
++- 进程退出后由 Wait 收尾；Job 句柄在 Manager.Close 时释放，KILL_ON_JOB_CLOSE 兜底强杀场景。
++
++---
++
++## 7. API 就绪与失败回滚
++
++三阶段：
++
++| 阶段 | 判定 | 失败处理 |
++|---|---|---|
++| ProcessStarted | `cmd.Start` 成功 | Kill/Wait/关闭日志/Failed |
++| APIReady | probe（`/version`）成功 | 超时/端口冲突/API 不可达/进程退出分类 |
++| KernelReady | Manager 状态 Running，且 `m.run == r` | 进程期间退出则 Failed |
++
++- `awaitReady` 轮询间隔 200ms，超时默认 15s。
++- 失败统一走 `abortStart`：标记 intentional、Kill、等待 done、清理 run，状态 Failed。
++- 端口冲突、启动超时、API 不可达、进程提前退出分别返回不同 sentinel error。
++- 探测成功后再次核对 `m.run == r`，避免进程退出后仍标记 Running。
++- API 探测绑定本次 `processRun`；Service 层 afterStart 另用 generation 防止旧任务修改新实例。
++- 启动失败不会接管系统代理；afterStart 中的代理恢复失败会写 bootErr 并保留备份。
++
++---
++
++## 8. 测试覆盖矩阵
++
++| 任务书场景 | 测试 | 结果 |
++|---|---|---|
++| 100 个并发 Start | `TestConcurrentStartOnlyOneInstance` | 通过 |
++| Start 与 Stop 并发 | `TestStartStopConcurrentConsistency` | 通过 |
++| 多个 Restart 并发 | `TestConcurrentRestartAllSucceed` | 通过 |
++| Start 与 Shutdown 并发 | `TestCloseDuringStartingLeavesNoProcess` | 通过 |
++| API 超时 | `TestStartTimeoutCleansProcess` / `TestStopWhileWaitingAPIReady` | 通过 |
++| Watchdog 连续崩溃 | `TestWatchdogExhaustsAfterMaxRestarts` / `TestBackoffDelay` | 通过 |
++| Job Object 绑定失败 | `TestJobObjectAssignInvalidPID` / `TestReproT09JobObjectFailureIsReported` | 通过 |
++| 代理恢复失败 | `TestReconcileClosedProxyFailureKeepsBackup` / `TestT02...` | 通过 |
++| 代理恢复后再次启动 | `TestReconcileClosedProxyFailureKeepsBackup` 二次恢复 | 通过 |
++| 旧异步任务晚到 | `TestStaleAfterStartCannotReadNewInstance` / `TestStaleAfterTaskCannotMutateNewGeneration` | 通过 |
++| Stop 在 Starting 中 | `TestStopDuringStartingWaitsForTransaction` | 通过 |
++| 回调重入 | `TestExitCallbackConcurrentWithRestart` | 通过 |
++| 真实内核 | `TestRealKernelLifecycle` | 通过 |
++
++完整执行命令与结果见 `TEST-REPORT.md`；完整 Git diff 见 `C1.1-C2-CHANGES.diff`。
++
++---
++
++## 9. 修改文件与 diff 摘要
++
++```
++ internal/kernel/manager.go        +34   hook / jobAttached / JobAttached
++ internal/kernel/watchdog_test.go  +24   Stop 取消待执行重启
++ service.go                        +266  generation / lifeMu / after 任务 / 代理事务加固
++ 新增：
++ internal/kernel/lifecycle_barrier_test.go
++ service_generation_test.go
++ c1_1_proxy_test.go
++ C1.1-REMEDIATION.md
++ C2-LIFECYCLE-REMEDIATION.md
++ TEST-REPORT.md
++```
++
++重要改动原因：
++
++- `service.go` 代际与 afterStart 登记：Manager 锁无法保护异步副作用；Stop/Restart/Shutdown 必须等待并阻止旧任务。
++- `Manager.hook`：用 barrier 替代随机 Sleep，确定性复现 Start 中间态。
++- `processRun.jobAttached` / `JobAttached()`：让“是否真正受 Job 托管”可验证。
++- 生命周期串行化：保证 Service 层操作顺序与 Manager 状态一致。
++- Watchdog/Job/API readiness：复核既有实现并补齐测试与边界。
++
++---
++
++## 10. 未解决与风险
++
++1. **race detector 不可执行**：本机无 gcc，`CGO_ENABLED=1 go test -race` 在 runtime/cgo 失败；不能声称 race 通过。
++2. **外部孤儿进程的 API 身份**：mihomo `/version` 不返回 PID；防护依赖端口预检查、Manager 串行化和 `m.run == r` 核对。极端情况下外部进程占用同一 API 端口会被判为端口冲突而拒绝启动，不会误认旧实例为新实例。
++3. **Shutdown 等待无上限**：afterStart 中的 API 有 15s 超时，注册表调用通常很快；若系统调用挂起，Shutdown 会等待。正确性优先。
++4. **真实 WinINET/WinHTTP 注册表恢复**：测试使用 fakeRegistry，避免改动本机网络；需要管理员实机验收。
++5. **UI/TUN/休眠唤醒**：不在本轮 C1.1/C2 范围，未做完整实机矩阵。
++
++本阶段到此暂停，等待人工审查。
+diff --git a/TEST-REPORT.md b/TEST-REPORT.md
+new file mode 100644
+index 0000000..bf82f07
+--- /dev/null
++++ b/TEST-REPORT.md
+@@ -0,0 +1,206 @@
++# C1.1 + C2 测试报告
++
++- 日期：2026-11-10
++- 环境：Windows 10/11 x64、Go 1.27.3、Node 20、`CGO_ENABLED=0`、无 gcc、内置 mihomo v1.19.33
++- 基线：`0c38642`
++- 结论：单元/并发/复现/真实内核测试通过；**race detector 因缺少 gcc 无法执行**，未宣称通过。
++
++---
++
++## 1. 自动化测试命令与结果
++
++### 1.1 全量单元测试
++
++```powershell
++go test -count=1 ./...
++```
++
++结果：
++
++```
++ok   routepilot
++ok   routepilot/internal/autostart
++ok   routepilot/internal/configgen
++?    routepilot/internal/elevate      [no test files]
++?    routepilot/internal/geoip        [no test files]
++ok   routepilot/internal/kernel
++ok   routepilot/internal/procid
++ok   routepilot/internal/subscription
++?    routepilot/internal/sysproxy     [no test files]
++```
++
++### 1.2 生命周期与 C1.1 用例重复执行
++
++```powershell
++go test -count=3 ./internal/kernel .
++```
++
++结果：
++
++```
++ok   routepilot/internal/kernel  27.513s
++ok   routepilot              1.305s
++```
++
++### 1.3 复现套件
++
++```powershell
++go test -count=1 -tags repro ./...
++```
++
++结果：全部通过（包含 T01-T18 复现用例，T17 SSRF 已于上一阶段修复）。
++
++### 1.4 真实 mihomo（Windows 实机）
++
++```powershell
++go test -tags realkernel -count=1 -run "TestRealKernel" -v ./internal/kernel
++```
++
++结果：
++
++```
++=== RUN   TestRealKernelDistinguishesSameNameProcessPaths
++--- PASS (0.28s)  A=200 direct, B=502 REJECT
++=== RUN   TestRealKernelSmartRoutingRulesStart
++--- PASS (0.55s)
++=== RUN   TestRealKernelLifecycle
++    真实内核已就绪: pid=12204 version=v1.19.33
++--- PASS (0.22s)
++```
++
++### 1.5 静态检查
++
++```powershell
++go vet ./...
++gofmt -l .
++```
++
++结果：无输出（无问题）。
++
++### 1.6 前端
++
++```powershell
++cd frontend
++npm run build
++```
++
++结果：`tsc` + `vite build` 成功（67 modules，产物约 299KB）。
++仓库没有独立 lint 脚本，`tsc` 已作为构建前置检查。
++
++### 1.7 Windows amd64 生产编译
++
++```powershell
++go build -tags production -trimpath -buildvcs=false -ldflags "-w -s -H windowsgui" -o bin\RoutePilot.exe .
++```
++
++结果：成功，生成约 90MB 的 `bin\RoutePilot.exe`。
++
++### 1.8 Race Detector（未通过，环境限制）
++
++```powershell
++$env:CGO_ENABLED=1
++go test -race -count=1 ./...
++```
++
++结果：
++
++```
++# runtime/cgo
++cgo: C compiler "gcc" not found: exec: "gcc": executable file not found in %PATH%
++FAIL routepilot [build failed]
++...
++```
++
++**说明**：本机没有 gcc，`-race` 无法构建；这不是测试通过。并发正确性由确定性 barrier/channel 测试与多轮重复执行覆盖，但不能替代 race detector。
++
++---
++
++## 2. 并发与故障测试矩阵
++
++| 场景 | 测试 | 控制方式 | 结果 |
++|---|---|---|---|
++| 100 个并发 Start | `TestConcurrentStartOnlyOneInstance` | 100 goroutine | 通过，仅 1 个成功 |
++| Start / Stop 并发 | `TestStartStopConcurrentConsistency` | 20 轮并发 | 通过，状态与 PID 一致 |
++| 多个 Restart 并发 | `TestConcurrentRestartAllSucceed` | 5 goroutine | 通过 |
++| Restart 与 Stop 并发 | `TestRestartStopConcurrent` | barrier/并发 | 通过 |
++| Start 在 process-started 时 Stop | `TestStopDuringStartingWaitsForTransaction` | Manager hook + channel | 通过，Stop 等待事务结束，无孤儿 |
++| Start 在 process-started 时 Close | `TestCloseDuringStartingLeavesNoProcess` | Manager hook + channel | 通过，Close 后无进程 |
++| Start 等待 API 时 Stop | `TestStopWhileWaitingAPIReady` | 300ms probe + 并发 | 通过，超时清理、PID 清空 |
++| Restart 等旧进程退出 | `TestRestartWaitsForOldProcessExit` | PID 对比 | 通过，旧 PID 不再存活 |
++| 回调阻塞时 Restart | `TestExitCallbackConcurrentWithRestart` | 回调 channel 阻塞 | 通过，未死锁 |
++| API 超时清理 | `TestStartTimeoutCleansProcess` | PID 文件 + 300ms 超时 | 通过，进程被清理 |
++| API 不可达分类 | `TestAPIUnreachableClassified` | 端口监听 + 无 HTTP | 通过，`ErrAPIUnreachable` |
++| 端口占用 | `TestStartFailsWhenAPIPortInUse` | 占用监听 | 通过，`ErrPortInUse` |
++| 进程提前退出 | `TestProcessExitDuringStartup` | fake exit | 通过，`ErrProcessExited` |
++| Job 分配失败 | `TestJobObjectAssignInvalidPID` | 无效 PID | 通过，返回错误 |
++| Job 绑定成功记录 | `TestJobAttachedForStartedProcess` | 实际子进程 | 通过 |
++| Watchdog 连续崩溃熔断 | `TestWatchdogExhaustsAfterMaxRestarts` | 小窗口定时器 | 通过 |
++| Watchdog 重启失败计数 | `TestWatchdogRestartFailureCountsTowardLimit` | 失败 restart | 通过 |
++| Watchdog 稳定运行重置 | `TestWatchdogStableRunResetsCounter` | Uptime 2 分钟 | 通过 |
++| Watchdog Stop 取消待重启 | `TestWatchdogStopCancelsPendingRestart` | timer + Stop | 通过 |
++| 旧 afterStart 改新实例 | `TestStaleAfterStartCannotReadNewInstance` | API server + hook | 通过，未读取 `/configs`、未改端口 |
++| 旧任务延迟返回 | `TestStaleAfterTaskCannotMutateNewGeneration` | channel | 通过 |
++| Shutdown 等待异步任务 | `TestShutdownWaitsForAfterTasksAndClosesGate` | channel + WaitGroup | 通过，Shutdown 等待且拒绝新任务 |
++| 用户关闭代理恢复失败 | `TestReconcileClosedProxyFailureKeepsBackup` | fakeRegistry 注入 | 通过，备份保留，重试成功 |
++| 恢复成功清理备份 | `TestReconcileClosedProxySuccessClearsBackup` | fakeRegistry | 通过 |
++| 恢复成功但删备份失败 | `TestRestoreSuccessRemoveFailureKeepsBackup` | `removeProxyState` 注入 | 通过，保留并可重试 |
++| 既有代理事务 T01/T02/T10/T16 | `c1_proxy_test.go` | fakeRegistry + 写失败注入 | 通过 |
++
++---
++
++## 3. Windows 实机验证结果
++
++已在当前 Windows 主机实际执行：
++
++- 真实 mihomo v1.19.33 启动、API `/version` 就绪、Stop 后进程/端口释放：通过。
++- 真实 mihomo 按路径区分同名 `same.exe`，A 直连 200、B REJECT 502：通过。
++- 真实 mihomo 加载内置 `GEOSITE,cn` / `GEOIP,CN` 数据库并启动：通过。
++- 子进程创建、Job Object 分配、并发 Start/Stop/Close barrier 测试：通过（使用真实 test binary 作为假内核）。
++- Windows 文件占用场景（升级目标独占打开）下的替换失败测试：通过（属于上一阶段，本轮回归仍通过）。
++- Windows amd64 生产构建：通过。
++
++**未做**：
++
++- 管理员权限下真实 WinINET/WinHTTP 注册表恢复（测试使用 fakeRegistry，避免改动本机网络）。
++- TUN 模式、系统休眠/唤醒、真实断网重连。
++- 图形界面连续点击 Start/Stop、托盘退出与崩溃恢复。
++- 长时间稳定性（小时级）。
++
++---
++
++## 4. 未完成项
++
++1. `go test -race` 未执行成功：缺少 gcc/CGO。
++2. 真实注册表系统代理事务未做管理员实机演练。
++3. WinHTTP 与 WinINET 混合异常的真实注册表演练未做（代码路径已接入，测试用 fake）。
++4. UI/TUN/休眠唤醒不在本阶段范围。
++5. `Shutdown` 等待异步任务没有超时上限；依赖 API 15s 超时与注册表调用快速返回，属于正确性优先取舍。
++
++---
++
++## 5. 已知风险
++
++| 风险 | 说明 | 缓解 |
++|---|---|---|
++| 无 race detector 证据 | 本机无 gcc | 确定性 barrier/channel 测试 + count=3 重复；CI/有 gcc 环境应补跑 `-race` |
++| 外部孤儿内核占用 API 端口 | mihomo `/version` 不含 PID | 端口预检查、Manager 串行化、探测后 `m.run == r` 复核；占用端口会拒绝启动 |
++| Shutdown 可能变慢 | 等待 afterStart 真正退出 | API 15s 上限；代理副作用必须等待，避免退出后改注册表 |
++| 真实 WinHTTP 恢复失败 | 仅管理员可写 HKLM | 失败保留 `app-state` 备份，下次提权启动重试 |
++| Job Object 嵌套限制 | 宿主已有禁止嵌套的 Job（主要 Win7） | Assign 失败明确阻止启动并报错，不静默降级 |
++| Watchdog 熔断后代理恢复 | UI 事件与 debug.log 记录 | 熔断同时还原 WinINET/WinHTTP；失败保留备份 |
++
++---
++
++## 6. 与任务书验收标准对照
++
++- “任何并发操作不能产生多个 mihomo”：Manager `opMu` + 100 并发 Start 测试通过。
++- “Stop 不能误判 Starting”：barrier 测试通过，Stop 等待 Start 事务。
++- “Restart 不允许旧进程未退出就启动新进程”：PID 测试通过。
++- “Shutdown 返回后无残留进程”：Close/Shutdown barrier 测试通过。
++- “Watchdog 不会无限重启”：窗口、退避、上限、稳定窗口测试通过。
++- “Job 失败不静默”：错误返回 + 启动中止测试通过。
++- “API 超时清理进程”：PID 文件与 `ErrStartTimeout` 测试通过。
++- “代理恢复失败保留备份”：三类恢复失败测试通过。
++- “旧异步任务不能改新实例”：代际 + 真实 afterStart hook 测试通过。
++
++报告完成，暂停等待人工审查。
+diff --git a/c1_1_proxy_test.go b/c1_1_proxy_test.go
+new file mode 100644
+index 0000000..2f956d2
+--- /dev/null
++++ b/c1_1_proxy_test.go
+@@ -0,0 +1,110 @@
++package main
++
++import (
++	"errors"
++	"os"
++	"strings"
++	"testing"
++)
++
++// 用户手动关闭系统代理时，reconcileProxy 必须先恢复原始设置；
++// 任一步失败都要保留备份，便于下次启动继续恢复。
++func TestReconcileClosedProxyFailureKeepsBackup(t *testing.T) {
++	fake := &fakeRegistry{
++		enabled:         false,
++		failSetOverride: true,
++	}
++	svc := newC1Service(t, fake)
++	writeState(t, svc, proxyBackup{
++		Addr:          "127.0.0.1:17890",
++		Server:        "old:1",
++		Override:      "old-override",
++		AutoConfigURL: "http://old/pac",
++		Enabled:       false,
++		Saved:         true,
++	})
++
++	svc.reconcileProxy()
++	if _, ok := readState(t, svc); !ok {
++		t.Fatal("恢复失败时备份必须保留")
++	}
++
++	// 幂等重试：失败因素消失后再次执行，应完成恢复并删除备份。
++	fake.failSetOverride = false
++	svc.reconcileProxy()
++	if _, ok := readState(t, svc); ok {
++		t.Fatal("恢复成功并回读校验通过后应删除备份")
++	}
++	if fake.server != "old:1" || fake.override != "old-override" || fake.pac != "http://old/pac" {
++		t.Fatalf("原始代理设置未完整恢复: %+v", fake)
++	}
++	if fake.enabled {
++		t.Fatal("用户手动关闭的代理不应被重新打开")
++	}
++}
++
++// 恢复成功后必须回读校验，再清理备份。
++func TestReconcileClosedProxySuccessClearsBackup(t *testing.T) {
++	fake := &fakeRegistry{enabled: false}
++	svc := newC1Service(t, fake)
++	writeState(t, svc, proxyBackup{
++		Addr:     "127.0.0.1:17890",
++		Server:   "old:2",
++		Override: "bypass",
++		Enabled:  false,
++		Saved:    true,
++	})
++
++	svc.reconcileProxy()
++	if _, ok := readState(t, svc); ok {
++		t.Fatal("恢复成功后应清理备份")
++	}
++	svc.mu.RLock()
++	proxyOn := svc.proxyOn
++	svc.mu.RUnlock()
++	if proxyOn {
++		t.Fatal("用户关闭代理后 proxyOn 应为 false")
++	}
++}
++
++// 恢复动作和回读校验都成功，但删除备份失败：必须返回错误并保留备份，
++// 下次启动继续校验/恢复，不能误认为事务完成。
++func TestRestoreSuccessRemoveFailureKeepsBackup(t *testing.T) {
++	fake := &fakeRegistry{
++		server:   "ours:17890",
++		enabled:  true,
++		override: "ours",
++	}
++	svc := newC1Service(t, fake)
++	writeState(t, svc, proxyBackup{
++		Addr:     "127.0.0.1:17890",
++		Server:   "old:1",
++		Override: "old",
++		Enabled:  true,
++		Saved:    true,
++	})
++
++	origRemove := removeProxyState
++	removeProxyState = func(string) error { return errors.New("injected remove failure") }
++	t.Cleanup(func() { removeProxyState = origRemove })
++
++	err := svc.restoreSystemProxy()
++	if err == nil || !strings.Contains(err.Error(), "删除系统代理备份失败") {
++		t.Fatalf("应返回删除备份失败，实际 %v", err)
++	}
++	if _, ok := readState(t, svc); !ok {
++		t.Fatal("删除失败时必须保留备份")
++	}
++	if fake.server != "old:1" || fake.override != "old" {
++		t.Fatalf("恢复动作应已执行: %+v", fake)
++	}
++
++	// 删除故障消失后重试，应完成清理。
++	removeProxyState = os.Remove
++	if err := svc.restoreSystemProxy(); err != nil {
++		t.Fatalf("重试恢复失败: %v", err)
++	}
++	if _, ok := readState(t, svc); ok {
++		t.Fatal("重试成功后应删除备份")
++	}
++}
+diff --git a/internal/kernel/lifecycle_barrier_test.go b/internal/kernel/lifecycle_barrier_test.go
+new file mode 100644
+index 0000000..ac90113
+--- /dev/null
++++ b/internal/kernel/lifecycle_barrier_test.go
+@@ -0,0 +1,175 @@
++package kernel
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++// 用 hook 把 Start 卡在「进程已创建、尚未就绪」的阶段，确定性验证
++// Stop 不会误判为已停止，也不会与 Start 交叉产生孤儿进程。
++func TestStopDuringStartingWaitsForTransaction(t *testing.T) {
++	m := newFakeManager(t, "sleep")
++	started := make(chan struct{})
++	gate := make(chan struct{})
++	var once sync.Once
++	m.hook = func(stage string) {
++		if stage == "process-started" {
++			once.Do(func() { close(started) })
++			<-gate
++		}
++	}
++
++	startDone := make(chan error, 1)
++	go func() { startDone <- m.Start("dummy.yaml") }()
++	select {
++	case <-started:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Start 未进入 process-started 阶段")
++	}
++	pid := m.Status().PID
++	if pid <= 0 {
++		t.Fatal("进程已创建但 Status 没有 PID")
++	}
++
++	stopDone := make(chan error, 1)
++	go func() { stopDone <- m.Stop() }()
++	select {
++	case <-stopDone:
++		t.Fatal("Start 仍在执行时 Stop 不应返回")
++	case <-time.After(120 * time.Millisecond):
++	}
++
++	close(gate)
++	if err := <-startDone; err != nil {
++		t.Fatalf("Start 失败: %v", err)
++	}
++	if err := <-stopDone; err != nil {
++		t.Fatalf("Stop 失败: %v", err)
++	}
++	if m.IsRunning() {
++		t.Fatal("Stop 返回后内核仍在运行")
++	}
++	if processAlive(pid) {
++		t.Fatalf("Stop 返回后进程 %d 仍存活", pid)
++	}
++}
++
++// Start 执行期间调用 Close：Close 必须等待 Start 事务结束，然后停止进程。
++func TestCloseDuringStartingLeavesNoProcess(t *testing.T) {
++	m := newFakeManager(t, "sleep")
++	started := make(chan struct{})
++	gate := make(chan struct{})
++	var once sync.Once
++	m.hook = func(stage string) {
++		if stage == "process-started" {
++			once.Do(func() { close(started) })
++			<-gate
++		}
++	}
++
++	startDone := make(chan error, 1)
++	go func() { startDone <- m.Start("dummy.yaml") }()
++	select {
++	case <-started:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Start 未进入 process-started 阶段")
++	}
++	pid := m.Status().PID
++
++	closeDone := make(chan error, 1)
++	go func() { closeDone <- m.Close() }()
++	select {
++	case <-closeDone:
++		t.Fatal("Start 仍在执行时 Close 不应返回")
++	case <-time.After(120 * time.Millisecond):
++	}
++
++	close(gate)
++	if err := <-startDone; err != nil {
++		t.Fatalf("Start 失败: %v", err)
++	}
++	if err := <-closeDone; err != nil {
++		t.Fatalf("Close 失败: %v", err)
++	}
++	if processAlive(pid) {
++		t.Fatalf("Close 返回后进程 %d 仍存活", pid)
++	}
++	if err := m.Start("dummy.yaml"); !errors.Is(err, ErrManagerClosed) {
++		t.Fatalf("Close 后 Start 应返回 ErrManagerClosed，实际 %v", err)
++	}
++}
++
++// Start 正在等待 API 就绪时 Stop 介入：Stop 必须等待启动事务超时清理，
++// 不能把“Starting”误判为已停止。
++func TestStopWhileWaitingAPIReady(t *testing.T) {
++	m := newFakeManager(t, "sleep")
++	addr := freeAddr(t)
++	m.SetStartupValidation(addr, func(context.Context) error {
++		return errProbe
++	}, 300*time.Millisecond)
++
++	var wg sync.WaitGroup
++	wg.Add(2)
++	var startErr, stopErr error
++	go func() {
++		defer wg.Done()
++		startErr = m.Start("dummy.yaml")
++	}()
++	go func() {
++		defer wg.Done()
++		stopErr = m.Stop()
++	}()
++	wg.Wait()
++
++	if !errors.Is(startErr, ErrStartTimeout) {
++		t.Fatalf("Start 应因 API 超时失败，实际 %v", startErr)
++	}
++	if stopErr != nil {
++		t.Fatalf("Stop 失败: %v", stopErr)
++	}
++	if m.IsRunning() {
++		t.Fatal("最终不应有内核在运行")
++	}
++	if st := m.Status(); st.PID != 0 {
++		t.Fatalf("启动失败后 PID 应清空，实际 %d", st.PID)
++	}
++}
++
++// Restart 必须等旧进程真正退出后才创建新进程。
++func TestRestartWaitsForOldProcessExit(t *testing.T) {
++	m := newFakeManager(t, "sleep")
++	if err := m.Start("dummy.yaml"); err != nil {
++		t.Fatal(err)
++	}
++	oldPID := m.Status().PID
++	if oldPID <= 0 {
++		t.Fatal("旧进程 PID 无效")
++	}
++	if err := m.Restart("dummy.yaml"); err != nil {
++		t.Fatal(err)
++	}
++	newPID := m.Status().PID
++	if newPID <= 0 || newPID == oldPID {
++		t.Fatalf("Restart 后 PID 应变化：old=%d new=%d", oldPID, newPID)
++	}
++	if processAlive(oldPID) {
++		t.Fatalf("Restart 返回后旧进程 %d 仍存活", oldPID)
++	}
++}
++
++// 成功启动的进程必须明确记录已加入 Job Object。
++func TestJobAttachedForStartedProcess(t *testing.T) {
++	m := newFakeManager(t, "sleep")
++	if err := m.Start("dummy.yaml"); err != nil {
++		t.Fatal(err)
++	}
++	if !m.JobAttached() {
++		t.Fatal("启动成功的进程应已加入 Job Object")
++	}
++	if err := m.Stop(); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/internal/kernel/manager.go b/internal/kernel/manager.go
+index a88c49f..eed41ed 100644
+--- a/internal/kernel/manager.go
++++ b/internal/kernel/manager.go
+@@ -78,6 +78,8 @@ type processRun struct {
+ 	intentional bool
+ 	// exitErr 在 close(exited) 前写入，读取方需等待 done。
+ 	exitErr error
++	// jobAttached 表示该进程已成功加入 Manager 的 Job Object。
++	jobAttached bool
+ }
+ 
+ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+@@ -247,6 +249,10 @@ type Manager struct {
+ 	// 升级后的首次启动失败时用它回滚；只在同一次进程内有效。
+ 	lastBackup string
+ 
++	// hook 仅用于测试注入确定性 barrier（process-started / before-running）。
++	// 生产环境为 nil，不参与生命周期判断。
++	hook func(stage string)
++
+ 	Logs *LogBuffer
+ }
+ 
+@@ -373,11 +379,12 @@ func (m *Manager) startLocked(configPath string) error {
+ 	}
+ 
+ 	r := &processRun{
+-		cmd:     cmd,
+-		pid:     cmd.Process.Pid,
+-		started: time.Now(),
+-		exited:  make(chan struct{}),
+-		done:    make(chan struct{}),
++		cmd:         cmd,
++		pid:         cmd.Process.Pid,
++		started:     time.Now(),
++		exited:      make(chan struct{}),
++		done:        make(chan struct{}),
++		jobAttached: m.job != nil,
+ 	}
+ 	m.mu.Lock()
+ 	m.run = r
+@@ -386,6 +393,8 @@ func (m *Manager) startLocked(configPath string) error {
+ 	// 唯一的 Wait 调用点。进程自然退出时在这里收尾。
+ 	go m.waitProcess(r, w)
+ 
++	m.callHook("process-started")
++
+ 	// 进程存活不等于启动成功：必须等控制 API 真正可用。
+ 	if probe != nil {
+ 		if err := m.awaitReady(r, probe, timeout); err != nil {
+@@ -393,6 +402,8 @@ func (m *Manager) startLocked(configPath string) error {
+ 		}
+ 	}
+ 
++	m.callHook("before-running")
++
+ 	m.mu.Lock()
+ 	if m.run != r {
+ 		// 进程在探测成功与状态切换之间退出：这仍然是一次启动失败。
+@@ -629,6 +640,19 @@ func (m *Manager) IsRunning() bool {
+ 	return m.state == StateRunning
+ }
+ 
++// JobAttached 返回当前进程是否已成功加入 Job Object。
++func (m *Manager) JobAttached() bool {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return m.run != nil && m.run.jobAttached
++}
++
++func (m *Manager) callHook(stage string) {
++	if m.hook != nil {
++		m.hook(stage)
++	}
++}
++
+ func (m *Manager) Status() Status {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+diff --git a/internal/kernel/watchdog_test.go b/internal/kernel/watchdog_test.go
+index 8c54f5d..388c113 100644
+--- a/internal/kernel/watchdog_test.go
++++ b/internal/kernel/watchdog_test.go
+@@ -51,6 +51,30 @@ func TestWatchdogSingleRestartForBurst(t *testing.T) {
+ 	}
+ }
+ 
++// Stop 必须取消已经排队的重启，用于程序退出/Shutdown。
++func TestWatchdogStopCancelsPendingRestart(t *testing.T) {
++	var restarts int32
++	w := NewWatchdog(WatchdogOptions{
++		Config: WatchdogConfig{
++			Window:      time.Hour,
++			MaxRestarts: 5,
++			BaseDelay:   60 * time.Millisecond,
++			MaxDelay:    time.Second,
++			StableAfter: time.Hour,
++		},
++		Restart: func() error {
++			atomic.AddInt32(&restarts, 1)
++			return nil
++		},
++	})
++	w.ReportExit(ExitInfo{Reason: "boom", At: time.Now()})
++	w.Stop()
++	time.Sleep(150 * time.Millisecond)
++	if got := atomic.LoadInt32(&restarts); got != 0 {
++		t.Fatalf("Stop 后仍执行了 %d 次重启", got)
++	}
++}
++
+ // 用户主动退出（Stop 之后）不得再触发重启。
+ func TestWatchdogStopsOnUserExit(t *testing.T) {
+ 	var restarts int32
+diff --git a/service.go b/service.go
+index 2830e0a..c864c95 100644
+--- a/service.go
++++ b/service.go
+@@ -92,6 +92,9 @@ var dataDirOverride string
+ // writeFileAtomic 允许测试注入写失败。生产实现见 atomicWriteFile。
+ var writeFileAtomic = atomicWriteFile
+ 
++// removeProxyState 单独抽出来，便于测试“恢复成功但删除备份失败”的分支。
++var removeProxyState = os.Remove
++
+ // processTargetPrefix 是进程规则里"指定节点/策略组"的值前缀。
+ // 例：target:NodeA。direct / proxy / follow 仍用原来的短值。
+ const processTargetPrefix = "target:"
+@@ -169,6 +172,23 @@ type CoreService struct {
+ 	// 的域名后缀规则，顺序即匹配顺序。
+ 	smartRouting bool
+ 	siteRules    []SiteRule
++
++	// 生命周期串行化：Service 层的 Start/Stop/Restart/Shutdown 也必须
++	// 串行，Manager 的进程锁不能保护 afterStart 这类异步副作用。
++	lifeMu       sync.Mutex
++	shuttingDown bool
++
++	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
++	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
++	gen       uint64
++	genCancel context.CancelFunc
++
++	// afterStart 异步任务登记。Shutdown 会关闭入口并等待全部任务结束。
++	afterMu     sync.Mutex
++	afterWG     sync.WaitGroup
++	afterClosed bool
++	// afterVersionHook 仅用于测试：在 API /version 成功后、读取端口前插入 barrier。
++	afterVersionHook func()
+ 	// 用户明确选择"不再提示"的进程。
+ 	ignored map[string]bool
+ 
+@@ -583,11 +603,12 @@ func (s *CoreService) Boot() {
+ 		return
+ 	}
+ 
++	gen, genCtx := s.beginKernelGeneration()
+ 	s.startAutoUpdate()
+ 	s.startHistorySampler()
+ 	s.startKernelWatchdog()
+ 	s.startNetworkHealthCheck()
+-	s.afterStart()
++	s.afterStart(gen, genCtx)
+ }
+ 
+ // options 汇总当前端口与密钥，供生成配置使用。
+@@ -906,19 +927,91 @@ func (s *CoreService) selectProcessTargets() {
+ 	}
+ }
+ 
++// beginKernelGeneration 为一次成功启动生成新代际。
++// 旧代际的 context 会被取消，旧 afterStart 任务不会继续产生副作用。
++func (s *CoreService) beginKernelGeneration() (uint64, context.Context) {
++	ctx, cancel := context.WithCancel(context.Background())
++	s.mu.Lock()
++	if s.genCancel != nil {
++		s.genCancel()
++	}
++	s.gen++
++	gen := s.gen
++	s.genCancel = cancel
++	s.mu.Unlock()
++	return gen, ctx
++}
++
++// invalidateKernelGeneration 让当前启动代际失效。
++func (s *CoreService) invalidateKernelGeneration() {
++	s.mu.Lock()
++	s.gen++
++	if s.genCancel != nil {
++		s.genCancel()
++		s.genCancel = nil
++	}
++	s.mu.Unlock()
++}
++
++// generationCurrent 判断异步任务是否仍属于当前内核实例。
++func (s *CoreService) generationCurrent(gen uint64, ctx context.Context) bool {
++	if ctx.Err() != nil {
++		return false
++	}
++	s.mu.RLock()
++	ok := s.gen == gen && !s.quitting && !s.shuttingDown
++	s.mu.RUnlock()
++	return ok
++}
++
++// spawnAfterTask 登记并启动一个 afterStart 任务。
++// Shutdown 关闭入口后不再接受新任务，并会等待已登记任务退出。
++func (s *CoreService) spawnAfterTask(gen uint64, parent context.Context, fn func(context.Context)) {
++	s.afterMu.Lock()
++	if s.afterClosed {
++		s.afterMu.Unlock()
++		return
++	}
++	s.afterWG.Add(1)
++	s.afterMu.Unlock()
++
++	go func() {
++		defer s.afterWG.Done()
++		fn(parent)
++	}()
++}
++
++// waitAfterTasks 等待已登记的 afterStart 任务结束。
++// closeGate=true 用于 Shutdown，永久禁止后续任务。
++func (s *CoreService) waitAfterTasks(closeGate bool) {
++	if closeGate {
++		s.afterMu.Lock()
++		s.afterClosed = true
++		s.afterMu.Unlock()
++	}
++	s.afterWG.Wait()
++}
++
+ // afterStart 等内核就绪后，把真实监听端口同步回来。
+ //
+ // mihomo 在端口被占用时会自动顺延（7890 → 7891），配置里写的端口因此
+ // 不一定是它真正监听的端口。如果系统代理指向一个没人监听的端口，
+ // 用户的表现就是"一开代理就断网"。所以必须以内核自报为准。
+-func (s *CoreService) afterStart() {
++//
++// 所有阻塞步骤前后都验证 generation；Stop/Restart/Shutdown 会取消旧代际
++// 并等待任务退出，防止晚到的任务修改新实例或恢复后的代理状态。
++func (s *CoreService) afterStart(gen uint64, parent context.Context) {
+ 	if s.api == nil {
+ 		return
+ 	}
+-	go func() {
+-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	s.spawnAfterTask(gen, parent, func(parent context.Context) {
++		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+ 		defer cancel()
++
+ 		for {
++			if !s.generationCurrent(gen, ctx) {
++				return
++			}
+ 			if _, err := s.api.Version(ctx); err == nil {
+ 				break
+ 			}
+@@ -928,33 +1021,61 @@ func (s *CoreService) afterStart() {
+ 			case <-time.After(200 * time.Millisecond):
+ 			}
+ 		}
++
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
++		if s.afterVersionHook != nil {
++			s.afterVersionHook()
++		}
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
+ 		cfg, err := s.api.Configs(ctx)
+ 		if err != nil || cfg.MixedPort <= 0 {
+ 			return
+ 		}
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
++
+ 		s.mu.Lock()
++		if s.gen != gen {
++			s.mu.Unlock()
++			return
++		}
+ 		changed := s.mixedPort != cfg.MixedPort
+ 		s.mixedPort = cfg.MixedPort
+-		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
+ 		proxyOn := s.proxyOn
+ 		s.mu.Unlock()
++
++		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
+ 		if changed && proxyOn {
+-			_ = sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort))
++			if !s.generationCurrent(gen, ctx) {
++				return
++			}
++			if err := sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)); err != nil {
++				s.dbg("afterStart: update proxy port failed: %v", err)
++				s.appendBootErr("系统代理端口校正失败: " + err.Error())
++			}
+ 		}
+ 
+-		// 校正系统代理：确保它指向内核这次真正监听的端口。
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
+ 		s.reconcileProxy()
+ 
+ 		// 恢复上次退出时的接管状态。
+ 		// TUN 的配置在生成阶段已经带上，这里只同步标记；
+-		// 系统代理要显式开一次（reconcileProxy 只处理代理重启前后的状态，
+-		// 处理不了"用户上次主动开着、这次要重新打开"）。
+-		//
+-		// 这两个标志只在启动阶段消费一次。若不清零，会话中用户主动关掉的
+-		// TUN / 系统代理会在任意一次内核重启后按旧快照被重新打开；TUN 更糟：
+-		// 配置是按当前 tunOn 生成的（不含 TUN），这里却把 tunOn 置回 true，
+-		// 界面显示"已接管"，实际流量并没有走 TUN。
++		// 系统代理要显式开一次。
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
+ 		s.mu.Lock()
++		if s.gen != gen {
++			s.mu.Unlock()
++			return
++		}
+ 		wantTUN := s.restoreTUN && s.admin()
+ 		wantProxy := s.restoreProxy
+ 		s.restoreTUN = false
+@@ -962,17 +1083,26 @@ func (s *CoreService) afterStart() {
+ 		s.mu.Unlock()
+ 
+ 		if wantTUN {
+-			s.mu.Lock()
+-			s.tunOn = true
+-			s.mu.Unlock()
+-		} else if wantProxy {
+-			_ = s.SetSystemProxy(true)
++			if s.generationCurrent(gen, ctx) {
++				s.mu.Lock()
++				if s.gen == gen {
++					s.tunOn = true
++				}
++				s.mu.Unlock()
++			}
++		} else if wantProxy && s.generationCurrent(gen, ctx) {
++			if err := s.SetSystemProxy(true); err != nil {
++				s.dbg("afterStart: restore system proxy failed: %v", err)
++				s.appendBootErr("恢复系统代理失败: " + err.Error())
++			}
+ 		}
+ 
+-		// 进程指定到 provider 节点的隐藏组需要显式选中；
+-		// 显式节点组也会统一补一次，保证与持久化映射一致。
++		if !s.generationCurrent(gen, ctx) {
++			return
++		}
++		// 进程/网站指定到 provider 节点的隐藏组需要显式选中。
+ 		s.selectProcessTargets()
+-	}()
++	})
+ }
+ 
+ func (s *CoreService) setBootErr(msg string) {
+@@ -1045,16 +1175,26 @@ func (s *CoreService) Attach(app *application.App) { s.app = app }
+ // 退出阶段的恢复失败无法阻止进程结束，但备份与 Pending 标记必须保留，
+ // 下次启动会优先重试，避免网络配置永久停留在死端口。
+ func (s *CoreService) Shutdown() {
+-	s.mu.RLock()
++	s.lifeMu.Lock()
++	defer s.lifeMu.Unlock()
++
++	s.mu.Lock()
++	s.shuttingDown = true
+ 	wd := s.watchdog
+ 	mgr := s.mgr
+ 	api := s.api
+-	s.mu.RUnlock()
++	s.mu.Unlock()
++
+ 	// 退出期间绝不允许看门狗再拉起内核。
+ 	if wd != nil {
+ 		wd.Stop()
+ 	}
+ 
++	// 关闭 afterStart 入口、取消当前代际，并等待已进入执行阶段的任务。
++	// 不能只取消 context：注册表/代理副作用一旦开始，必须等它结束。
++	s.invalidateKernelGeneration()
++	s.waitAfterTasks(true)
++
+ 	if err := s.restoreSystemProxy(); err != nil {
+ 		s.dbg("shutdown: restore system proxy failed, backup kept: %v", err)
+ 	}
+@@ -1136,9 +1276,29 @@ func (s *CoreService) clearVersionCache() {
+ // ---------- 内核控制 ----------
+ 
+ func (s *CoreService) StartKernel() error {
++	s.lifeMu.Lock()
++	defer s.lifeMu.Unlock()
++
++	if s.Quitting() || s.IsShuttingDown() {
++		return fmt.Errorf("程序正在退出，拒绝启动内核")
++	}
+ 	if s.mgr == nil {
+ 		return fmt.Errorf("内核管理器未初始化")
+ 	}
++
++	// 已在运行/启动中时不要使当前代际失效，否则会打断正在执行的
++	// afterStart 端口校正。由 Manager 做最终的原子状态检查。
++	switch s.mgr.Status().State {
++	case kernel.StateRunning, kernel.StateStarting:
++		return fmt.Errorf("%w（当前状态 %s）", kernel.ErrAlreadyRunning, s.mgr.Status().State)
++	case kernel.StateStopping:
++		return kernel.ErrLifecycleBusy
++	}
++
++	// 新启动前先让旧代际失效，并等待旧 afterStart 任务退出。
++	s.invalidateKernelGeneration()
++	s.waitAfterTasks(false)
++
+ 	confPath, err := configgen.Write(dataDir(), s.options())
+ 	if err != nil {
+ 		return err
+@@ -1146,17 +1306,19 @@ func (s *CoreService) StartKernel() error {
+ 	if err := s.mgr.Start(confPath); err != nil {
+ 		return err
+ 	}
++
++	gen, genCtx := s.beginKernelGeneration()
+ 	s.clearVersionCache()
+ 	s.invalidateConnCache()
+ 	s.resumeWatchdog()
+-	s.afterStart()
++	s.afterStart(gen, genCtx)
+ 	return nil
+ }
+ 
+ func (s *CoreService) StopKernel() error {
+-	if s.mgr == nil {
+-		return nil
+-	}
++	s.lifeMu.Lock()
++	defer s.lifeMu.Unlock()
++
+ 	if pc, file, line, ok := runtime.Caller(1); ok {
+ 		fn := runtime.FuncForPC(pc)
+ 		name := "?"
+@@ -1165,10 +1327,22 @@ func (s *CoreService) StopKernel() error {
+ 		}
+ 		s.dbg("StopKernel <- %s (%s:%d)", name, filepath.Base(file), line)
+ 	}
++
++	// 先使代际失效并等待旧异步任务退出，避免 afterStart 在代理恢复后
++	// 又把代理打开。等待结束前不停止内核，状态保持一致。
++	s.invalidateKernelGeneration()
++	s.waitAfterTasks(false)
++
++	if s.mgr == nil {
++		return nil
++	}
+ 	// 先恢复系统代理，避免关了内核还挂着代理导致断网。
+ 	// 恢复失败时必须中止停止流程：此时内核还在运行，代理仍可用；
+ 	// 强行停内核只会留下一个指向死端口的系统代理。
+ 	if err := s.SetSystemProxy(false); err != nil {
++		// 内核仍在运行，恢复一个新的代际让端口/代理校正任务继续工作。
++		gen, genCtx := s.beginKernelGeneration()
++		s.afterStart(gen, genCtx)
+ 		return fmt.Errorf("无法恢复系统代理，已中止停止内核: %w", err)
+ 	}
+ 	s.clearVersionCache()
+@@ -1191,6 +1365,12 @@ func (s *CoreService) RestartKernel() error {
+ // restartKernel 的 manual 为 false 时表示由看门狗触发，不能清零失败计数，
+ // 否则「启动即崩」会因每次重启都清零而无限重试。
+ func (s *CoreService) restartKernel(manual bool) error {
++	s.lifeMu.Lock()
++	defer s.lifeMu.Unlock()
++
++	if s.Quitting() || s.IsShuttingDown() {
++		return fmt.Errorf("程序正在退出，取消重启")
++	}
+ 	if s.mgr == nil {
+ 		return fmt.Errorf("内核管理器未初始化")
+ 	}
+@@ -1203,6 +1383,12 @@ func (s *CoreService) restartKernel(manual bool) error {
+ 		}
+ 		s.dbg("RestartKernel <- %s (%s:%d)", name, filepath.Base(file), line)
+ 	}
++
++	// Restart 是完整生命周期事务：先取消旧代际并等待异步任务，
++	// 再由 Manager 串行完成 Stop + Start。
++	s.invalidateKernelGeneration()
++	s.waitAfterTasks(false)
++
+ 	confPath, err := configgen.Write(dataDir(), s.options())
+ 	if err != nil {
+ 		return err
+@@ -1210,6 +1396,8 @@ func (s *CoreService) restartKernel(manual bool) error {
+ 	if err := s.mgr.Restart(confPath); err != nil {
+ 		return err
+ 	}
++
++	gen, genCtx := s.beginKernelGeneration()
+ 	s.clearVersionCache()
+ 	s.invalidateConnCache()
+ 	if s.api != nil {
+@@ -1218,7 +1406,7 @@ func (s *CoreService) restartKernel(manual bool) error {
+ 	if manual {
+ 		s.resumeWatchdog()
+ 	}
+-	s.afterStart()
++	s.afterStart(gen, genCtx)
+ 	return nil
+ }
+ 
+@@ -1419,7 +1607,7 @@ func (s *CoreService) restoreSystemProxy() error {
+ 	if err := s.verifyProxySnapshot(bk); err != nil {
+ 		return fmt.Errorf("恢复系统代理后校验失败（备份已保留）: %w", err)
+ 	}
+-	if err := os.Remove(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
++	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
+ 		return fmt.Errorf("删除系统代理备份失败（恢复已完成，下次将继续校验）: %w", err)
+ 	}
+ 
+@@ -1601,7 +1789,7 @@ func (s *CoreService) reconcileProxy() {
+ 			s.saveAppState()
+ 			return
+ 		}
+-		_ = os.Remove(s.proxyStatePath())
++		_ = removeProxyState(s.proxyStatePath())
+ 		s.mu.Lock()
+ 		s.proxyOn = false
+ 		s.backup = proxyBackup{}
+@@ -1622,7 +1810,7 @@ func (s *CoreService) reconcileProxy() {
+ 		// 外部软件/用户改了系统代理。以当前注册表为准，放弃我们旧的备份，
+ 		// 否则退出时会把用户的新设置覆盖回接管前的值。
+ 		s.dbg("system proxy changed externally to %s, relinquish takeover", cur)
+-		_ = os.Remove(s.proxyStatePath())
++		_ = removeProxyState(s.proxyStatePath())
+ 		s.mu.Lock()
+ 		s.proxyOn = false
+ 		s.backup = proxyBackup{}
+@@ -1803,6 +1991,13 @@ func (s *CoreService) Quitting() bool {
+ 	return s.quitting
+ }
+ 
++// IsShuttingDown 表示 Shutdown 已开始，任何新的生命周期操作都应拒绝。
++func (s *CoreService) IsShuttingDown() bool {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.shuttingDown
++}
++
+ func (s *CoreService) MarkQuitting() {
+ 	s.mu.Lock()
+ 	s.quitting = true
+@@ -1812,6 +2007,8 @@ func (s *CoreService) MarkQuitting() {
+ 	if wd != nil {
+ 		wd.Stop()
+ 	}
++	// 取消正在执行的 afterStart；Shutdown 还会等待它真正结束。
++	s.invalidateKernelGeneration()
+ }
+ 
+ // ---------- 配置备份 ----------
+@@ -2013,10 +2210,13 @@ func (s *CoreService) startKernelWatchdog() {
+ 				return
+ 			}
+ 			// 内核已无法自动恢复，系统代理若还指向它会让整台机器断网。
+-			// 优先还原成用户的原始代理设置，失败时保留备份等下次启动重试。
++			// WinINET 与 WinHTTP 都要还原；失败时保留备份等下次启动重试。
+ 			if err := s.restoreSystemProxy(); err != nil {
+ 				s.dbg("watchdog exhausted: restore system proxy failed: %v", err)
+ 			}
++			if err := s.restoreWinHTTPIfPending(); err != nil {
++				s.dbg("watchdog exhausted: restore WinHTTP failed: %v", err)
++			}
+ 			if s.app != nil {
+ 				s.app.Event.Emit("kernel-crashed", message)
+ 			}
+diff --git a/service_generation_test.go b/service_generation_test.go
+new file mode 100644
+index 0000000..561d194
+--- /dev/null
++++ b/service_generation_test.go
+@@ -0,0 +1,155 @@
++package main
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"routepilot/internal/kernel"
++)
++
++// 旧代际被取消后，晚到的任务不能再被判定为当前实例。
++func TestGenerationInvalidation(t *testing.T) {
++	svc := NewCoreService()
++	gen1, ctx1 := svc.beginKernelGeneration()
++	if !svc.generationCurrent(gen1, ctx1) {
++		t.Fatal("新代际应有效")
++	}
++	svc.invalidateKernelGeneration()
++	if svc.generationCurrent(gen1, ctx1) {
++		t.Fatal("invalidate 后旧代际必须失效")
++	}
++	gen2, ctx2 := svc.beginKernelGeneration()
++	if gen2 == gen1 || !svc.generationCurrent(gen2, ctx2) {
++		t.Fatalf("应生成新的有效代际：old=%d new=%d", gen1, gen2)
++	}
++	svc.invalidateKernelGeneration()
++}
++
++// 旧 afterStart 延迟返回时不能修改新实例状态。
++func TestStaleAfterTaskCannotMutateNewGeneration(t *testing.T) {
++	svc := NewCoreService()
++	gen1, ctx1 := svc.beginKernelGeneration()
++	release := make(chan struct{})
++	var mutated int32
++
++	svc.spawnAfterTask(gen1, ctx1, func(context.Context) {
++		<-release
++		if svc.generationCurrent(gen1, ctx1) {
++			atomic.AddInt32(&mutated, 1)
++		}
++	})
++	// 模拟新内核启动。
++	svc.invalidateKernelGeneration()
++	_, _ = svc.beginKernelGeneration()
++	close(release)
++	svc.waitAfterTasks(false)
++
++	if atomic.LoadInt32(&mutated) != 0 {
++		t.Fatal("旧任务在代际失效后仍修改了状态")
++	}
++}
++
++// 旧 afterStart 在 /version 成功后延迟返回，此时新内核已启动；
++// 它不能再读取端口、修改 mixedPort 或系统代理。
++func TestStaleAfterStartCannotReadNewInstance(t *testing.T) {
++	var configs int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/version":
++			_, _ = w.Write([]byte(`{"version":"v1"}`))
++		case "/configs":
++			atomic.AddInt32(&configs, 1)
++			_, _ = w.Write([]byte(`{"mixed-port":19999,"mode":"rule"}`))
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer srv.Close()
++
++	svc := NewCoreService()
++	svc.api = kernel.NewClient(srv.Listener.Addr().String(), "")
++	svc.mixedPort = 17890
++
++	ready := make(chan struct{})
++	release := make(chan struct{})
++	svc.afterVersionHook = func() {
++		close(ready)
++		<-release
++	}
++
++	gen1, ctx1 := svc.beginKernelGeneration()
++	svc.afterStart(gen1, ctx1)
++	select {
++	case <-ready:
++	case <-time.After(2 * time.Second):
++		t.Fatal("afterStart 未到达 /version 成功点")
++	}
++
++	// 模拟新内核启动，旧代际立即失效。
++	gen2, ctx2 := svc.beginKernelGeneration()
++	close(release)
++	svc.waitAfterTasks(false)
++
++	if got := atomic.LoadInt32(&configs); got != 0 {
++		t.Fatalf("旧任务在失效后仍读取了新实例配置：%d 次", got)
++	}
++	svc.mu.RLock()
++	port := svc.mixedPort
++	svc.mu.RUnlock()
++	if port != 17890 {
++		t.Fatalf("旧任务修改了端口：%d", port)
++	}
++
++	svc.invalidateKernelGeneration()
++	if svc.generationCurrent(gen2, ctx2) {
++		t.Fatal("清理后代际应失效")
++	}
++}
++
++// Shutdown 必须等待已进入执行阶段的任务结束，并拒绝新任务。
++func TestShutdownWaitsForAfterTasksAndClosesGate(t *testing.T) {
++	oldDir := dataDirOverride
++	dataDirOverride = t.TempDir()
++	t.Cleanup(func() { dataDirOverride = oldDir })
++
++	svc := NewCoreService()
++	gen, ctx := svc.beginKernelGeneration()
++	started := make(chan struct{})
++	finished := make(chan struct{})
++
++	svc.spawnAfterTask(gen, ctx, func(c context.Context) {
++		close(started)
++		<-c.Done()
++		close(finished)
++	})
++	<-started
++
++	shutdownDone := make(chan struct{})
++	go func() {
++		svc.Shutdown()
++		close(shutdownDone)
++	}()
++
++	select {
++	case <-finished:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Shutdown 未取消 afterStart 任务")
++	}
++	select {
++	case <-shutdownDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Shutdown 未等待 afterStart 任务结束")
++	}
++
++	ran := make(chan struct{}, 1)
++	svc.spawnAfterTask(999, context.Background(), func(context.Context) { ran <- struct{}{} })
++	select {
++	case <-ran:
++		t.Fatal("Shutdown 后仍接受了新的 afterStart 任务")
++	default:
++	}
++}

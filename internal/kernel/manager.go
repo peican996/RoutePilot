@@ -78,6 +78,8 @@ type processRun struct {
 	intentional bool
 	// exitErr 在 close(exited) 前写入，读取方需等待 done。
 	exitErr error
+	// jobAttached 表示该进程已成功加入 Manager 的 Job Object。
+	jobAttached bool
 }
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
@@ -247,6 +249,10 @@ type Manager struct {
 	// 升级后的首次启动失败时用它回滚；只在同一次进程内有效。
 	lastBackup string
 
+	// hook 仅用于测试注入确定性 barrier（process-started / before-running）。
+	// 生产环境为 nil，不参与生命周期判断。
+	hook func(stage string)
+
 	Logs *LogBuffer
 }
 
@@ -373,11 +379,12 @@ func (m *Manager) startLocked(configPath string) error {
 	}
 
 	r := &processRun{
-		cmd:     cmd,
-		pid:     cmd.Process.Pid,
-		started: time.Now(),
-		exited:  make(chan struct{}),
-		done:    make(chan struct{}),
+		cmd:         cmd,
+		pid:         cmd.Process.Pid,
+		started:     time.Now(),
+		exited:      make(chan struct{}),
+		done:        make(chan struct{}),
+		jobAttached: m.job != nil,
 	}
 	m.mu.Lock()
 	m.run = r
@@ -386,12 +393,16 @@ func (m *Manager) startLocked(configPath string) error {
 	// 唯一的 Wait 调用点。进程自然退出时在这里收尾。
 	go m.waitProcess(r, w)
 
+	m.callHook("process-started")
+
 	// 进程存活不等于启动成功：必须等控制 API 真正可用。
 	if probe != nil {
 		if err := m.awaitReady(r, probe, timeout); err != nil {
 			return m.abortStart(r, err)
 		}
 	}
+
+	m.callHook("before-running")
 
 	m.mu.Lock()
 	if m.run != r {
@@ -627,6 +638,19 @@ func (m *Manager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.state == StateRunning
+}
+
+// JobAttached 返回当前进程是否已成功加入 Job Object。
+func (m *Manager) JobAttached() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.run != nil && m.run.jobAttached
+}
+
+func (m *Manager) callHook(stage string) {
+	if m.hook != nil {
+		m.hook(stage)
+	}
 }
 
 func (m *Manager) Status() Status {

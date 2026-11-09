@@ -92,6 +92,9 @@ var dataDirOverride string
 // writeFileAtomic 允许测试注入写失败。生产实现见 atomicWriteFile。
 var writeFileAtomic = atomicWriteFile
 
+// removeProxyState 单独抽出来，便于测试“恢复成功但删除备份失败”的分支。
+var removeProxyState = os.Remove
+
 // processTargetPrefix 是进程规则里"指定节点/策略组"的值前缀。
 // 例：target:NodeA。direct / proxy / follow 仍用原来的短值。
 const processTargetPrefix = "target:"
@@ -169,6 +172,23 @@ type CoreService struct {
 	// 的域名后缀规则，顺序即匹配顺序。
 	smartRouting bool
 	siteRules    []SiteRule
+
+	// 生命周期串行化：Service 层的 Start/Stop/Restart/Shutdown 也必须
+	// 串行，Manager 的进程锁不能保护 afterStart 这类异步副作用。
+	lifeMu       sync.Mutex
+	shuttingDown bool
+
+	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
+	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
+	gen       uint64
+	genCancel context.CancelFunc
+
+	// afterStart 异步任务登记。Shutdown 会关闭入口并等待全部任务结束。
+	afterMu     sync.Mutex
+	afterWG     sync.WaitGroup
+	afterClosed bool
+	// afterVersionHook 仅用于测试：在 API /version 成功后、读取端口前插入 barrier。
+	afterVersionHook func()
 	// 用户明确选择"不再提示"的进程。
 	ignored map[string]bool
 
@@ -583,11 +603,12 @@ func (s *CoreService) Boot() {
 		return
 	}
 
+	gen, genCtx := s.beginKernelGeneration()
 	s.startAutoUpdate()
 	s.startHistorySampler()
 	s.startKernelWatchdog()
 	s.startNetworkHealthCheck()
-	s.afterStart()
+	s.afterStart(gen, genCtx)
 }
 
 // options 汇总当前端口与密钥，供生成配置使用。
@@ -906,19 +927,91 @@ func (s *CoreService) selectProcessTargets() {
 	}
 }
 
+// beginKernelGeneration 为一次成功启动生成新代际。
+// 旧代际的 context 会被取消，旧 afterStart 任务不会继续产生副作用。
+func (s *CoreService) beginKernelGeneration() (uint64, context.Context) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	if s.genCancel != nil {
+		s.genCancel()
+	}
+	s.gen++
+	gen := s.gen
+	s.genCancel = cancel
+	s.mu.Unlock()
+	return gen, ctx
+}
+
+// invalidateKernelGeneration 让当前启动代际失效。
+func (s *CoreService) invalidateKernelGeneration() {
+	s.mu.Lock()
+	s.gen++
+	if s.genCancel != nil {
+		s.genCancel()
+		s.genCancel = nil
+	}
+	s.mu.Unlock()
+}
+
+// generationCurrent 判断异步任务是否仍属于当前内核实例。
+func (s *CoreService) generationCurrent(gen uint64, ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	s.mu.RLock()
+	ok := s.gen == gen && !s.quitting && !s.shuttingDown
+	s.mu.RUnlock()
+	return ok
+}
+
+// spawnAfterTask 登记并启动一个 afterStart 任务。
+// Shutdown 关闭入口后不再接受新任务，并会等待已登记任务退出。
+func (s *CoreService) spawnAfterTask(gen uint64, parent context.Context, fn func(context.Context)) {
+	s.afterMu.Lock()
+	if s.afterClosed {
+		s.afterMu.Unlock()
+		return
+	}
+	s.afterWG.Add(1)
+	s.afterMu.Unlock()
+
+	go func() {
+		defer s.afterWG.Done()
+		fn(parent)
+	}()
+}
+
+// waitAfterTasks 等待已登记的 afterStart 任务结束。
+// closeGate=true 用于 Shutdown，永久禁止后续任务。
+func (s *CoreService) waitAfterTasks(closeGate bool) {
+	if closeGate {
+		s.afterMu.Lock()
+		s.afterClosed = true
+		s.afterMu.Unlock()
+	}
+	s.afterWG.Wait()
+}
+
 // afterStart 等内核就绪后，把真实监听端口同步回来。
 //
 // mihomo 在端口被占用时会自动顺延（7890 → 7891），配置里写的端口因此
 // 不一定是它真正监听的端口。如果系统代理指向一个没人监听的端口，
 // 用户的表现就是"一开代理就断网"。所以必须以内核自报为准。
-func (s *CoreService) afterStart() {
+//
+// 所有阻塞步骤前后都验证 generation；Stop/Restart/Shutdown 会取消旧代际
+// 并等待任务退出，防止晚到的任务修改新实例或恢复后的代理状态。
+func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 	if s.api == nil {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	s.spawnAfterTask(gen, parent, func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 		defer cancel()
+
 		for {
+			if !s.generationCurrent(gen, ctx) {
+				return
+			}
 			if _, err := s.api.Version(ctx); err == nil {
 				break
 			}
@@ -928,33 +1021,61 @@ func (s *CoreService) afterStart() {
 			case <-time.After(200 * time.Millisecond):
 			}
 		}
+
+		if !s.generationCurrent(gen, ctx) {
+			return
+		}
+		if s.afterVersionHook != nil {
+			s.afterVersionHook()
+		}
+		if !s.generationCurrent(gen, ctx) {
+			return
+		}
 		cfg, err := s.api.Configs(ctx)
 		if err != nil || cfg.MixedPort <= 0 {
 			return
 		}
-		s.mu.Lock()
-		changed := s.mixedPort != cfg.MixedPort
-		s.mixedPort = cfg.MixedPort
-		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
-		proxyOn := s.proxyOn
-		s.mu.Unlock()
-		if changed && proxyOn {
-			_ = sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort))
+		if !s.generationCurrent(gen, ctx) {
+			return
 		}
 
-		// 校正系统代理：确保它指向内核这次真正监听的端口。
+		s.mu.Lock()
+		if s.gen != gen {
+			s.mu.Unlock()
+			return
+		}
+		changed := s.mixedPort != cfg.MixedPort
+		s.mixedPort = cfg.MixedPort
+		proxyOn := s.proxyOn
+		s.mu.Unlock()
+
+		// 端口变化时如果系统代理已开着，得跟着改正，否则立刻断网。
+		if changed && proxyOn {
+			if !s.generationCurrent(gen, ctx) {
+				return
+			}
+			if err := sysproxy.Enable(fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)); err != nil {
+				s.dbg("afterStart: update proxy port failed: %v", err)
+				s.appendBootErr("系统代理端口校正失败: " + err.Error())
+			}
+		}
+
+		if !s.generationCurrent(gen, ctx) {
+			return
+		}
 		s.reconcileProxy()
 
 		// 恢复上次退出时的接管状态。
 		// TUN 的配置在生成阶段已经带上，这里只同步标记；
-		// 系统代理要显式开一次（reconcileProxy 只处理代理重启前后的状态，
-		// 处理不了"用户上次主动开着、这次要重新打开"）。
-		//
-		// 这两个标志只在启动阶段消费一次。若不清零，会话中用户主动关掉的
-		// TUN / 系统代理会在任意一次内核重启后按旧快照被重新打开；TUN 更糟：
-		// 配置是按当前 tunOn 生成的（不含 TUN），这里却把 tunOn 置回 true，
-		// 界面显示"已接管"，实际流量并没有走 TUN。
+		// 系统代理要显式开一次。
+		if !s.generationCurrent(gen, ctx) {
+			return
+		}
 		s.mu.Lock()
+		if s.gen != gen {
+			s.mu.Unlock()
+			return
+		}
 		wantTUN := s.restoreTUN && s.admin()
 		wantProxy := s.restoreProxy
 		s.restoreTUN = false
@@ -962,17 +1083,26 @@ func (s *CoreService) afterStart() {
 		s.mu.Unlock()
 
 		if wantTUN {
-			s.mu.Lock()
-			s.tunOn = true
-			s.mu.Unlock()
-		} else if wantProxy {
-			_ = s.SetSystemProxy(true)
+			if s.generationCurrent(gen, ctx) {
+				s.mu.Lock()
+				if s.gen == gen {
+					s.tunOn = true
+				}
+				s.mu.Unlock()
+			}
+		} else if wantProxy && s.generationCurrent(gen, ctx) {
+			if err := s.SetSystemProxy(true); err != nil {
+				s.dbg("afterStart: restore system proxy failed: %v", err)
+				s.appendBootErr("恢复系统代理失败: " + err.Error())
+			}
 		}
 
-		// 进程指定到 provider 节点的隐藏组需要显式选中；
-		// 显式节点组也会统一补一次，保证与持久化映射一致。
+		if !s.generationCurrent(gen, ctx) {
+			return
+		}
+		// 进程/网站指定到 provider 节点的隐藏组需要显式选中。
 		s.selectProcessTargets()
-	}()
+	})
 }
 
 func (s *CoreService) setBootErr(msg string) {
@@ -1045,15 +1175,25 @@ func (s *CoreService) Attach(app *application.App) { s.app = app }
 // 退出阶段的恢复失败无法阻止进程结束，但备份与 Pending 标记必须保留，
 // 下次启动会优先重试，避免网络配置永久停留在死端口。
 func (s *CoreService) Shutdown() {
-	s.mu.RLock()
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+
+	s.mu.Lock()
+	s.shuttingDown = true
 	wd := s.watchdog
 	mgr := s.mgr
 	api := s.api
-	s.mu.RUnlock()
+	s.mu.Unlock()
+
 	// 退出期间绝不允许看门狗再拉起内核。
 	if wd != nil {
 		wd.Stop()
 	}
+
+	// 关闭 afterStart 入口、取消当前代际，并等待已进入执行阶段的任务。
+	// 不能只取消 context：注册表/代理副作用一旦开始，必须等它结束。
+	s.invalidateKernelGeneration()
+	s.waitAfterTasks(true)
 
 	if err := s.restoreSystemProxy(); err != nil {
 		s.dbg("shutdown: restore system proxy failed, backup kept: %v", err)
@@ -1136,9 +1276,29 @@ func (s *CoreService) clearVersionCache() {
 // ---------- 内核控制 ----------
 
 func (s *CoreService) StartKernel() error {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+
+	if s.Quitting() || s.IsShuttingDown() {
+		return fmt.Errorf("程序正在退出，拒绝启动内核")
+	}
 	if s.mgr == nil {
 		return fmt.Errorf("内核管理器未初始化")
 	}
+
+	// 已在运行/启动中时不要使当前代际失效，否则会打断正在执行的
+	// afterStart 端口校正。由 Manager 做最终的原子状态检查。
+	switch s.mgr.Status().State {
+	case kernel.StateRunning, kernel.StateStarting:
+		return fmt.Errorf("%w（当前状态 %s）", kernel.ErrAlreadyRunning, s.mgr.Status().State)
+	case kernel.StateStopping:
+		return kernel.ErrLifecycleBusy
+	}
+
+	// 新启动前先让旧代际失效，并等待旧 afterStart 任务退出。
+	s.invalidateKernelGeneration()
+	s.waitAfterTasks(false)
+
 	confPath, err := configgen.Write(dataDir(), s.options())
 	if err != nil {
 		return err
@@ -1146,17 +1306,19 @@ func (s *CoreService) StartKernel() error {
 	if err := s.mgr.Start(confPath); err != nil {
 		return err
 	}
+
+	gen, genCtx := s.beginKernelGeneration()
 	s.clearVersionCache()
 	s.invalidateConnCache()
 	s.resumeWatchdog()
-	s.afterStart()
+	s.afterStart(gen, genCtx)
 	return nil
 }
 
 func (s *CoreService) StopKernel() error {
-	if s.mgr == nil {
-		return nil
-	}
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+
 	if pc, file, line, ok := runtime.Caller(1); ok {
 		fn := runtime.FuncForPC(pc)
 		name := "?"
@@ -1165,10 +1327,22 @@ func (s *CoreService) StopKernel() error {
 		}
 		s.dbg("StopKernel <- %s (%s:%d)", name, filepath.Base(file), line)
 	}
+
+	// 先使代际失效并等待旧异步任务退出，避免 afterStart 在代理恢复后
+	// 又把代理打开。等待结束前不停止内核，状态保持一致。
+	s.invalidateKernelGeneration()
+	s.waitAfterTasks(false)
+
+	if s.mgr == nil {
+		return nil
+	}
 	// 先恢复系统代理，避免关了内核还挂着代理导致断网。
 	// 恢复失败时必须中止停止流程：此时内核还在运行，代理仍可用；
 	// 强行停内核只会留下一个指向死端口的系统代理。
 	if err := s.SetSystemProxy(false); err != nil {
+		// 内核仍在运行，恢复一个新的代际让端口/代理校正任务继续工作。
+		gen, genCtx := s.beginKernelGeneration()
+		s.afterStart(gen, genCtx)
 		return fmt.Errorf("无法恢复系统代理，已中止停止内核: %w", err)
 	}
 	s.clearVersionCache()
@@ -1191,6 +1365,12 @@ func (s *CoreService) RestartKernel() error {
 // restartKernel 的 manual 为 false 时表示由看门狗触发，不能清零失败计数，
 // 否则「启动即崩」会因每次重启都清零而无限重试。
 func (s *CoreService) restartKernel(manual bool) error {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+
+	if s.Quitting() || s.IsShuttingDown() {
+		return fmt.Errorf("程序正在退出，取消重启")
+	}
 	if s.mgr == nil {
 		return fmt.Errorf("内核管理器未初始化")
 	}
@@ -1203,6 +1383,12 @@ func (s *CoreService) restartKernel(manual bool) error {
 		}
 		s.dbg("RestartKernel <- %s (%s:%d)", name, filepath.Base(file), line)
 	}
+
+	// Restart 是完整生命周期事务：先取消旧代际并等待异步任务，
+	// 再由 Manager 串行完成 Stop + Start。
+	s.invalidateKernelGeneration()
+	s.waitAfterTasks(false)
+
 	confPath, err := configgen.Write(dataDir(), s.options())
 	if err != nil {
 		return err
@@ -1210,6 +1396,8 @@ func (s *CoreService) restartKernel(manual bool) error {
 	if err := s.mgr.Restart(confPath); err != nil {
 		return err
 	}
+
+	gen, genCtx := s.beginKernelGeneration()
 	s.clearVersionCache()
 	s.invalidateConnCache()
 	if s.api != nil {
@@ -1218,7 +1406,7 @@ func (s *CoreService) restartKernel(manual bool) error {
 	if manual {
 		s.resumeWatchdog()
 	}
-	s.afterStart()
+	s.afterStart(gen, genCtx)
 	return nil
 }
 
@@ -1419,7 +1607,7 @@ func (s *CoreService) restoreSystemProxy() error {
 	if err := s.verifyProxySnapshot(bk); err != nil {
 		return fmt.Errorf("恢复系统代理后校验失败（备份已保留）: %w", err)
 	}
-	if err := os.Remove(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
+	if err := removeProxyState(s.proxyStatePath()); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除系统代理备份失败（恢复已完成，下次将继续校验）: %w", err)
 	}
 
@@ -1601,7 +1789,7 @@ func (s *CoreService) reconcileProxy() {
 			s.saveAppState()
 			return
 		}
-		_ = os.Remove(s.proxyStatePath())
+		_ = removeProxyState(s.proxyStatePath())
 		s.mu.Lock()
 		s.proxyOn = false
 		s.backup = proxyBackup{}
@@ -1622,7 +1810,7 @@ func (s *CoreService) reconcileProxy() {
 		// 外部软件/用户改了系统代理。以当前注册表为准，放弃我们旧的备份，
 		// 否则退出时会把用户的新设置覆盖回接管前的值。
 		s.dbg("system proxy changed externally to %s, relinquish takeover", cur)
-		_ = os.Remove(s.proxyStatePath())
+		_ = removeProxyState(s.proxyStatePath())
 		s.mu.Lock()
 		s.proxyOn = false
 		s.backup = proxyBackup{}
@@ -1803,6 +1991,13 @@ func (s *CoreService) Quitting() bool {
 	return s.quitting
 }
 
+// IsShuttingDown 表示 Shutdown 已开始，任何新的生命周期操作都应拒绝。
+func (s *CoreService) IsShuttingDown() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.shuttingDown
+}
+
 func (s *CoreService) MarkQuitting() {
 	s.mu.Lock()
 	s.quitting = true
@@ -1812,6 +2007,8 @@ func (s *CoreService) MarkQuitting() {
 	if wd != nil {
 		wd.Stop()
 	}
+	// 取消正在执行的 afterStart；Shutdown 还会等待它真正结束。
+	s.invalidateKernelGeneration()
 }
 
 // ---------- 配置备份 ----------
@@ -2013,9 +2210,12 @@ func (s *CoreService) startKernelWatchdog() {
 				return
 			}
 			// 内核已无法自动恢复，系统代理若还指向它会让整台机器断网。
-			// 优先还原成用户的原始代理设置，失败时保留备份等下次启动重试。
+			// WinINET 与 WinHTTP 都要还原；失败时保留备份等下次启动重试。
 			if err := s.restoreSystemProxy(); err != nil {
 				s.dbg("watchdog exhausted: restore system proxy failed: %v", err)
+			}
+			if err := s.restoreWinHTTPIfPending(); err != nil {
+				s.dbg("watchdog exhausted: restore WinHTTP failed: %v", err)
 			}
 			if s.app != nil {
 				s.app.Event.Emit("kernel-crashed", message)
