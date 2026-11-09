@@ -1,4 +1,4 @@
-﻿# NexusLink 本地构建脚本（只生成 exe，不打 zip）
+﻿# RoutePilot 本地构建脚本（只生成 exe，不打 zip）
 # 用法：.\build.ps1                 默认走官方源
 #       .\build.ps1 -ChinaMirror    走国内镜像（goproxy.cn / npmmirror）
 #       .\build.ps1 -Version 1.2.3  指定写进 exe 版本信息的版本号
@@ -61,9 +61,9 @@ if ($LASTEXITCODE -ne 0) { throw "Windows 资源生成失败" }
 
 Write-Host "[3/4] 编译 Go 应用..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path bin | Out-Null
-go build -ldflags "-s -w -H windowsgui" -o bin\NexusLink.exe .
+go build -ldflags "-s -w -H windowsgui" -o bin\RoutePilot.exe .
 if ($LASTEXITCODE -ne 0) { throw "编译失败" }
 
-Write-Host "[4/4] 完成 -> bin\NexusLink.exe" -ForegroundColor Green
-$size = [math]::Round((Get-Item bin\NexusLink.exe).Length / 1MB, 1)
+Write-Host "[4/4] 完成 -> bin\RoutePilot.exe" -ForegroundColor Green
+$size = [math]::Round((Get-Item bin\RoutePilot.exe).Length / 1MB, 1)
 Write-Host "      体积 $size MB" -ForegroundColor Green

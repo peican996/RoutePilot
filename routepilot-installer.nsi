@@ -1,6 +1,6 @@
-; NexusLink NSIS 安装脚本
-; 用法: makensis nexuslink-installer.nsi
-; 需要先运行 python package.py 生成 bin/NexusLink.exe
+; RoutePilot NSIS 安装脚本
+; 用法: makensis routepilot-installer.nsi
+; 需要先运行 python package.py 生成 bin/RoutePilot.exe
 
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
@@ -10,13 +10,13 @@
 !ifndef APP_VERSION
   !define APP_VERSION "1.0.0"
 !endif
-!define APP_NAME "NexusLink"
-!define APP_PUBLISHER "NexusLink Project"
-!define APP_EXE "NexusLink.exe"
+!define APP_NAME "RoutePilot"
+!define APP_PUBLISHER "RoutePilot Project"
+!define APP_EXE "RoutePilot.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
 
 Name "${APP_NAME} ${APP_VERSION}"
-OutFile "NexusLink-${APP_VERSION}-setup.exe"
+OutFile "RoutePilot-${APP_VERSION}-setup.exe"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
 InstallDirRegKey HKLM "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel admin
@@ -84,9 +84,11 @@ Section "Uninstall"
     DeleteRegKey HKLM "${UNINST_KEY}"
     DeleteRegKey HKLM "Software\${APP_NAME}"
 
-    ; 配置目录保留（%APPDATA%\NexusLink），用户可能想保留订阅
-    MessageBox MB_YESNO "是否同时删除配置数据（订阅、规则、流量历史）？" IDNO +2
-    RMDir /r "$APPDATA\NexusLink"
+    ; 配置目录保留（%APPDATA%\RoutePilot），用户可能想保留订阅
+    ; IDNO 要跳过下面 3 条 RMDir，点「否」时一个都不删
+    MessageBox MB_YESNO "是否同时删除配置数据（订阅、规则、流量历史）？" IDNO +3
+    RMDir /r "$APPDATA\RoutePilot"
     ; 兼容旧版本目录名
+    RMDir /r "$APPDATA\NexusLink"
     RMDir /r "$APPDATA\ProxDeck"
 SectionEnd

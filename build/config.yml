@@ -5,12 +5,12 @@ version: '3'
 
 # This information is used to generate the build assets.
 info:
-  companyName: "NexusLink Project"
-  productName: "NexusLink"
-  productIdentifier: "io.github.peican996.nexuslink"
+  companyName: "RoutePilot Project"
+  productName: "RoutePilot"
+  productIdentifier: "io.github.peican996.routepilot"
   description: "按程序分流的 Windows 代理控制台"
-  copyright: "(c) 2026, NexusLink Project"
-  comments: "NexusLink"
+  copyright: "(c) 2026, RoutePilot Project"
+  comments: "RoutePilot"
   version: "1.6.0"
   # cfBundleIconName: "appicon" # The macOS icon name in Assets.car icon bundles (optional)
   #                               # Should match the name of your .icon file without the extension

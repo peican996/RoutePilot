@@ -217,9 +217,11 @@ body::before {
   filter: drop-shadow(0 0 10px rgba(34, 211, 238, 0.38));
 }
 
-.brand-mark svg {
-  width: 19px;
-  height: 19px;
+.brand-mark img {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: block;
 }
 
 .brand-name {

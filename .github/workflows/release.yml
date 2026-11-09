@@ -75,5 +75,5 @@ jobs:
         run: |
           tag="${{ steps.ver.outputs.tag }}"
           gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" --title "NexusLink $tag" --generate-notes
+            gh release create "$tag" --title "RoutePilot $tag" --generate-notes
           gh release upload "$tag" release/*.zip release/SHA256SUMS.txt --clobber

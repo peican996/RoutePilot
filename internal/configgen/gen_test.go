@@ -135,7 +135,7 @@ func TestBuildStripsSubscriptionControlledFields(t *testing.T) {
 func TestMainProxyGroupUsesProviderMembers(t *testing.T) {
 	cfg := map[string]any{
 		"proxy-groups": []any{
-			map[string]any{"name": "节点选择", "type": "select", "use": []any{"nexuslink"}},
+			map[string]any{"name": "节点选择", "type": "select", "use": []any{"routepilot"}},
 		},
 	}
 	if got := MainProxyGroup(cfg); got != "节点选择" {
@@ -149,7 +149,7 @@ func TestBuildDefaultRulesUseProviderGroup(t *testing.T) {
 	base := map[string]any{
 		"proxies": []any{},
 		"proxy-groups": []any{
-			map[string]any{"name": "节点选择", "type": "select", "use": []any{"nexuslink"}},
+			map[string]any{"name": "节点选择", "type": "select", "use": []any{"routepilot"}},
 		},
 	}
 

@@ -1,5 +1,5 @@
 // 界面用到的视图模型类型。
-// 后端已经通过 bindings/proxdeck 导出了同构的模型，但历史代码里手写了一份
+// 后端已经通过 bindings/routepilot 导出了同构的模型，但历史代码里手写了一份
 // 且做了双重断言。这里集中放一份，方便逐步替换成 bindings 的官方类型。
 
 export type Status = {

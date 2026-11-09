@@ -7,10 +7,10 @@
 		"0409": {
 			"FileVersion": "1.6.0",
 			"ProductVersion": "1.6.0",
-			"CompanyName": "NexusLink Project",
-			"FileDescription": "NexusLink",
-			"LegalCopyright": "© 2026, NexusLink Project",
-			"ProductName": "NexusLink",
+			"CompanyName": "RoutePilot Project",
+			"FileDescription": "RoutePilot",
+			"LegalCopyright": "© 2026, RoutePilot Project",
+			"ProductName": "RoutePilot",
 			"Comments": "按程序分流的 Windows 代理控制台"
 		}
 	}

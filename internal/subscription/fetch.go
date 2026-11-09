@@ -359,7 +359,7 @@ func collectClashMeta(res *Result, cfg map[string]any) {
 // 避免 mihomo 的 base64 解码被首尾空白卡住），内核自己完成 URI → proxy 转换；
 // 选择组显式引用 provider，进程分流与节点切换才有出口可用。
 func base64ProviderConfig(subURL string) map[string]any {
-	const providerName = "nexuslink"
+	const providerName = "routepilot"
 	return map[string]any{
 		"proxy-providers": map[string]any{
 			providerName: map[string]any{

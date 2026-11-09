@@ -3,26 +3,26 @@
 #
 # The lines below are called `modelines`. See `:help modeline`
 
-name: "proxdeck.exe"
+name: "routepilot"
 arch: ${GOARCH}
 platform: "linux"
 version: "0.1.0"
 section: "default"
 priority: "extra"
 maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
-description: "A proxdeck application"
+description: "A RoutePilot application"
 vendor: "My Company"
 homepage: "https://wails.io"
 license: "MIT"
 release: "1"
 
 contents:
-  - src: "./bin/proxdeck.exe"
-    dst: "/usr/local/bin/proxdeck.exe"
+  - src: "./bin/routepilot"
+    dst: "/usr/local/bin/routepilot"
   - src: "./build/appicon.png"
-    dst: "/usr/share/icons/hicolor/128x128/apps/proxdeck.exe.png"
-  - src: "./build/linux/proxdeck.exe.desktop"
-    dst: "/usr/share/applications/proxdeck.exe.desktop"
+    dst: "/usr/share/icons/hicolor/128x128/apps/routepilot.png"
+  - src: "./build/linux/routepilot.desktop"
+    dst: "/usr/share/applications/routepilot.desktop"
 
 # Default dependencies for the GTK4 + WebKitGTK 6.0 stack (Ubuntu 24.04+ / Debian 13+)
 depends:

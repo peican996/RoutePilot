@@ -70,9 +70,9 @@ func TestParseBase64NodeList(t *testing.T) {
 	if !ok {
 		t.Fatal("base64 订阅应生成 proxy-providers")
 	}
-	p, ok := providers["nexuslink"].(map[string]any)
+	p, ok := providers["routepilot"].(map[string]any)
 	if !ok {
-		t.Fatalf("缺少 nexuslink provider：%v", providers)
+		t.Fatalf("缺少 routepilot provider：%v", providers)
 	}
 	if p["type"] != "file" {
 		t.Fatalf("provider 应为 file 类型，实际 %v", p["type"])
@@ -88,7 +88,7 @@ func TestParseBase64NodeList(t *testing.T) {
 	}
 	g, _ := groups[0].(map[string]any)
 	use, _ := g["use"].([]any)
-	if len(use) != 1 || use[0] != "nexuslink" {
+	if len(use) != 1 || use[0] != "routepilot" {
 		t.Fatalf("策略组应引用 provider：%v", g)
 	}
 }

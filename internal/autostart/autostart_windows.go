@@ -17,15 +17,16 @@ import (
 
 const (
 	runKey  = `Software\Microsoft\Windows\CurrentVersion\Run`
-	appName = "NexusLink"
-	// 旧版本的启动项名。产品改名后要顺手清掉，否则注册表里
-	// 会留一条指向新路径但叫 ProxDeck 的僵尸启动项。
-	legacyAppName = "ProxDeck"
+	appName = "RoutePilot"
 
 	// 管理员自启的计划任务名。用计划任务而不是 Run 键，才能带
 	// HighestAvailable 权限静默启动，TUN 模式开机后不用再手动提权。
-	taskName = "NexusLink"
+	taskName = "RoutePilot"
 )
+
+// legacyAppNames 是旧版本的启动项名（产品改过两次名）。要顺手清掉，
+// 否则注册表里会留一条指向新路径但叫旧名字的僵尸启动项。
+var legacyAppNames = []string{"NexusLink", "ProxDeck"}
 
 // Enabled 检查是否已经配置了开机启动（普通 Run 项或管理员计划任务）。
 func Enabled() bool {
@@ -90,8 +91,13 @@ func runValueExists() bool {
 	if v, _, err := k.GetStringValue(appName); err == nil && v != "" {
 		return true
 	}
-	v, _, err := k.GetStringValue(legacyAppName)
-	return err == nil && v != ""
+	// 旧名字的启动项也算"开着"，否则升级后用户会看到开关被莫名关掉
+	for _, legacy := range legacyAppNames {
+		if v, _, err := k.GetStringValue(legacy); err == nil && v != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func setRunValue() error {
@@ -101,7 +107,10 @@ func setRunValue() error {
 	}
 	defer k.Close()
 
-	_ = k.DeleteValue(legacyAppName)
+	// 清理旧名字的启动项，避免两个同名程序同时自启
+	for _, legacy := range legacyAppNames {
+		_ = k.DeleteValue(legacy)
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -118,7 +127,9 @@ func removeRunValue() {
 	}
 	defer k.Close()
 	_ = k.DeleteValue(appName)
-	_ = k.DeleteValue(legacyAppName)
+	for _, legacy := range legacyAppNames {
+		_ = k.DeleteValue(legacy)
+	}
 }
 
 func taskExists() bool {
@@ -136,7 +147,7 @@ func createTask() error {
 		return err
 	}
 
-	f, err := os.CreateTemp("", "nexuslink-task-*.xml")
+	f, err := os.CreateTemp("", "routepilot-task-*.xml")
 	if err != nil {
 		return err
 	}
@@ -183,7 +194,7 @@ func taskXMLWithRunLevel(exe, runLevel string) ([]byte, error) {
 	text := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>NexusLink 开机自启（管理员）</Description>
+    <Description>RoutePilot 开机自启（管理员）</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>

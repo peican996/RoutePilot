@@ -203,7 +203,7 @@ export default function App() {
     [schedErrClear],
   );
   const logErr = useCallback((e: unknown) => {
-    console.warn("[nexuslink]", e);
+    console.warn("[routepilot]", e);
   }, []);
   // 用计数表达并发操作。单个布尔值时，第一个结束的操作就会解锁界面，
   // 另一个还在跑却已经可以再点。
@@ -868,7 +868,7 @@ export default function App() {
       await svc.UpdateCore(coreInfo.url);
       setNote(`内核已更新到 ${coreInfo.latest}`);
       schedNoteClear(TOAST_INFO_MS);
-      notify("内核已更新", `NexusLink 已升级到 ${coreInfo.latest}`);
+      notify("内核已更新", `RoutePilot 已升级到 ${coreInfo.latest}`);
       const info = await svc.CheckCoreUpdate();
       setCoreInfo(info);
       setCoreCustom(await svc.CoreCustomized());
@@ -900,7 +900,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `nexuslink-config-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `routepilot-config-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(url);
       setNote("配置已导出");
@@ -970,7 +970,7 @@ export default function App() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `nexuslink-logs-${new Date().toISOString().slice(0, 10)}.txt`;
+        a.download = `routepilot-logs-${new Date().toISOString().slice(0, 10)}.txt`;
         a.click();
         URL.revokeObjectURL(url);
         setNote("日志已导出");

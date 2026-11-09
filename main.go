@@ -63,7 +63,7 @@ var trayIconRed []byte
 // 是线程局部的、Go 的 goroutine 会在系统调用之间迁移线程。必须用
 // runtime.LockOSThread 把当前 goroutine 钉住，否则读到的可能是别的
 // 线程的 LastError——这也是最初放弃互斥体方案的真实原因。
-const instanceMutexName = "Local\\NexusLink.SingleInstance"
+const instanceMutexName = "Local\\RoutePilot.SingleInstance"
 
 // 端口锁保留作补充判据：互斥体在极端情况下（权限/会话隔离）可能失效。
 const instanceLockPort = "127.0.0.1:47914"
@@ -129,8 +129,8 @@ func acquireSingleInstance() bool {
 
 // showAlreadyRunning 启动失败时给个可见提示，而不是静默退出。
 func showAlreadyRunning() {
-	text, _ := windows.UTF16PtrFromString("NexusLink 已经在运行了。\n\n请从系统托盘打开，或先退出已有实例。")
-	title, _ := windows.UTF16PtrFromString("NexusLink")
+	text, _ := windows.UTF16PtrFromString("RoutePilot 已经在运行了。\n\n请从系统托盘打开，或先退出已有实例。")
+	title, _ := windows.UTF16PtrFromString("RoutePilot")
 	procMessageBox.Call(0,
 		uintptr(unsafe.Pointer(text)),
 		uintptr(unsafe.Pointer(title)),
@@ -140,7 +140,7 @@ func showAlreadyRunning() {
 
 func main() {
 	if !acquireSingleInstance() {
-		log.Println("NexusLink 已经在运行了")
+		log.Println("RoutePilot 已经在运行了")
 		showAlreadyRunning()
 		return
 	}
@@ -154,7 +154,7 @@ func main() {
 	var saveBounds func()
 
 	app := application.New(application.Options{
-		Name:        "NexusLink",
+		Name:        "RoutePilot",
 		Description: "个人定制的代理控制台",
 		Icon:        trayIcon,
 		Services: []application.Service{
@@ -190,7 +190,7 @@ func main() {
 	svc.Attach(app)
 
 	mainWindow = app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "NexusLink",
+		Title:            "RoutePilot",
 		Width:            1080,
 		Height:           720,
 		BackgroundColour: application.NewRGB(14, 16, 20),
@@ -293,7 +293,7 @@ func setWindowIcon(hwnd uintptr) {
 func setupTray(app *application.App, svc *CoreService, win *application.WebviewWindow) {
 	tray := app.SystemTray.New()
 	tray.SetIcon(trayIcon)
-	tray.SetTooltip("NexusLink")
+	tray.SetTooltip("RoutePilot")
 
 	menu := app.NewMenu()
 
@@ -367,7 +367,7 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 
 	menu.AddSeparator()
 
-	quit := menu.Add("退出 NexusLink")
+	quit := menu.Add("退出 RoutePilot")
 	quit.OnClick(func(ctx *application.Context) {
 		svc.MarkQuitting()
 		app.Quit()
@@ -403,7 +403,7 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 			}
 			if label != lastState {
 				tray.SetIcon(icon)
-				tray.SetTooltip("NexusLink — " + label)
+				tray.SetTooltip("RoutePilot — " + label)
 				lastState = label
 			}
 		}

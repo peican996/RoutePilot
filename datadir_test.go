@@ -38,14 +38,19 @@ func TestCopyDirAll(t *testing.T) {
 	}
 }
 
-// 数据目录必须叫 NexusLink（产品名），旧名字只作为迁移来源存在。
+// 数据目录必须叫 RoutePilot（当前产品名），旧名字只作为迁移来源存在。
 func TestDataDirName(t *testing.T) {
 	got := filepath.Base(dataDir())
 	if got != dataDirName {
 		t.Fatalf("数据目录名应为 %q，实际 %q", dataDirName, got)
 	}
-	if dataDirName == legacyDirName {
-		t.Fatal("新旧目录名不能相同，否则迁移逻辑会把数据当成已存在")
+	if dataDirName == "" {
+		t.Fatal("数据目录名不能为空")
+	}
+	for _, legacy := range legacyDirNames {
+		if dataDirName == legacy {
+			t.Fatalf("新旧目录名不能相同（%q），否则迁移逻辑会把数据当成已存在", legacy)
+		}
 	}
 }
 

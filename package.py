@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NexusLink 发布打包脚本。
+"""RoutePilot 发布打包脚本。
 
 产出便携版 zip：解压即用，配置存在用户目录（不污染系统）。
 
@@ -28,7 +28,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
 
 def main() -> int:
     version = sys.argv[1] if len(sys.argv) > 1 else "1.0.0"
-    print(f"==> 打包 NexusLink v{version}")
+    print(f"==> 打包 RoutePilot v{version}")
 
     # 1. 前端
     print("\n[1/5] 构建前端")
@@ -40,7 +40,7 @@ def main() -> int:
 
     # 3. Go 编译
     print("\n[3/5] 编译 Go")
-    exe_name = "NexusLink.exe"
+    exe_name = "RoutePilot.exe"
     run(
         [
             "go",
@@ -62,21 +62,21 @@ def main() -> int:
     shutil.copy2(ROOT / "bin" / exe_name, DIST / exe_name)
 
     # 便携版说明
-    readme = f"""NexusLink v{version} — 便携版
+    readme = f"""RoutePilot v{version} — 便携版
 ================================
 
 用法
 ----
-1. 双击 NexusLink.exe 启动
+1. 双击 RoutePilot.exe 启动
 2. 首次运行会释放 mihomo 内核到数据目录
 3. 托盘图标右键可退出
 
 配置位置
 --------
 订阅、规则、流量历史等存在：
-    %APPDATA%\\NexusLink\\
-（即 C:\\Users\\<用户名>\\AppData\\Roaming\\NexusLink）
-旧版本（ProxDeck）的数据会在首次启动时自动迁移过来。
+    %APPDATA%\\RoutePilot\\
+（即 C:\\Users\\<用户名>\\AppData\\Roaming\\RoutePilot）
+旧版本（NexusLink / ProxDeck）的数据会在首次启动时自动迁移过来。
 卸载时删掉这个目录即可完全清除。
 
 模式说明
@@ -94,7 +94,7 @@ def main() -> int:
 
     # 5. 压成 zip
     print("\n[5/5] 压缩")
-    zip_name = f"NexusLink-v{version}-win64-portable.zip"
+    zip_name = f"RoutePilot-v{version}-win64-portable.zip"
     # 发布包统一放 release/，根目录只留源码
     release_dir = ROOT / "release"
     release_dir.mkdir(exist_ok=True)
@@ -111,7 +111,7 @@ def main() -> int:
     print(f"    位置: {zip_path}")
 
     # 5. 可选：NSIS 安装包
-    nsis_script = ROOT / "nexuslink-installer.nsi"
+    nsis_script = ROOT / "routepilot-installer.nsi"
     makensis = shutil.which("makensis")
     if nsis_script.exists() and makensis:
         try:
@@ -121,7 +121,7 @@ def main() -> int:
                 check=True,
                 capture_output=True,
             )
-            setup = ROOT / f"NexusLink-{version}-setup.exe"
+            setup = ROOT / f"RoutePilot-{version}-setup.exe"
             if setup.exists():
                 mb = setup.stat().st_size / 1024 / 1024
                 print(f"    安装包: {setup.name}  ({mb:.1f} MB)")

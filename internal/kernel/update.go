@@ -57,7 +57,7 @@ func fetchLatest(timeout time.Duration) (*release, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "NexusLink")
+	req.Header.Set("User-Agent", "RoutePilot")
 
 	resp, err := client.Do(req)
 	if err != nil {

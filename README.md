@@ -1,4 +1,4 @@
-# NexusLink
+# RoutePilot
 
 [![CI](https://github.com/peican996/nexuslink/actions/workflows/ci.yml/badge.svg)](https://github.com/peican996/nexuslink/actions/workflows/ci.yml)
 [![Release](https://github.com/peican996/nexuslink/actions/workflows/release.yml/badge.svg)](https://github.com/peican996/nexuslink/releases)
@@ -6,7 +6,7 @@
 
 > 一个把**「按程序分流」**做到位的代理控制台。Go + Wails v3 + React，内核复用 [mihomo](https://github.com/MetaCubeX/mihomo)。
 
-**English TL;DR** — NexusLink is a Windows desktop proxy console built with Go + Wails v3 + React, wrapping the mihomo core. Unlike generic Clash GUIs that route by domain only, it exposes **per-process routing** as a first-class feature: every connection is tagged with its owning process, and you can pin any program to "always direct" or "always proxy". Licensed GPL-3.0.
+**English TL;DR** — RoutePilot is a Windows desktop proxy console built with Go + Wails v3 + React, wrapping the mihomo core. Unlike generic Clash GUIs that route by domain only, it exposes **per-process routing** as a first-class feature: every connection is tagged with its owning process, and you can pin any program to "always direct" or "always proxy". Licensed GPL-3.0.
 
 ---
 
@@ -18,7 +18,7 @@
 - 游戏客户端不能过代理，否则掉线
 - 而浏览器、终端又必须走代理
 
-NexusLink 把进程名直接暴露到界面上：连接列表带进程、进程策略三态（代理 / 直连 / 跟随规则），改完立刻生效，不用重启内核。
+RoutePilot 把进程名直接暴露到界面上：连接列表带进程、进程策略三态（代理 / 直连 / 跟随规则），改完立刻生效，不用重启内核。
 
 ## 功能
 
@@ -87,7 +87,7 @@ cd frontend && npm install && npm run build && cd ..
 python package.py 1.0.0
 ```
 
-产物：`bin/NexusLink.exe`、`release/NexusLink-v1.0.0-win64-portable.zip`。
+产物：`bin/RoutePilot.exe`、`release/RoutePilot-v1.0.0-win64-portable.zip`。
 也可以直接跑 `.\build.ps1`。
 
 发版走 CI：把 tag 推上去（`git tag v1.0.0 && git push --tags`），`.github/workflows/release.yml` 会重新拉资源、构建、算好 sha256 并挂到 Release 页。构建好的版本也可以直接从 [Releases](https://github.com/peican996/nexuslink/releases) 下，不用自己编。
@@ -125,7 +125,7 @@ wails3 dev                     # 后端 + WebView 联调
 ## 数据目录
 
 ```
-%APPDATA%\NexusLink\
+%APPDATA%\RoutePilot\
 ├── config.yaml              # 由订阅生成的运行时配置
 ├── subs.json / sub-*.yaml   # 多订阅列表与各订阅原文
 ├── sub-*.provider.yaml      # base64 订阅解码后的节点列表（给内核 provider）
@@ -140,7 +140,7 @@ wails3 dev                     # 后端 + WebView 联调
 └── bin\                     # 释放出来的内核与 wintun.dll
 ```
 
-旧版本（`ProxDeck`）的数据会在首次启动时自动迁移。
+旧版本（`NexusLink` / `ProxDeck`）的数据会在首次启动时自动迁移。
 
 ## 隐私
 

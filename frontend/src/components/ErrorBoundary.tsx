@@ -18,7 +18,7 @@ export default class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("[nexuslink] 界面渲染失败", error, info.componentStack);
+    console.error("[routepilot] 界面渲染失败", error, info.componentStack);
   }
 
   render() {

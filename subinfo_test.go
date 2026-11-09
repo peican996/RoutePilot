@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"proxdeck/internal/subscription"
+	"routepilot/internal/subscription"
 )
 
 // 切换订阅 / 自动更新后必须使用解析结果里的计数。

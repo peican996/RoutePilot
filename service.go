@@ -19,13 +19,13 @@ import (
 	"sync"
 	"time"
 
-	"proxdeck/internal/autostart"
-	"proxdeck/internal/configgen"
-	"proxdeck/internal/elevate"
-	"proxdeck/internal/geoip"
-	"proxdeck/internal/kernel"
-	"proxdeck/internal/subscription"
-	"proxdeck/internal/sysproxy"
+	"routepilot/internal/autostart"
+	"routepilot/internal/configgen"
+	"routepilot/internal/elevate"
+	"routepilot/internal/geoip"
+	"routepilot/internal/kernel"
+	"routepilot/internal/subscription"
+	"routepilot/internal/sysproxy"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -309,12 +309,14 @@ type NodeView struct {
 
 // ---------- 初始化 ----------
 
-// 数据目录名。历史版本叫 ProxDeck，现已统一为产品名 NexusLink，
-// 旧目录在首次启动时由 migrateDataDir 搬过来。
+// 数据目录名。产品改名过两次：ProxDeck → NexusLink → RoutePilot。
+// 旧目录在首次启动时由 migrateDataDir 按顺序搬过来，
+// 谁在就搬谁——NexusLink 排前面，避免用更老的 ProxDeck 数据覆盖。
 const (
-	dataDirName   = "NexusLink"
-	legacyDirName = "ProxDeck"
+	dataDirName = "RoutePilot"
 )
+
+var legacyDirNames = []string{"NexusLink", "ProxDeck"}
 
 func dataDir() string {
 	if dataDirOverride != "" {
@@ -334,27 +336,33 @@ func (s *CoreService) migrateDataDir() {
 	if err != nil {
 		return
 	}
-	oldDir := filepath.Join(base, legacyDirName)
 	newDir := filepath.Join(base, dataDirName)
 
 	if _, err := os.Stat(newDir); err == nil {
 		return // 新目录已存在，什么都不动
 	}
-	if fi, err := os.Stat(oldDir); err != nil || !fi.IsDir() {
-		return
-	}
+	// 按新旧程度依次找：改名链是 ProxDeck → NexusLink → RoutePilot，
+	// 越靠前越新。两个旧目录都在时只搬 NexusLink。
+	for _, legacy := range legacyDirNames {
+		oldDir := filepath.Join(base, legacy)
+		fi, err := os.Stat(oldDir)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
 
-	// 同一卷内 rename 是原子的，最干净
-	if err := os.Rename(oldDir, newDir); err == nil {
+		// 同一卷内 rename 是原子的，最干净
+		if err := os.Rename(oldDir, newDir); err == nil {
+			return
+		}
+		// 跨卷或被占用时退化为逐个复制；只有全部成功才删旧目录，
+		// 否则宁可留着让用户手动处理，也不能把没复制过去的数据删掉。
+		if err := copyDirAll(oldDir, newDir); err != nil {
+			s.dbg("data dir migrate skipped: %v", err)
+			return
+		}
+		_ = os.RemoveAll(oldDir)
 		return
 	}
-	// 跨卷或被占用时退化为逐个复制；只有全部成功才删旧目录，
-	// 否则宁可留着让用户手动处理，也不能把没复制过去的数据删掉。
-	if err := copyDirAll(oldDir, newDir); err != nil {
-		s.dbg("data dir migrate skipped: %v", err)
-		return
-	}
-	_ = os.RemoveAll(oldDir)
 }
 
 // copyDirAll 递归复制目录。

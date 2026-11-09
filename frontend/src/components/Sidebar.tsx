@@ -96,18 +96,11 @@ export default function Sidebar({
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-mark">
-          {/* Logo：闪电穿环，和应用图标一致 */}
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7}>
-            <circle cx="12" cy="12" r="8.6" opacity={0.55} />
-            <path
-              d="M13.4 3.2 L7.6 13.4 L10.4 13.4 L9 20.8 L15.2 10.4 L12.4 10.4 Z"
-              fill="currentColor"
-              stroke="none"
-            />
-          </svg>
+          {/* 品牌位直接用应用图标，和 exe/托盘保持同一张脸 */}
+          <img src="/appicon.png" alt="" width="32" height="32" />
         </div>
         <span className="brand-name">
-          Nexus<span className="brand-accent">Link</span>
+          Route<span className="brand-accent">Pilot</span>
         </span>
       </div>
 

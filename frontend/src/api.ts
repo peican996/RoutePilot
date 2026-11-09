@@ -4,6 +4,6 @@
 // 不再手写一份等价签名再用 `as unknown as` 强行断言——那种写法
 // 一旦后端签名变化，编译器不会报警，只会在运行时炸。
 
-import { CoreService } from "../bindings/proxdeck";
+import { CoreService } from "../bindings/routepilot";
 
 export const svc = CoreService;
