@@ -48,7 +48,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "assets" / "manifest.json"
 
 # GitHub 会拒绝没有 UA 的请求
-UA = "routepilot-fetch-assets/1.0 (+https://github.com/peican996/nexuslink)"
+UA = "routepilot-fetch-assets/1.0 (+https://github.com/peican996/RoutePilot)"
 
 
 def sha256_of(path: Path) -> str:

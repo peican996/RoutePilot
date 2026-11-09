@@ -1,7 +1,7 @@
 # RoutePilot
 
-[![CI](https://github.com/peican996/nexuslink/actions/workflows/ci.yml/badge.svg)](https://github.com/peican996/nexuslink/actions/workflows/ci.yml)
-[![Release](https://github.com/peican996/nexuslink/actions/workflows/release.yml/badge.svg)](https://github.com/peican996/nexuslink/releases)
+[![CI](https://github.com/peican996/RoutePilot/actions/workflows/ci.yml/badge.svg)](https://github.com/peican996/RoutePilot/actions/workflows/ci.yml)
+[![Release](https://github.com/peican996/RoutePilot/actions/workflows/release.yml/badge.svg)](https://github.com/peican996/RoutePilot/releases)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
 > 一个把**「按程序分流」**做到位的代理控制台。Go + Wails v3 + React，内核复用 [mihomo](https://github.com/MetaCubeX/mihomo)。
@@ -90,7 +90,7 @@ python package.py 1.0.0
 产物：`bin/RoutePilot.exe`、`release/RoutePilot-v1.0.0-win64-portable.zip`。
 也可以直接跑 `.\build.ps1`。
 
-发版走 CI：把 tag 推上去（`git tag v1.0.0 && git push --tags`），`.github/workflows/release.yml` 会重新拉资源、构建、算好 sha256 并挂到 Release 页。构建好的版本也可以直接从 [Releases](https://github.com/peican996/nexuslink/releases) 下，不用自己编。
+发版走 CI：把 tag 推上去（`git tag v1.0.0 && git push --tags`），`.github/workflows/release.yml` 会重新拉资源、构建、算好 sha256 并挂到 Release 页。构建好的版本也可以直接从 [Releases](https://github.com/peican996/RoutePilot/releases) 下，不用自己编。
 
 ### 开发
 
