@@ -55,6 +55,14 @@ export class LatestInfo {
              */
             this["assetName"] = "";
         }
+        if (!("size" in $$source)) {
+            /**
+             * 资源字节数，0 表示未知
+             * @member
+             * @type {number}
+             */
+            this["size"] = 0;
+        }
         if (!("digest" in $$source)) {
             /**
              * "sha256:<hex>"，为空表示该 release 没提供

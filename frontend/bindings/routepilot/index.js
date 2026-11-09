@@ -15,6 +15,7 @@ export {
     LogDelta,
     NodeView,
     RuleView,
+    SiteRule,
     SubInfo,
     TrafficSample,
     TrafficView

@@ -3,10 +3,49 @@ package configgen
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// config.yaml 必须原子写入：成功后内容完整，且不残留临时文件。
+// 网站规则排在进程规则之后、智能分流与订阅规则之前。
+func TestSiteAndSmartRuleOrder(t *testing.T) {
+	base := map[string]any{
+		"rules": []any{"DOMAIN-SUFFIX,corp.example,PROXY", "MATCH,PROXY"},
+	}
+	cfg := Build(Options{
+		Base:         base,
+		SiteRules:    []string{"DOMAIN-SUFFIX,google.com,DIRECT"},
+		SmartRouting: true,
+		ProcessRules: false,
+	})
+	rules, _ := cfg["rules"].([]any)
+	wantPrefix := []string{
+		"DOMAIN-SUFFIX,google.com,DIRECT",
+		"GEOSITE,cn,DIRECT",
+		"GEOIP,CN,DIRECT",
+		"DOMAIN-SUFFIX,corp.example,PROXY",
+	}
+	if len(rules) < len(wantPrefix) {
+		t.Fatalf("规则数量不足: %v", rules)
+	}
+	for i, want := range wantPrefix {
+		if got, _ := rules[i].(string); got != want {
+			t.Fatalf("第 %d 条规则应为 %q，实际 %q（全部：%v）", i, want, got, rules)
+		}
+	}
+}
+
+// 关闭智能分流时不应注入 GEOSITE/GEOIP。
+func TestSmartRoutingDisabledByDefault(t *testing.T) {
+	cfg := Build(Options{Base: map[string]any{"rules": []any{"MATCH,PROXY"}}})
+	rules, _ := cfg["rules"].([]any)
+	for _, r := range rules {
+		if s, ok := r.(string); ok && (strings.HasPrefix(s, "GEOSITE,") || strings.HasPrefix(s, "GEOIP,")) {
+			t.Fatalf("未开启智能分流却出现内置规则: %s", s)
+		}
+	}
+}
+
 func TestWriteConfigAtomic(t *testing.T) {
 	dir := t.TempDir()
 	path, err := Write(dir, Options{

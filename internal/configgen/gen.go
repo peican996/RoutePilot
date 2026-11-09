@@ -34,6 +34,15 @@ type Options struct {
 	// 组名统一带 nx-pp- 前缀，界面上不作为普通策略组展示。
 	ProcessGroups []map[string]any
 
+	// SiteRules 是用户自定义的网站分流规则（已带出口），例如
+	// DOMAIN-SUFFIX,example.com,DIRECT。它们排在进程规则之后、
+	// 智能分流与订阅规则之前，网站级别的选择优先。
+	SiteRules []string
+
+	// SmartRouting 开启内置国内外分流：国内域名/IP 直连，
+	// 其余流量继续交给订阅规则决定出口。
+	SmartRouting bool
+
 	// Base 是订阅解析出来的原始配置。为空时退化为一份最小可用的直连配置。
 	Base map[string]any
 }
@@ -242,19 +251,20 @@ func Build(o Options) map[string]any {
 		}
 	}
 
-	// 按程序分流的规则由本应用动态维护，必须排在所有订阅规则之前，
+	// 按程序/按网站的规则由本应用动态维护，必须排在所有订阅规则之前，
 	// 否则机场自己的 DOMAIN-SUFFIX 规则会先命中，用户的选择就失效了。
 	//
 	// 关键约束：mihomo 的 classical rule-provider 里**不能自带策略**，
 	// payload 只写匹配条件，出口由外层 RULE-SET 的第二个参数决定。
 	// 所以按策略拆成两个 provider，而不是把出口写进规则里。
+	var prepend []any
 	if o.ProcessRules {
 		providers := map[string]any{
 			"pp-direct": map[string]any{
 				"type": "file", "behavior": "classical", "path": "./process-direct.yaml",
 			},
 		}
-		prepend := []any{"RULE-SET,pp-direct,DIRECT"}
+		prepend = append(prepend, "RULE-SET,pp-direct,DIRECT")
 
 		if group := MainProxyGroup(cfg); group != "" {
 			providers["pp-proxy"] = map[string]any{
@@ -281,6 +291,22 @@ func Build(o Options) map[string]any {
 			merged[k] = v
 		}
 		cfg["rule-providers"] = merged
+	}
+
+	// 网站级自定义规则优先于智能分流与订阅规则。
+	for _, rule := range o.SiteRules {
+		if strings.TrimSpace(rule) != "" {
+			prepend = append(prepend, rule)
+		}
+	}
+	// 国内直连、其余交给订阅规则（通常是主策略组或机场自己的兜底）。
+	if o.SmartRouting {
+		prepend = append(prepend,
+			"GEOSITE,cn,DIRECT",
+			"GEOIP,CN,DIRECT",
+		)
+	}
+	if len(prepend) > 0 {
 		rules = append(prepend, rules...)
 	}
 	cfg["rules"] = rules

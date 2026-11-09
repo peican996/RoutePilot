@@ -119,6 +119,25 @@ export function CoreCustomized() {
 }
 
 /**
+ * DeleteSiteRule 删除该域名的全部规则（精确与后缀）。
+ * @param {string} domain
+ * @returns {$CancellablePromise<void>}
+ */
+export function DeleteSiteRule(domain) {
+    return $Call.ByID(4038063860, domain);
+}
+
+/**
+ * DeleteSiteRuleWithType 只删除指定匹配类型的规则。
+ * @param {string} domain
+ * @param {string} ruleType
+ * @returns {$CancellablePromise<void>}
+ */
+export function DeleteSiteRuleWithType(domain, ruleType) {
+    return $Call.ByID(1675521124, domain, ruleType);
+}
+
+/**
  * ExportConfig 导出配置为 JSON 字符串，供前端保存成文件。
  * @returns {$CancellablePromise<string>}
  */
@@ -458,6 +477,38 @@ export function SetProcessRule(proc, policy) {
 }
 
 /**
+ * SetSiteRule 新增或更新一条「域名后缀」规则（兼容旧调用）。
+ * @param {string} domain
+ * @param {string} policy
+ * @returns {$CancellablePromise<void>}
+ */
+export function SetSiteRule(domain, policy) {
+    return $Call.ByID(4289698211, domain, policy);
+}
+
+/**
+ * SetSiteRuleWithType 新增或更新一条网站规则。
+ * ruleType 取 "suffix"（域名后缀）/ "exact"（精确域名）。
+ * policy 取 "direct" / "proxy" / "target:<节点或策略组>"。
+ * @param {string} domain
+ * @param {string} ruleType
+ * @param {string} policy
+ * @returns {$CancellablePromise<void>}
+ */
+export function SetSiteRuleWithType(domain, ruleType, policy) {
+    return $Call.ByID(3843769395, domain, ruleType, policy);
+}
+
+/**
+ * SetSmartRouting 开关「国内直连、其余走订阅规则」。
+ * @param {boolean} on
+ * @returns {$CancellablePromise<void>}
+ */
+export function SetSmartRouting(on) {
+    return $Call.ByID(2892155003, on);
+}
+
+/**
  * SetSubInsecure 为某个订阅开启/关闭"忽略证书校验"。
  * 只改标记不重新拉取，调用方需要自己再触发一次刷新。
  * @param {string} url
@@ -508,6 +559,24 @@ export function Shutdown() {
 }
 
 /**
+ * SiteRules 返回当前网站分流规则（副本）。
+ * @returns {$CancellablePromise<$models.SiteRule[]>}
+ */
+export function SiteRules() {
+    return $Call.ByID(3503135096).then(/** @type {($result: any) => any} */(($result) => {
+        return $$createType17($result);
+    }));
+}
+
+/**
+ * SmartRouting 返回是否开启内置国内外分流。
+ * @returns {$CancellablePromise<boolean>}
+ */
+export function SmartRouting() {
+    return $Call.ByID(587064051);
+}
+
+/**
  * @returns {$CancellablePromise<void>}
  */
 export function StartKernel() {
@@ -519,7 +588,7 @@ export function StartKernel() {
  */
 export function Status() {
     return $Call.ByID(506972672).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType16($result);
+        return $$createType18($result);
     }));
 }
 
@@ -545,7 +614,7 @@ export function Subscribe(url) {
  */
 export function Subscription() {
     return $Call.ByID(392029171).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType17($result);
+        return $$createType19($result);
     }));
 }
 
@@ -591,7 +660,7 @@ export function TUNState() {
  */
 export function TestAllNodes() {
     return $Call.ByID(3168033562).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType18($result);
+        return $$createType20($result);
     }));
 }
 
@@ -619,7 +688,7 @@ export function ToggleFavorite(name) {
  */
 export function Traffic() {
     return $Call.ByID(3279408427).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType19($result);
+        return $$createType21($result);
     }));
 }
 
@@ -637,7 +706,7 @@ export function TrafficAlertLimit() {
  */
 export function TrafficHistory() {
     return $Call.ByID(2962103669).then(/** @type {($result: any) => any} */(($result) => {
-        return $$createType21($result);
+        return $$createType23($result);
     }));
 }
 
@@ -680,9 +749,11 @@ const $$createType12 = $Create.Map($Create.Any, $$createType11);
 const $$createType13 = $models.NodeView.createFrom;
 const $$createType14 = $Create.Array($$createType13);
 const $$createType15 = $Create.Map($Create.Any, $Create.Any);
-const $$createType16 = $models.AppStatus.createFrom;
-const $$createType17 = $models.SubInfo.createFrom;
-const $$createType18 = $Create.Map($Create.Any, $Create.Any);
-const $$createType19 = $models.TrafficView.createFrom;
-const $$createType20 = $models.TrafficSample.createFrom;
-const $$createType21 = $Create.Array($$createType20);
+const $$createType16 = $models.SiteRule.createFrom;
+const $$createType17 = $Create.Array($$createType16);
+const $$createType18 = $models.AppStatus.createFrom;
+const $$createType19 = $models.SubInfo.createFrom;
+const $$createType20 = $Create.Map($Create.Any, $Create.Any);
+const $$createType21 = $models.TrafficView.createFrom;
+const $$createType22 = $models.TrafficSample.createFrom;
+const $$createType23 = $Create.Array($$createType22);

@@ -173,6 +173,15 @@ export class ConnView {
              */
             this["processPath"] = "";
         }
+        if (!("processKey" in $$source)) {
+            /**
+             * ProcessKey 是稳定的进程匹配身份（path:... / name:...），
+             * 前端用它聚合与设置规则，避免同名不同目录的程序被合并。
+             * @member
+             * @type {string}
+             */
+            this["processKey"] = "";
+        }
         if (!("chains" in $$source)) {
             /**
              * @member
@@ -474,6 +483,53 @@ export class RuleView {
     static createFrom($$source = {}) {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new RuleView(/** @type {Partial<RuleView>} */($$parsedSource));
+    }
+}
+
+/**
+ * SiteRule 是一条按网站分流规则。
+ * Type 取 "suffix"（域名后缀）/ "exact"（精确域名）；
+ * Policy 取 "direct" / "proxy"（主策略组）/ "target:<节点或策略组>"。
+ */
+export class SiteRule {
+    /**
+     * Creates a new SiteRule instance.
+     * @param {Partial<SiteRule>} [$$source = {}] - The source object to create the SiteRule.
+     */
+    constructor($$source = {}) {
+        if (!("domain" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["domain"] = "";
+        }
+        if (!("type" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["type"] = "";
+        }
+        if (!("policy" in $$source)) {
+            /**
+             * @member
+             * @type {string}
+             */
+            this["policy"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new SiteRule instance from a string or object.
+     * @param {any} [$$source = {}]
+     * @returns {SiteRule}
+     */
+    static createFrom($$source = {}) {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new SiteRule(/** @type {Partial<SiteRule>} */($$parsedSource));
     }
 }
 

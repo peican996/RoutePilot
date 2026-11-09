@@ -714,6 +714,21 @@ export default function App() {
   };
 
   const onCloseConn = (id: string) => run(() => svc.CloseConnection(id));
+
+  const onSetSite = (domain: string, ruleType: string, policy: string) => {
+    void (async () => {
+      try {
+        await svc.SetSiteRuleWithType(domain, ruleType, policy);
+        setNote(
+          `${domain} 已按「${ruleType === "exact" ? "精确域名" : "域名后缀"}」设置网站出口`,
+        );
+        schedNoteClear(TOAST_NOTE_MS);
+      } catch (e) {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    })();
+  };
+
   const onCloseAll = () => {
     if (conns.length === 0) return;
     if (!window.confirm(`确定断开全部 ${conns.length} 条连接？\n程序会自动重新发起连接。`)) {
@@ -1082,6 +1097,7 @@ export default function App() {
     running,
     busy,
     sub,
+    nodes,
     autoStart,
     onToggleAutoStart,
     coreInfo,
@@ -1175,6 +1191,7 @@ export default function App() {
               running={running}
               busy={busy}
               onSetProc={onSetProc}
+              onSetSite={onSetSite}
               onCloseConn={onCloseConn}
               onCloseAll={onCloseAll}
             />

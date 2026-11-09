@@ -164,6 +164,11 @@ type CoreService struct {
 	procTracker *procid.Tracker
 	idLogMu     sync.Mutex
 	idLogAt     map[string]time.Time
+
+	// 网站分流：smartRouting 开启内置国内外分流；siteRules 是用户自定义
+	// 的域名后缀规则，顺序即匹配顺序。
+	smartRouting bool
+	siteRules    []SiteRule
 	// 用户明确选择"不再提示"的进程。
 	ignored map[string]bool
 
@@ -563,6 +568,7 @@ func (s *CoreService) Boot() {
 	// 如果上次用过订阅，直接拿本地缓存起，不用等网络。
 	s.loadSavedSubscription()
 	s.loadProcRules()
+	s.loadSiteRules()
 	s.loadIgnored()
 	_ = s.writeProcRulesYAML()
 
@@ -598,7 +604,10 @@ func (s *CoreService) options() configgen.Options {
 	// TUN 改不动配置，界面显示和实际行为会脱节。
 	wantTUN := s.tunOn && s.admin()
 
-	plan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+	mainGroup := configgen.MainProxyGroup(s.subConfig)
+	procPlan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+	sitePlan := buildSiteRulePlan(s.siteRules, s.subTargets, s.subProviders, mainGroup)
+	combined := mergeTargetPlans(procPlan, sitePlan)
 
 	return configgen.Options{
 		MixedPort:          s.mixedPort,
@@ -608,8 +617,10 @@ func (s *CoreService) options() configgen.Options {
 		Mode:               mode,
 		Tun:                wantTUN,
 		ProcessRules:       true,
-		ProcessCustomRules: plan.Rules,
-		ProcessGroups:      plan.Groups,
+		ProcessCustomRules: procPlan.Rules,
+		ProcessGroups:      combined.Groups,
+		SiteRules:          sitePlan.Rules,
+		SmartRouting:       s.smartRouting,
 		Base:               s.subConfig,
 	}
 }
@@ -706,6 +717,154 @@ func buildProcessTargetPlan(rules map[string]string, targets map[string]bool, pr
 	return plan
 }
 
+// normalizeSiteRuleType 规范化规则类型；旧数据没有 type 字段时按后缀处理。
+func normalizeSiteRuleType(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", siteRuleSuffix, "domain-suffix":
+		return siteRuleSuffix, nil
+	case siteRuleExact, "domain":
+		return siteRuleExact, nil
+	default:
+		return "", fmt.Errorf("不支持的网站匹配类型: %s", raw)
+	}
+}
+
+// buildSiteRulePlan 把网站规则映射成 DOMAIN / DOMAIN-SUFFIX 规则。
+//
+// 显式节点/策略组与 DIRECT 直接作为规则出口；provider 节点在配置阶段
+// 还不存在，需要生成隐藏 select 组（复用进程分流的组与选中逻辑）。
+func buildSiteRulePlan(rules []SiteRule, targets map[string]bool, providers []string, mainGroup string) processTargetPlan {
+	plan := processTargetPlan{}
+	if len(rules) == 0 {
+		return plan
+	}
+	groupsByTarget := map[string]bool{}
+
+	// 精确域名比后缀更具体，必须排在前面；否则先写的后缀规则会
+	// 抢先命中，精确规则永远轮不到。
+	ordered := append([]SiteRule(nil), rules...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		ti, _ := normalizeSiteRuleType(ordered[i].Type)
+		tj, _ := normalizeSiteRuleType(ordered[j].Type)
+		return ti == siteRuleExact && tj != siteRuleExact
+	})
+
+	for _, r := range ordered {
+		domain, err := normalizeSiteDomain(r.Domain)
+		if err != nil {
+			continue
+		}
+		ruleType, err := normalizeSiteRuleType(r.Type)
+		if err != nil {
+			continue
+		}
+		target := ""
+		switch {
+		case r.Policy == "direct":
+			target = "DIRECT"
+		case r.Policy == "proxy":
+			target = mainGroup
+		case strings.HasPrefix(r.Policy, processTargetPrefix):
+			target = strings.TrimSpace(strings.TrimPrefix(r.Policy, processTargetPrefix))
+		}
+		if target == "" || strings.ContainsAny(target, ",\n\r\t\x00") {
+			continue
+		}
+
+		ruleTarget := target
+		if target != "DIRECT" && !builtinGroupNames[target] &&
+			!targets[target] && !strings.EqualFold(target, mainGroup) {
+			if len(providers) == 0 {
+				continue
+			}
+			group := processTargetGroupName(target)
+			if !groupsByTarget[target] {
+				use := make([]any, 0, len(providers))
+				for _, p := range providers {
+					use = append(use, p)
+				}
+				plan.Groups = append(plan.Groups, map[string]any{
+					"name": group, "type": "select", "proxies": []any{"DIRECT"}, "use": use,
+				})
+				plan.Selections = append(plan.Selections, processTargetSelection{
+					Group: group, Target: target, ProviderBacked: true,
+				})
+				groupsByTarget[target] = true
+			}
+			ruleTarget = group
+		}
+		rulePrefix := "DOMAIN-SUFFIX"
+		if ruleType == siteRuleExact {
+			rulePrefix = "DOMAIN"
+		}
+		plan.Rules = append(plan.Rules, fmt.Sprintf("%s,%s,%s", rulePrefix, domain, ruleTarget))
+	}
+	return plan
+}
+
+// mergeTargetPlans 合并进程与网站规则产生的隐藏组/选中动作，避免同名组重复。
+func mergeTargetPlans(parts ...processTargetPlan) processTargetPlan {
+	out := processTargetPlan{}
+	seenGroup := map[string]bool{}
+	seenSel := map[string]bool{}
+	for _, p := range parts {
+		for _, g := range p.Groups {
+			name, _ := g["name"].(string)
+			if name == "" || seenGroup[name] {
+				continue
+			}
+			seenGroup[name] = true
+			out.Groups = append(out.Groups, g)
+		}
+		for _, sel := range p.Selections {
+			key := sel.Group + "\x00" + sel.Target
+			if seenSel[key] {
+				continue
+			}
+			seenSel[key] = true
+			out.Selections = append(out.Selections, sel)
+		}
+	}
+	return out
+}
+
+// normalizeSiteDomain 规范化用户输入的域名后缀。
+func normalizeSiteDomain(raw string) (string, error) {
+	d := strings.ToLower(strings.TrimSpace(raw))
+	if d == "" {
+		return "", fmt.Errorf("域名不能为空")
+	}
+	if strings.Contains(d, "://") {
+		return "", fmt.Errorf("只填域名，不要带 http:// 或路径")
+	}
+	if strings.ContainsAny(d, ",\n\r\t\x00 /\\") {
+		return "", fmt.Errorf("域名不能包含空格、逗号、斜杠或控制字符")
+	}
+	d = strings.TrimPrefix(d, ".")
+	d = strings.TrimSuffix(d, ".")
+	if d == "" || !strings.Contains(d, ".") {
+		return "", fmt.Errorf("请输入完整域名，例如 example.com")
+	}
+	if net.ParseIP(d) != nil {
+		return "", fmt.Errorf("这里只支持域名，IP 请用订阅/GEOIP 规则")
+	}
+	for _, label := range strings.Split(d, ".") {
+		if label == "" || len(label) > 63 {
+			return "", fmt.Errorf("域名格式不正确: %s", d)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", fmt.Errorf("域名标签不能以连字符开头或结尾: %s", label)
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", fmt.Errorf("域名只支持英文、数字、连字符: %s", d)
+		}
+	}
+	return d, nil
+}
+
 // reloadConfig 让内核重新读取生成的配置，不重启进程。
 func (s *CoreService) reloadConfig(path string) error {
 	if s.api == nil {
@@ -724,7 +883,10 @@ func (s *CoreService) selectProcessTargets() {
 		return
 	}
 	s.mu.RLock()
-	plan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+	mainGroup := configgen.MainProxyGroup(s.subConfig)
+	procPlan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+	sitePlan := buildSiteRulePlan(s.siteRules, s.subTargets, s.subProviders, mainGroup)
+	plan := mergeTargetPlans(procPlan, sitePlan)
 	s.mu.RUnlock()
 	if len(plan.Selections) == 0 {
 		return
@@ -1656,21 +1818,25 @@ func (s *CoreService) MarkQuitting() {
 
 // ConfigBundle 导出的配置包。只含用户配置，不含流量历史等运行数据。
 type ConfigBundle struct {
-	Version    int               `json:"version"`
-	ExportedAt int64             `json:"exportedAt"`
-	Subs       []subMeta         `json:"subs"`
-	ProcRules  map[string]string `json:"procRules"`
-	Ignored    []string          `json:"ignored"`
+	Version      int               `json:"version"`
+	ExportedAt   int64             `json:"exportedAt"`
+	Subs         []subMeta         `json:"subs"`
+	ProcRules    map[string]string `json:"procRules"`
+	Ignored      []string          `json:"ignored"`
+	SmartRouting bool              `json:"smartRouting,omitempty"`
+	SiteRules    []SiteRule        `json:"siteRules,omitempty"`
 }
 
 // ExportConfig 导出配置为 JSON 字符串，供前端保存成文件。
 func (s *CoreService) ExportConfig() (string, error) {
 	s.mu.RLock()
 	bundle := ConfigBundle{
-		Version:    1,
-		ExportedAt: time.Now().Unix(),
-		Subs:       s.subs,
-		ProcRules:  s.procRules,
+		Version:      1,
+		ExportedAt:   time.Now().Unix(),
+		Subs:         s.subs,
+		ProcRules:    s.procRules,
+		SmartRouting: s.smartRouting,
+		SiteRules:    append([]SiteRule(nil), s.siteRules...),
 	}
 	for k, v := range s.ignored {
 		if v {
@@ -1700,6 +1866,8 @@ func (s *CoreService) ImportConfig(jsonStr string) error {
 	s.mu.Lock()
 	s.subs = bundle.Subs
 	s.procRules = rules
+	s.smartRouting = bundle.SmartRouting
+	s.siteRules = normalizeSiteRuleList(bundle.SiteRules)
 	s.ignored = make(map[string]bool)
 	for _, n := range bundle.Ignored {
 		s.ignored[n] = true
@@ -1707,6 +1875,9 @@ func (s *CoreService) ImportConfig(jsonStr string) error {
 	s.mu.Unlock()
 	if migrated {
 		s.dbg("导入的进程规则已迁移为路径/名称身份键（%d 条）", len(rules))
+	}
+	if err := s.persistSiteRules(s.SiteRules()); err != nil {
+		return fmt.Errorf("配置已导入，但保存网站规则失败: %w", err)
 	}
 
 	s.saveSubs()
@@ -2860,6 +3031,9 @@ type appState struct {
 	WinHTTPBackup  []byte `json:"winHttpBackup,omitempty"`
 	WinHTTPPending bool   `json:"winHttpPending,omitempty"`
 
+	// 国内外智能分流开关。
+	SmartRouting bool `json:"smartRouting,omitempty"`
+
 	// 地图本机位置（不填则用默认值）
 	HomeLon   *float64 `json:"homeLon,omitempty"`
 	HomeLat   *float64 `json:"homeLat,omitempty"`
@@ -3635,10 +3809,25 @@ func (s *CoreService) ResolveTargets(ips []string) map[string]any {
 const (
 	procRulesJSON   = "process-rules.json"
 	procIgnoredJSON = "process-ignored.json"
+	siteRulesJSON   = "site-rules.json"
 	procDirectYAML  = "process-direct.yaml"
 	procProxyYAML   = "process-proxy.yaml"
 	procDirectProv  = "pp-direct"
 	procProxyProv   = "pp-proxy"
+)
+
+// SiteRule 是一条按网站分流规则。
+// Type 取 "suffix"（域名后缀）/ "exact"（精确域名）；
+// Policy 取 "direct" / "proxy"（主策略组）/ "target:<节点或策略组>"。
+type SiteRule struct {
+	Domain string `json:"domain"`
+	Type   string `json:"type"`
+	Policy string `json:"policy"`
+}
+
+const (
+	siteRuleSuffix = "suffix"
+	siteRuleExact  = "exact"
 )
 
 // 常见系统进程，永远不用提示。
@@ -3731,6 +3920,59 @@ func (s *CoreService) loadProcRules() {
 			s.dbg("persist migrated process rules failed: %v", err)
 		}
 	}
+}
+
+func normalizeSiteRuleList(in []SiteRule) []SiteRule {
+	out := make([]SiteRule, 0, len(in))
+	seen := map[string]bool{}
+	for _, r := range in {
+		domain, err := normalizeSiteDomain(r.Domain)
+		if err != nil {
+			continue
+		}
+		ruleType, err := normalizeSiteRuleType(r.Type)
+		if err != nil {
+			continue
+		}
+		policy := strings.TrimSpace(r.Policy)
+		switch {
+		case policy == "direct" || policy == "proxy":
+		case strings.HasPrefix(policy, processTargetPrefix):
+		default:
+			continue
+		}
+		key := ruleType + "|" + domain
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, SiteRule{Domain: domain, Type: ruleType, Policy: policy})
+	}
+	return out
+}
+
+func (s *CoreService) loadSiteRules() {
+	b, err := os.ReadFile(filepath.Join(dataDir(), siteRulesJSON))
+	if err != nil {
+		return
+	}
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	var stored []SiteRule
+	if err := json.Unmarshal(b, &stored); err != nil {
+		s.dbg("read site rules failed: %v", err)
+		return
+	}
+	s.mu.Lock()
+	s.siteRules = normalizeSiteRuleList(stored)
+	s.mu.Unlock()
+}
+
+func (s *CoreService) persistSiteRules(rules []SiteRule) error {
+	mb, err := json.MarshalIndent(rules, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dataDir(), siteRulesJSON), mb, 0o600)
 }
 
 // loadIgnored 读取"用户已经选择不再提示"的进程列表。
@@ -3924,6 +4166,7 @@ func (s *CoreService) loadAppState() {
 	s.tunPrevProxyOn = st.TunPrevProxyOn
 	s.winHTTPPending = st.WinHTTPPending
 	s.winHTTPBackup = append([]byte(nil), st.WinHTTPBackup...)
+	s.smartRouting = st.SmartRouting
 	s.winX, s.winY, s.winW, s.winH = st.WinX, st.WinY, st.WinW, st.WinH
 	if st.HomeLon != nil && st.HomeLat != nil {
 		s.homeLon, s.homeLat = *st.HomeLon, *st.HomeLat
@@ -3984,6 +4227,7 @@ func (s *CoreService) saveAppState() {
 		Favorites:      favorites,
 		WinHTTPBackup:  winBackup,
 		WinHTTPPending: s.winHTTPPending,
+		SmartRouting:   s.smartRouting,
 		HomeLon:        &lon,
 		HomeLat:        &lat,
 		HomeLabel:      s.homeLabel,
@@ -4165,6 +4409,220 @@ func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Re
 		return
 	}
 	s.saveSubs()
+}
+
+// ---------- 网站分流 ----------
+
+// SmartRouting 返回是否开启内置国内外分流。
+func (s *CoreService) SmartRouting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.smartRouting
+}
+
+// SetSmartRouting 开关「国内直连、其余走订阅规则」。
+func (s *CoreService) SetSmartRouting(on bool) error {
+	s.mu.Lock()
+	old := s.smartRouting
+	s.smartRouting = on
+	s.mu.Unlock()
+	if old == on {
+		return nil
+	}
+	s.saveAppState()
+	if err := s.applyGeneratedConfig(); err != nil {
+		// 配置没生效就恢复开关，避免界面与实际不一致。
+		s.mu.Lock()
+		s.smartRouting = old
+		s.mu.Unlock()
+		s.saveAppState()
+		return err
+	}
+	return nil
+}
+
+// SiteRules 返回当前网站分流规则（副本）。
+func (s *CoreService) SiteRules() []SiteRule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]SiteRule, len(s.siteRules))
+	copy(out, s.siteRules)
+	return out
+}
+
+// SetSiteRule 新增或更新一条「域名后缀」规则（兼容旧调用）。
+func (s *CoreService) SetSiteRule(domain, policy string) error {
+	return s.SetSiteRuleWithType(domain, siteRuleSuffix, policy)
+}
+
+// SetSiteRuleWithType 新增或更新一条网站规则。
+// ruleType 取 "suffix"（域名后缀）/ "exact"（精确域名）。
+// policy 取 "direct" / "proxy" / "target:<节点或策略组>"。
+func (s *CoreService) SetSiteRuleWithType(domain, ruleType, policy string) error {
+	d, err := normalizeSiteDomain(domain)
+	if err != nil {
+		return err
+	}
+	rt, err := normalizeSiteRuleType(ruleType)
+	if err != nil {
+		return err
+	}
+	policy, err = s.normalizeSitePolicy(policy)
+	if err != nil {
+		return err
+	}
+
+	s.mu.RLock()
+	next := append([]SiteRule(nil), s.siteRules...)
+	s.mu.RUnlock()
+	found := false
+	for i := range next {
+		if next[i].Type == rt && strings.EqualFold(next[i].Domain, d) {
+			next[i].Policy = policy
+			found = true
+			break
+		}
+	}
+	if !found {
+		next = append(next, SiteRule{Domain: d, Type: rt, Policy: policy})
+	}
+
+	if err := s.persistSiteRules(next); err != nil {
+		return fmt.Errorf("保存网站规则失败: %w", err)
+	}
+	s.mu.Lock()
+	s.siteRules = next
+	s.mu.Unlock()
+
+	if err := s.applyGeneratedConfig(); err != nil {
+		return err
+	}
+	s.closeSiteConnections(d, rt)
+	return nil
+}
+
+// DeleteSiteRule 删除该域名的全部规则（精确与后缀）。
+func (s *CoreService) DeleteSiteRule(domain string) error {
+	return s.deleteSiteRule(domain, "")
+}
+
+// DeleteSiteRuleWithType 只删除指定匹配类型的规则。
+func (s *CoreService) DeleteSiteRuleWithType(domain, ruleType string) error {
+	rt, err := normalizeSiteRuleType(ruleType)
+	if err != nil {
+		return err
+	}
+	return s.deleteSiteRule(domain, rt)
+}
+
+func (s *CoreService) deleteSiteRule(domain, onlyType string) error {
+	d, err := normalizeSiteDomain(domain)
+	if err != nil {
+		return err
+	}
+	s.mu.RLock()
+	next := make([]SiteRule, 0, len(s.siteRules))
+	var removed []SiteRule
+	for _, r := range s.siteRules {
+		match := strings.EqualFold(r.Domain, d) && (onlyType == "" || r.Type == onlyType)
+		if match {
+			removed = append(removed, r)
+			continue
+		}
+		next = append(next, r)
+	}
+	s.mu.RUnlock()
+
+	if err := s.persistSiteRules(next); err != nil {
+		return fmt.Errorf("保存网站规则失败: %w", err)
+	}
+	s.mu.Lock()
+	s.siteRules = next
+	s.mu.Unlock()
+
+	if err := s.applyGeneratedConfig(); err != nil {
+		return err
+	}
+	for _, r := range removed {
+		s.closeSiteConnections(r.Domain, r.Type)
+	}
+	return nil
+}
+
+func (s *CoreService) normalizeSitePolicy(policy string) (string, error) {
+	policy = strings.TrimSpace(policy)
+	switch {
+	case policy == "direct":
+		return "direct", nil
+	case policy == "proxy":
+		s.mu.RLock()
+		group := configgen.MainProxyGroup(s.subConfig)
+		s.mu.RUnlock()
+		if group == "" {
+			return "", fmt.Errorf("还没有可用节点，请先添加订阅")
+		}
+		return "proxy", nil
+	case strings.HasPrefix(policy, processTargetPrefix):
+		target := strings.TrimSpace(strings.TrimPrefix(policy, processTargetPrefix))
+		if strings.ContainsAny(target, ",\n\r\t\x00") {
+			return "", fmt.Errorf("节点名含有非法字符")
+		}
+		if err := s.validateProcessTarget(target); err != nil {
+			return "", err
+		}
+		return processTargetPrefix + target, nil
+	default:
+		return "", fmt.Errorf("不支持的网站出口: %s", policy)
+	}
+}
+
+// applyGeneratedConfig 重新生成并热加载配置，让网站/智能分流修改即时生效。
+func (s *CoreService) applyGeneratedConfig() error {
+	if s.api == nil || s.mgr == nil || !s.mgr.IsRunning() {
+		return nil
+	}
+	confPath, err := configgen.Write(dataDir(), s.options())
+	if err != nil {
+		return fmt.Errorf("生成配置失败: %w", err)
+	}
+	if err := s.reloadConfig(confPath); err != nil {
+		s.dbg("reload site rules failed, fallback to kernel restart: %v", err)
+		if restartErr := s.RestartKernel(); restartErr != nil {
+			return fmt.Errorf("规则已保存，但重载内核失败: %v（重启也失败: %w）", err, restartErr)
+		}
+	}
+	s.selectProcessTargets()
+	s.invalidateConnCache()
+	return nil
+}
+
+// closeSiteConnections 断开命中该网站的旧连接，让新规则立刻生效。
+// 精确规则只断该主机；后缀规则同时断子域名。
+// mihomo 只在建连时匹配规则，不主动断开的话用户会以为没生效。
+func (s *CoreService) closeSiteConnections(domain, ruleType string) {
+	if s.api == nil || domain == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	resp, err := s.api.Connections(ctx)
+	if err != nil {
+		return
+	}
+	for _, c := range resp.Connections {
+		host := strings.ToLower(strings.TrimSuffix(c.Metadata.Host, "."))
+		if host == "" {
+			host = strings.ToLower(c.Metadata.DestinationIP)
+		}
+		match := host == domain
+		if ruleType != siteRuleExact {
+			match = match || strings.HasSuffix(host, "."+domain)
+		}
+		if match {
+			_ = s.api.CloseConnection(ctx, c.ID)
+		}
+	}
+	s.invalidateConnCache()
 }
 
 // ProcessRules 返回当前的进程分流表。

@@ -14,6 +14,7 @@ type Props = {
   running: boolean;
   busy: boolean;
   onSetProc: (proc: string, policy: string) => void;
+  onSetSite: (domain: string, ruleType: string, policy: string) => void;
   onCloseConn: (id: string) => void;
   onCloseAll: () => void;
 };
@@ -38,6 +39,14 @@ const BUILTIN = new Set([
 
 const TARGET_PREFIX = "target:";
 
+/** 连接目标是可用的域名（排除 IP / 空值）。 */
+function isDomainHost(host: string): boolean {
+  const h = (host || "").trim().toLowerCase();
+  if (!h || h === "—") return false;
+  if (h.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false;
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h);
+}
+
 /** 连接面板：进程策略 + 活动连接表。 */
 export default function ConnectionsPanel({
   conns,
@@ -46,6 +55,7 @@ export default function ConnectionsPanel({
   running,
   busy,
   onSetProc,
+  onSetSite,
   onCloseConn,
   onCloseAll,
 }: Props) {
@@ -56,6 +66,10 @@ export default function ConnectionsPanel({
   });
   const [groupByProc, setGroupByProc] = useState(false);
   const [connLimit, setConnLimit] = useState(CONN_PAGE_SIZE);
+  // 连接行上的「指定网站出口」小弹窗。
+  const [siteMenu, setSiteMenu] = useState<
+    { host: string; domain: string; type: string; policy: string } | null
+  >(null);
 
   // 按进程身份聚合连接数。身份优先是完整路径，同名不同目录不会合并。
   // 已有规则但当前没连接的进程也要列出来，否则改不回"跟随规则"。
@@ -283,7 +297,7 @@ export default function ConnectionsPanel({
                 下行 {connSort.key === "down" ? (connSort.desc ? "↓" : "↑") : ""}
               </th>
               <th style={{ width: 68, textAlign: "right" }}>时长</th>
-              <th style={{ width: 56 }}></th>
+              <th style={{ width: 112 }}></th>
             </tr>
           </thead>
           <tbody>
@@ -312,14 +326,35 @@ export default function ConnectionsPanel({
                   {fmtDuration(c.start)}
                 </td>
                 <td>
-                  <button
-                    className="row-action"
-                    onClick={() => onCloseConn(c.id)}
-                    disabled={busy}
-                    title="断开这条连接"
-                  >
-                    断开
-                  </button>
+                  <div style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                    <button
+                      className="row-action"
+                      onClick={() =>
+                        setSiteMenu({
+                          host: c.host,
+                          domain: c.host,
+                          type: "exact",
+                          policy: "direct",
+                        })
+                      }
+                      disabled={busy || !isDomainHost(c.host)}
+                      title={
+                        isDomainHost(c.host)
+                          ? "为这个网站指定出口"
+                          : "这条连接没有可用的目标域名"
+                      }
+                    >
+                      指定
+                    </button>
+                    <button
+                      className="row-action"
+                      onClick={() => onCloseConn(c.id)}
+                      disabled={busy}
+                      title="断开这条连接"
+                    >
+                      断开
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -335,6 +370,93 @@ export default function ConnectionsPanel({
           </tbody>
         </table>
       </div>
+
+      {siteMenu && (
+        <div
+          onClick={() => setSiteMenu(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 60,
+          }}
+        >
+          <div
+            className="card"
+            style={{ width: 390, margin: 0 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-head">
+              <span className="card-title">为网站指定出口</span>
+            </div>
+            <div className="card-sub">
+              保存后会断开该网站的旧连接，新连接按规则走。精确域名只匹配当前主机。
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+              <input
+                className="input"
+                value={siteMenu.domain}
+                onChange={(e) => setSiteMenu({ ...siteMenu, domain: e.target.value })}
+                placeholder="example.com"
+                spellCheck={false}
+              />
+              <select
+                className="input"
+                value={siteMenu.type}
+                onChange={(e) => setSiteMenu({ ...siteMenu, type: e.target.value })}
+              >
+                <option value="exact">精确域名（只匹配该主机）</option>
+                <option value="suffix">域名后缀（含子域名）</option>
+              </select>
+              <select
+                className="input"
+                value={siteMenu.policy}
+                onChange={(e) => setSiteMenu({ ...siteMenu, policy: e.target.value })}
+              >
+                <option value="direct">直连</option>
+                <option value="proxy">主策略组</option>
+                {groupChoices.length > 0 && (
+                  <optgroup label="策略组">
+                    {groupChoices.map((g) => (
+                      <option key={`mg-${g.name}`} value={`target:${g.name}`}>
+                        {g.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {nodeChoices.length > 0 && (
+                  <optgroup label="节点">
+                    {nodeChoices.map((n) => (
+                      <option key={`mn-${n.name}`} value={`target:${n.name}`}>
+                        {n.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn sm" onClick={() => setSiteMenu(null)}>
+                  取消
+                </button>
+                <button
+                  className="btn sm primary"
+                  disabled={!siteMenu.domain.trim()}
+                  onClick={() => {
+                    onSetSite(siteMenu.domain.trim(), siteMenu.type, siteMenu.policy);
+                    setSiteMenu(null);
+                  }}
+                >
+                  保存
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

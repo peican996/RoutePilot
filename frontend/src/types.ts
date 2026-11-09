@@ -51,6 +51,14 @@ export type NodeView = {
   count: number;
 };
 
+/** 网站分流规则：域名 → direct / proxy / target:<节点或策略组>。 */
+export type SiteRule = {
+  domain: string;
+  /** suffix = 域名后缀，exact = 精确域名 */
+  type: string;
+  policy: string;
+};
+
 export type SubInfo = {
   url: string;
   name: string;
