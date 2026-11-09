@@ -3,6 +3,7 @@
 package sysproxy
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -63,6 +64,26 @@ func Disable() error {
 
 	if err := k.SetDWordValue("ProxyEnable", 0); err != nil {
 		return fmt.Errorf("关闭 ProxyEnable 失败: %w", err)
+	}
+	notify()
+	return nil
+}
+
+// SetServer 单独恢复 ProxyServer。关闭代理时 Disable 只改 ProxyEnable，
+// 不会动地址；要把注册表完整还原到接管前，必须显式写回/删除该值。
+func SetServer(addr string) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开注册表失败: %w", err)
+	}
+	defer k.Close()
+
+	if addr == "" {
+		if err := k.DeleteValue("ProxyServer"); err != nil && !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return fmt.Errorf("删除 ProxyServer 失败: %w", err)
+		}
+	} else if err := k.SetStringValue("ProxyServer", addr); err != nil {
+		return fmt.Errorf("写入 ProxyServer 失败: %w", err)
 	}
 	notify()
 	return nil
@@ -188,7 +209,11 @@ func RestoreWinHTTP(data []byte) error {
 	defer k.Close()
 
 	if len(data) == 0 {
-		_ = k.DeleteValue("WinHttpSettings")
+		// 值本来就不存在等价于直连成功；其它删除失败必须上报，
+		// 否则调用方会误以为已经恢复，实际服务流量仍指向死端口。
+		if err := k.DeleteValue("WinHttpSettings"); err != nil && !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return fmt.Errorf("删除 WinHTTP 设置失败: %w", err)
+		}
 		return nil
 	}
 	if err := k.SetBinaryValue("WinHttpSettings", data); err != nil {
