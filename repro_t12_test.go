@@ -9,38 +9,39 @@ import (
 	"routepilot/internal/configgen"
 )
 
-// T12：两个不同目录下的同名 EXE。当前规则只能按 EXE 名匹配，
-// 且进程名里不允许出现路径分隔符，因此无法区分同名的两个程序。
-func TestReproT12SameNameExeCannotBeDistinguished(t *testing.T) {
-	// 1. 路径形式的进程名被拒绝，说明没有"按路径匹配"的能力。
-	if got := sanitizeProcName(`C:\Program Files\App\chrome.exe`); got != "" {
-		t.Fatalf("预期路径形式被拒绝，实际 %q", got)
-	}
-
-	// 2. 规则只按 basename 生成，两个目录的同名程序共享同一条规则。
+// T12（已修复）：两个不同目录下的同名 EXE 现在按完整路径匹配，
+// 不再共享同一条 PROCESS-NAME 规则。
+func TestReproT12SameNameExeDistinguishedByPath(t *testing.T) {
 	plan := buildProcessTargetPlan(
-		map[string]string{"chrome.exe": "target:NodeA"},
+		map[string]string{
+			`path:C:\Apps\A\chrome.exe`: "target:NodeA",
+			`path:C:\Apps\B\chrome.exe`: "target:NodeA",
+		},
 		map[string]bool{"NodeA": true},
 		nil,
 	)
-	if len(plan.Rules) != 1 {
-		t.Fatalf("预期只有一条按名称的规则，实际 %v", plan.Rules)
+	if len(plan.Rules) != 2 {
+		t.Fatalf("同名不同目录应生成两条规则，实际 %v", plan.Rules)
 	}
-	if !strings.HasPrefix(plan.Rules[0], "PROCESS-NAME,chrome.exe,") {
-		t.Fatalf("规则应只含 EXE 名：%q", plan.Rules[0])
+	for _, rule := range plan.Rules {
+		if !strings.HasPrefix(rule, "PROCESS-PATH,") {
+			t.Fatalf("应使用路径规则区分同名程序：%q", rule)
+		}
 	}
 
-	// 3. 生成的配置里不存在 ANY 路径匹配条件（PROCESS-PATH）。
 	cfg := configgen.Build(configgen.Options{
 		ProcessRules:       true,
 		ProcessCustomRules: plan.Rules,
 		ProcessGroups:      plan.Groups,
 	})
 	rules, _ := cfg["rules"].([]any)
+	pathRules := 0
 	for _, r := range rules {
 		if s, ok := r.(string); ok && strings.HasPrefix(s, "PROCESS-PATH") {
-			t.Fatalf("不应出现路径规则：%s", s)
+			pathRules++
 		}
 	}
-	t.Log("FAIL: 同名不同路径的 exe 会命中同一条规则（T12 复现）")
+	if pathRules != 2 {
+		t.Fatalf("生成的配置应包含两条 PROCESS-PATH 规则，实际 %d", pathRules)
+	}
 }

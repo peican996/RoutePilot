@@ -4,13 +4,14 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-// T17：订阅地址可以 302 到本机/内网地址。当前实现没有限制重定向目标，
-// 预期安全行为是拒绝；测试在修复前应当失败（复现 SSRF 面）。
+// T17（已修复）：订阅入口/重定向目标不允许指向本机或内网。
+// 这里初始地址就是 httptest 的 127.0.0.1，必须被 SSRF 防线直接拒绝。
 func TestReproT17RedirectToLoopback(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/yaml")
@@ -25,6 +26,9 @@ func TestReproT17RedirectToLoopback(t *testing.T) {
 
 	res, err := Fetch(context.Background(), redirect.URL, false)
 	if err == nil {
-		t.Fatalf("订阅被重定向到本机地址并成功解析（SSRF 复现）: nodes=%d", len(res.Nodes))
+		t.Fatalf("订阅被重定向到本机地址并成功解析（SSRF）: nodes=%d", len(res.Nodes))
+	}
+	if !errors.Is(err, ErrBlockedAddress) {
+		t.Fatalf("应以受限地址错误拒绝，实际 %v", err)
 	}
 }

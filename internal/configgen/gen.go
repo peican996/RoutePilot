@@ -370,8 +370,43 @@ func Write(dataDir string, o Options) (string, error) {
 	}
 	path := filepath.Join(dataDir, "config.yaml")
 	// config.yaml 里有 API secret，权限收紧到仅本人可读。
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("写入配置失败: %w", err)
 	}
 	return path, nil
+}
+
+// writeFileAtomic 先写同目录临时文件并 Sync，再原子替换。
+// 写一半崩溃时磁盘上仍是上一份完整配置，内核不会读到截断的 YAML。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	done := false
+	defer func() {
+		_ = f.Close()
+		if !done {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	done = true
+	return nil
 }

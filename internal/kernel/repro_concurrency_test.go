@@ -131,7 +131,7 @@ func TestReproT08ActiveStopNotReportedAsCrash(t *testing.T) {
 	withFakeKernel(t)
 	m := reproManager(t)
 	crashes := 0
-	m.OnExit = func(string) { crashes++ }
+	m.OnExit = func(ExitInfo) { crashes++ }
 
 	if err := m.Start("dummy.yaml"); err != nil {
 		t.Fatal(err)
@@ -145,12 +145,15 @@ func TestReproT08ActiveStopNotReportedAsCrash(t *testing.T) {
 	}
 }
 
-// T09：Job Object 分配失败。验证失败路径不会 panic、也不会误报成功。
-func TestReproT09JobObjectFailureIsSilent(t *testing.T) {
-	// 不存在的 PID：AssignProcessToJobObject 必然失败。
-	// 当前实现返回 void 且完全忽略返回值，调用方无法感知未托管。
-	attachToJob(0x7FFFFFF0)
-	t.Log("attachToJob 对不存在的 PID 静默返回，调用方无法区分已托管/未托管（T09 复现）")
+// T09：Job Object 分配失败。验证失败路径会返回可诊断错误，
+// 调用方因此能中止启动，而不是误以为进程已受管。
+func TestReproT09JobObjectFailureIsReported(t *testing.T) {
+	// 不存在的 PID：OpenProcess / AssignProcessToJobObject 必然失败。
+	err := newJobObject().assign(0x7FFFFFF0)
+	if err == nil {
+		t.Fatal("FAIL: Job Object 分配失败却返回 nil，调用方无法感知未托管")
+	}
+	t.Logf("Job Object 分配失败已正确上报: %v", err)
 }
 
 // T18：内核替换过程被中断。目标被占用/无法删除时，旧内核已删除、

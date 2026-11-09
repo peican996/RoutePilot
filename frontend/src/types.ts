@@ -26,6 +26,7 @@ export type Conn = {
   destIP: string;
   process: string;
   processPath: string;
+  processKey: string;
   chains: string;
   rule: string;
   upload: number;

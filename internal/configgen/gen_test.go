@@ -1,6 +1,39 @@
 package configgen
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// config.yaml 必须原子写入：成功后内容完整，且不残留临时文件。
+func TestWriteConfigAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path, err := Write(dir, Options{
+		MixedPort: 17890,
+		APIPort:   19090,
+		DNSListen: 11053,
+		Secret:    "test-secret",
+		Mode:      "rule",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Fatal("配置文件不应为空")
+	}
+	left, err := filepath.Glob(filepath.Join(dir, ".config.yaml.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("不应残留临时文件: %v", left)
+	}
+}
 
 // 这是一个真实踩过的回归：Build 曾经直接改写传入的 Base，
 // 导致每次重启内核都往 rules 里多插一遍 RULE-SET，规则无限叠加。

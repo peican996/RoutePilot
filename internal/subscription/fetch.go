@@ -57,11 +57,15 @@ type Result struct {
 }
 
 func do(ctx context.Context, u string, insecure bool) ([]byte, http.Header, error) {
-	tr := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecure},
-		ResponseHeaderTimeout: 20 * time.Second,
+	return doWithDeps(ctx, u, insecure, defaultFetchDeps())
+}
+
+func doWithDeps(ctx context.Context, u string, insecure bool, deps fetchDeps) ([]byte, http.Header, error) {
+	if _, err := validateSubscriptionURL(u); err != nil {
+		return nil, nil, err
 	}
-	c := &http.Client{Timeout: 45 * time.Second, Transport: tr}
+
+	c := newGuardedClient(insecure, deps)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, nil, err
@@ -76,9 +80,15 @@ func do(ctx context.Context, u string, insecure bool) ([]byte, http.Header, erro
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.ContentLength > maxSubscriptionBytes {
+		return nil, nil, fmt.Errorf("%w：声明长度 %d 字节", ErrResponseTooLarge, resp.ContentLength)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
 	if err != nil {
 		return nil, nil, err
+	}
+	if int64(len(body)) > maxSubscriptionBytes {
+		return nil, nil, fmt.Errorf("%w：超过 %d 字节", ErrResponseTooLarge, maxSubscriptionBytes)
 	}
 	if len(body) == 0 {
 		return nil, nil, fmt.Errorf("订阅返回空内容")
@@ -272,8 +282,8 @@ func Fetch(ctx context.Context, subURL string, allowInsecure bool) (*Result, err
 	if subURL == "" {
 		return nil, fmt.Errorf("订阅地址为空")
 	}
-	if !strings.HasPrefix(subURL, "http://") && !strings.HasPrefix(subURL, "https://") {
-		return nil, fmt.Errorf("订阅地址必须以 http:// 或 https:// 开头")
+	if _, err := validateSubscriptionURL(subURL); err != nil {
+		return nil, err
 	}
 
 	body, hdr, insecure, err := download(ctx, subURL, allowInsecure)

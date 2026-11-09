@@ -2,7 +2,10 @@ package kernel
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,14 +17,68 @@ import (
 )
 
 // State 表示内核进程的生命周期状态。
+//
+// 状态转换只允许在 Manager 的锁内完成：
+//
+//	Stopped/Failed → Starting → Running
+//	Starting → Failed（启动失败，进程已清理）
+//	Running → Stopping → Stopped
+//	Running → Failed（异常退出）
 type State string
 
 const (
 	StateStopped  State = "stopped"
 	StateStarting State = "starting"
 	StateRunning  State = "running"
-	StateError    State = "error"
+	StateStopping State = "stopping"
+	StateFailed   State = "failed"
 )
+
+// 生命周期错误。调用方用 errors.Is 判断具体类别，不要靠字符串匹配。
+var (
+	ErrAlreadyRunning  = errors.New("内核已在运行")
+	ErrLifecycleBusy   = errors.New("内核正在停止，请稍后重试")
+	ErrNotReady        = errors.New("内核尚未就绪")
+	ErrManagerClosed   = errors.New("内核管理器已关闭")
+	ErrPortInUse       = errors.New("控制 API 端口被占用")
+	ErrStartTimeout    = errors.New("内核启动超时")
+	ErrAPIUnreachable  = errors.New("内核进程已启动但控制 API 不可访问")
+	ErrProcessExited   = errors.New("内核进程在启动完成前退出")
+	ErrStopTimeout     = errors.New("内核未能在限定时间内退出")
+	ErrJobObjectFailed = errors.New("内核进程未能纳入 Job Object")
+)
+
+// ExitInfo 描述一次异常进程退出。回调只在「非主动且非零退出」时触发，
+// 因此这里不包含 Intentional 字段：收到它就代表需要上层决定是否恢复。
+type ExitInfo struct {
+	Reason    string
+	ExitCode  int
+	Uptime    time.Duration
+	StartedAt time.Time
+	At        time.Time
+}
+
+const (
+	// stopTimeout 是等待进程真正退出的上限。超过后状态进入 Failed，
+	// 由上层决定是否重试，而不是假装 Stop 成功。
+	stopTimeout = 5 * time.Second
+	// readyPollInterval 是启动就绪探测的轮询间隔。
+	readyPollInterval = 200 * time.Millisecond
+)
+
+// processRun 是一次启动产生的全部资源。cmd/PID/退出信号/清理完成信号
+// 绑定在同一个对象上，避免新旧两次启动互相覆盖字段。
+type processRun struct {
+	cmd     *exec.Cmd
+	pid     int
+	started time.Time
+	exited  chan struct{} // Wait 返回后关闭
+	done    chan struct{} // 收尾逻辑执行完毕后关闭
+	// intentional 由 Stop/Restart/启动失败清理写入，受 Manager.mu 保护。
+	intentional bool
+	// exitErr 在 close(exited) 前写入，读取方需等待 done。
+	exitErr error
+}
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
@@ -156,24 +213,39 @@ type Status struct {
 }
 
 // Manager 负责 mihomo 子进程的完整生命周期：落盘二进制、启动、退出、崩溃捕获。
+//
+// 并发模型：
+//   - opMu 串行化 Start/Stop/Restart/Close。同一时刻只有一个生命周期事务，
+//     Stop 与 Start 并发时按到达顺序线性化，不会交叉执行。
+//   - mu 只保护状态快照与当前 run，不做耗时操作，Status 轮询不会被阻塞。
 type Manager struct {
-	mu sync.Mutex
+	opMu sync.Mutex
 
+	mu      sync.Mutex
 	exePath string
 	dataDir string
-	cmd     *exec.Cmd
 	state   State
+	run     *processRun
 	lastErr string
-	started time.Time
-	exited  chan struct{}
+	closed  bool
 
-	// stopping 标记「主动 Stop/Restart」。主动 kill 时 cmd.Wait() 也会返回
-	// 非 nil（"signal: killed"/"exit status 1"），不能当成崩溃处理，
-	// 否则每次正常重启都会误报内核异常、还会连锁触发看门狗无限重启。
-	stopping bool
+	// 启动就绪校验：addr 是控制 API 监听地址。probe 成功才把状态推进到
+	// Running；仅进程存活不代表启动成功。
+	readyAddr    string
+	readyProbe   func(context.Context) error
+	readyTimeout time.Duration
 
-	// OnExit 内核进程意外退出时的回调（正常 Stop 不触发）。
-	OnExit func(reason string)
+	// job 拥有「本进程退出即杀死内核」的 Job 句柄。生命周期与 Manager 一致，
+	// 只有 Close 才关闭；Stop/Restart 不销毁它，避免重启时反复创建。
+	job *jobObject
+
+	// OnExit 只在「非主动、非零退出」时触发。用户 Stop/Restart 与正常
+	// 退出（exit code 0）都不会回调。
+	OnExit func(ExitInfo)
+
+	// lastBackup 是最近一次成功替换前的内核备份路径。
+	// 升级后的首次启动失败时用它回滚；只在同一次进程内有效。
+	lastBackup string
 
 	Logs *LogBuffer
 }
@@ -181,15 +253,36 @@ type Manager struct {
 // NewManager 创建管理器。dataDir 用于存放内核二进制、配置文件与缓存。
 func NewManager(dataDir string) *Manager {
 	return &Manager{
-		dataDir: dataDir,
-		state:   StateStopped,
-		Logs:    NewLogBuffer(400),
+		dataDir:      dataDir,
+		state:        StateStopped,
+		readyTimeout: 15 * time.Second,
+		job:          newJobObject(),
+		Logs:         NewLogBuffer(400),
+	}
+}
+
+// SetStartupValidation 配置启动就绪校验。
+//
+// addr 是控制 API 的监听地址（如 127.0.0.1:19090）；probe 应实际请求
+// 该 API（例如 /version）。只有 probe 成功，Start 才会返回成功并把状态
+// 置为 Running；超时后按「端口冲突 / 启动超时 / API 不可访问」分类报错。
+func (m *Manager) SetStartupValidation(addr string, probe func(context.Context) error, timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readyAddr = addr
+	m.readyProbe = probe
+	if timeout > 0 {
+		m.readyTimeout = timeout
 	}
 }
 
 func (m *Manager) DataDir() string { return m.dataDir }
 
-func (m *Manager) ExePath() string { return m.exePath }
+func (m *Manager) ExePath() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.exePath
+}
 
 // EnsureAux 释放内核运行所需的附属文件（Windows 上是 wintun.dll）。
 // 同时写到数据目录和 bin 目录：mihomo 查找驱动时会先看工作目录，
@@ -208,21 +301,46 @@ func (m *Manager) EnsureAux(files map[string][]byte) {
 }
 
 // Start 以指定的配置文件启动内核。
+//
+// 这是一个完整事务：互斥、启动进程、纳入 Job、等待控制 API 就绪。
+// 任何一步失败都会杀掉本次进程并把状态置为 Failed，不会留下半启动状态。
 func (m *Manager) Start(configPath string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.startLocked(configPath)
+}
+
+func (m *Manager) startLocked(configPath string) error {
 	m.mu.Lock()
-	if m.cmd != nil {
+	if m.closed {
 		m.mu.Unlock()
-		return fmt.Errorf("内核已在运行")
+		return ErrManagerClosed
+	}
+	if m.run != nil || m.state == StateRunning || m.state == StateStarting {
+		m.mu.Unlock()
+		return fmt.Errorf("%w（当前状态 %s）", ErrAlreadyRunning, m.state)
+	}
+	if m.state == StateStopping {
+		m.mu.Unlock()
+		return ErrLifecycleBusy
 	}
 	if m.exePath == "" {
 		m.mu.Unlock()
-		return fmt.Errorf("内核尚未就绪，请先调用 EnsureBinary")
+		return fmt.Errorf("%w，请先调用 EnsureBinary", ErrNotReady)
 	}
 	exe := m.exePath
+	addr, probe, timeout := m.readyAddr, m.readyProbe, m.readyTimeout
 	m.state = StateStarting
 	m.lastErr = ""
-	m.stopping = false
 	m.mu.Unlock()
+
+	// 端口预检查只能作为快速失败提示，不能保证随后一定能绑定；
+	// 真正的结论以启动后的 API 探测为准。
+	if addr != "" {
+		if err := checkAddrFree(addr); err != nil {
+			return m.failStart(fmt.Errorf("%w：%s（%v）", ErrPortInUse, addr, err))
+		}
+	}
 
 	cmd := exec.Command(exe, "-d", m.dataDir, "-f", configPath)
 	cmd.Dir = m.dataDir
@@ -235,115 +353,280 @@ func (m *Manager) Start(configPath string) error {
 	cmd.Stderr = w
 
 	if err := cmd.Start(); err != nil {
-		m.mu.Lock()
-		m.state = StateError
-		m.lastErr = err.Error()
-		m.mu.Unlock()
-		return fmt.Errorf("启动内核失败: %w", err)
-	}
-
-	// 挂在 Job 上，本进程被强杀时内核会一并结束，不留孤儿。
-	attachToJob(cmd.Process.Pid)
-
-	exited := make(chan struct{})
-	m.mu.Lock()
-	m.cmd = cmd
-	m.state = StateRunning
-	m.started = time.Now()
-	m.exited = exited
-	m.mu.Unlock()
-
-	// 唯一的 Wait 调用点。进程自然退出时在这里收尾。
-	go func() {
-		err := cmd.Wait()
 		if w.file != nil {
 			_ = w.file.Close()
 		}
-		close(exited)
-		m.mu.Lock()
-		if m.cmd != cmd {
-			m.mu.Unlock()
-			return
+		return m.failStart(fmt.Errorf("启动内核失败: %w", err))
+	}
+
+	// 挂在 Job 上，本进程被强杀时内核会一并结束，不留孤儿。
+	// 分配失败不再静默降级：无法保证进程受管时直接终止本次启动。
+	if m.job != nil {
+		if err := m.job.assign(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			if w.file != nil {
+				_ = w.file.Close()
+			}
+			return m.failStart(fmt.Errorf("%w：%v", ErrJobObjectFailed, err))
 		}
-		m.cmd = nil
-		m.started = time.Time{}
-		intentional := m.stopping
-		m.stopping = false
-		if err != nil && !intentional {
-			m.state = StateError
-			m.lastErr = err.Error()
-		} else {
-			m.state = StateStopped
-			m.lastErr = ""
+	}
+
+	r := &processRun{
+		cmd:     cmd,
+		pid:     cmd.Process.Pid,
+		started: time.Now(),
+		exited:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	m.mu.Lock()
+	m.run = r
+	m.mu.Unlock()
+
+	// 唯一的 Wait 调用点。进程自然退出时在这里收尾。
+	go m.waitProcess(r, w)
+
+	// 进程存活不等于启动成功：必须等控制 API 真正可用。
+	if probe != nil {
+		if err := m.awaitReady(r, probe, timeout); err != nil {
+			return m.abortStart(r, err)
 		}
-		cb := m.OnExit
-		reason := m.lastErr
+	}
+
+	m.mu.Lock()
+	if m.run != r {
+		// 进程在探测成功与状态切换之间退出：这仍然是一次启动失败。
+		if m.state != StateFailed {
+			m.state = StateFailed
+			m.lastErr = exitReason(r.exitErr)
+		}
 		m.mu.Unlock()
-
-		// 只把「非主动停止」的异常退出上报为崩溃
-		if cb != nil && err != nil && !intentional {
-			cb(reason)
-		}
-	}()
-
+		return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
+	}
+	m.state = StateRunning
+	m.lastErr = ""
+	m.mu.Unlock()
 	return nil
 }
 
-// Stop 结束内核进程，并等待它真正退出，避免端口未释放导致重启失败。
-func (m *Manager) Stop() error {
+// awaitReady 轮询探测控制 API，直到成功、进程退出或超时。
+func (m *Manager) awaitReady(r *processRun, probe func(context.Context) error, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(readyPollInterval)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		if err := probe(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-r.exited:
+			<-r.done
+			return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
+		case <-ctx.Done():
+			return m.classifyStartFailure(lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+// classifyStartFailure 在启动超时后区分三类失败，便于用户直接定位：
+// 端口被别的程序占住 / 进程在监听但 API 不健康 / 什么都没起来。
+func (m *Manager) classifyStartFailure(cause error) error {
 	m.mu.Lock()
-	cmd := m.cmd
-	exited := m.exited
-	// 先标记为主动停止，Wait goroutine 看到后不会当成崩溃上报
-	m.stopping = true
+	addr, timeout := m.readyAddr, m.readyTimeout
 	m.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		m.mu.Lock()
-		m.stopping = false
+	if addr != "" {
+		// 先尝试建连：能连上说明端口上是我们的（或别的）监听者，
+		// 但 HTTP 层没有正常响应，属于 API 不可访问。
+		if conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return fmt.Errorf("%w：%s 有监听但健康检查失败（%v）", ErrAPIUnreachable, addr, cause)
+		}
+		if err := bindAddr(addr); err != nil {
+			return fmt.Errorf("%w：%s（%v）", ErrPortInUse, addr, err)
+		}
+	}
+	return fmt.Errorf("%w：%s 内未就绪（%v）", ErrStartTimeout, timeout, cause)
+}
+
+// abortStart 清理一次失败的启动：标记为主动结束、杀掉进程并等待收尾，
+// 最后把状态置为 Failed。
+func (m *Manager) abortStart(r *processRun, cause error) error {
+	m.mu.Lock()
+	if m.run == r {
+		r.intentional = true
+		m.state = StateStopping
+	}
+	m.mu.Unlock()
+
+	_ = r.cmd.Process.Kill()
+
+	cleaned := true
+	select {
+	case <-r.done:
+	case <-time.After(stopTimeout):
+		cleaned = false
+	}
+
+	m.mu.Lock()
+	// 只有确认进程已收尾才清空 run；否则保留句柄，阻止后续 Start
+	// 在旧进程仍存活时再拉起第二个实例。
+	if cleaned && m.run == r {
+		m.run = nil
+	}
+	m.state = StateFailed
+	m.lastErr = cause.Error()
+	m.mu.Unlock()
+	return cause
+}
+
+// failStart 记录未产生进程的启动失败。
+func (m *Manager) failStart(err error) error {
+	m.mu.Lock()
+	if m.run == nil && m.state == StateStarting {
+		m.state = StateFailed
+	}
+	m.lastErr = err.Error()
+	m.mu.Unlock()
+	return err
+}
+
+// waitProcess 是唯一的 cmd.Wait 调用点，负责回收全部进程资源。
+func (m *Manager) waitProcess(r *processRun, w *logWriter) {
+	err := r.cmd.Wait()
+	if w.file != nil {
+		_ = w.file.Close()
+	}
+	r.exitErr = err
+	close(r.exited)
+
+	m.mu.Lock()
+	current := m.run == r
+	intentional := r.intentional
+	if current {
+		m.run = nil
+		// 用户主动停止、或进程以 0 正常退出，都不算崩溃。
+		if intentional || err == nil {
+			m.state = StateStopped
+			m.lastErr = ""
+		} else {
+			m.state = StateFailed
+			m.lastErr = err.Error()
+		}
+	}
+	cb := m.OnExit
+	m.mu.Unlock()
+
+	// done 关闭后，Stop/abortStart 可以确定 cmd、PID 已清空。
+	close(r.done)
+
+	// 只上报异常退出：主动停止与正常退出都不触发自动恢复。
+	if current && cb != nil && err != nil && !intentional {
+		cb(ExitInfo{
+			Reason:    err.Error(),
+			ExitCode:  exitCode(err),
+			Uptime:    time.Since(r.started),
+			StartedAt: r.started,
+			At:        time.Now(),
+		})
+	}
+}
+
+// Stop 结束内核进程，并等待资源真正回收。
+func (m *Manager) Stop() error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.stopLocked()
+}
+
+func (m *Manager) stopLocked() error {
+	m.mu.Lock()
+	if (m.state == StateStopped || m.state == StateFailed) && m.run == nil {
 		m.mu.Unlock()
 		return nil
 	}
-	_ = cmd.Process.Kill()
-
-	if exited != nil {
-		select {
-		case <-exited:
-		case <-time.After(5 * time.Second):
-			m.mu.Lock()
-			m.stopping = false
-			m.mu.Unlock()
-			return fmt.Errorf("内核未能在 5 秒内退出")
-		}
-	}
-
-	// exited 是在收尾逻辑之前 close 的，这里再等 cmd 句柄真正清空，
-	// 否则紧接着的 Start 会撞上「内核已在运行」。
-	for i := 0; i < 100; i++ {
-		m.mu.Lock()
-		done := m.cmd == nil
+	r := m.run
+	if r == nil {
+		m.state = StateStopped
+		m.lastErr = ""
 		m.mu.Unlock()
-		if done {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+		return nil
 	}
+	// 先标记为主动停止，Wait goroutine 看到后不会当成崩溃上报。
+	r.intentional = true
+	m.state = StateStopping
+	m.mu.Unlock()
+
+	killErr := r.cmd.Process.Kill()
+	// 进程可能已经自行退出；Kill 返回的错误交给 Wait 收尾判断，
+	// 只有等待超时时才把它作为诊断信息返回。
+
+	select {
+	case <-r.done:
+	case <-time.After(stopTimeout):
+		m.mu.Lock()
+		if m.run == r {
+			m.state = StateFailed
+			m.lastErr = fmt.Sprintf("停止内核超时（kill: %v）", killErr)
+		}
+		m.mu.Unlock()
+		return fmt.Errorf("%w（kill: %v）", ErrStopTimeout, killErr)
+	}
+
+	m.mu.Lock()
+	if m.run == nil && m.state != StateFailed {
+		m.state = StateStopped
+		m.lastErr = ""
+	}
+	m.mu.Unlock()
 	return nil
 }
 
-// Restart 先停再起。
+// Restart 是一个完整事务：Stop 与新 Start 之间不会被其他生命周期操作插入。
 func (m *Manager) Restart(configPath string) error {
-	if err := m.Stop(); err != nil {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if err := m.stopLocked(); err != nil {
 		return err
 	}
-	time.Sleep(150 * time.Millisecond)
-	return m.Start(configPath)
+	return m.startLocked(configPath)
+}
+
+// Close 停止内核并关闭 Job 句柄。关闭后 Manager 不再接受 Start。
+func (m *Manager) Close() error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+
+	stopErr := m.stopLocked()
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+
+	var jobErr error
+	if m.job != nil {
+		jobErr = m.job.close()
+	}
+	if stopErr != nil {
+		return stopErr
+	}
+	return jobErr
 }
 
 func (m *Manager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.cmd != nil
+	return m.state == StateRunning
 }
 
 func (m *Manager) Status() Status {
@@ -355,12 +638,55 @@ func (m *Manager) Status() Status {
 		ExePath: m.exePath,
 		DataDir: m.dataDir,
 	}
-	if m.cmd != nil && m.cmd.Process != nil {
-		st.PID = m.cmd.Process.Pid
-	}
-	if !m.started.IsZero() {
-		st.StartedAt = m.started.UnixMilli()
-		st.Uptime = int64(time.Since(m.started).Seconds())
+	if m.run != nil {
+		st.PID = m.run.pid
+		st.StartedAt = m.run.started.UnixMilli()
+		st.Uptime = int64(time.Since(m.run.started).Seconds())
 	}
 	return st
+}
+
+// checkAddrFree 用于启动前快速判断端口占用。
+//
+// 绑定失败不一定代表别的程序在监听：Windows 上 TIME_WAIT 也会让刚释放的
+// 端口短暂无法绑定。只有在确实能建立 TCP 连接时才判定为被占用，避免内核
+// 刚重启就误报端口冲突。
+func checkAddrFree(addr string) error {
+	bindErr := bindAddr(addr)
+	if bindErr == nil {
+		return nil
+	}
+	conn, dialErr := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if dialErr == nil {
+		_ = conn.Close()
+		return bindErr
+	}
+	return nil
+}
+
+// bindAddr 尝试独占绑定地址，返回底层错误。
+func bindAddr(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return ln.Close()
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+func exitReason(err error) string {
+	if err == nil {
+		return "exit code 0"
+	}
+	return err.Error()
 }

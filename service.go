@@ -24,6 +24,7 @@ import (
 	"routepilot/internal/elevate"
 	"routepilot/internal/geoip"
 	"routepilot/internal/kernel"
+	"routepilot/internal/procid"
 	"routepilot/internal/subscription"
 	"routepilot/internal/sysproxy"
 
@@ -101,6 +102,8 @@ type CoreService struct {
 
 	mgr *kernel.Manager
 	api *kernel.Client
+	// 内核异常退出的自动恢复策略。nil 表示尚未启动看门狗。
+	watchdog *kernel.Watchdog
 
 	// 系统代理注册表操作。默认走真实 sysproxy，测试可替换为故障注入版本。
 	sys systemProxyOps
@@ -153,8 +156,14 @@ type CoreService struct {
 	subs      []subMeta
 	activeIdx int
 
-	// 按程序分流：进程名 → "proxy" / "direct"。没有记录的进程走订阅规则。
+	// 按程序分流：进程匹配身份 → "proxy" / "direct" / "target:<节点>"。
+	// 键优先是 path:<规范化完整路径>，拿不到路径时才降级为 name:<exe 名>。
 	procRules map[string]string
+	// 连接 → 进程身份的短周期解析缓存。只在 mihomo 缺少 processPath 时使用，
+	// 规则键本身不包含 PID/创建时间，可跨重启稳定匹配。
+	procTracker *procid.Tracker
+	idLogMu     sync.Mutex
+	idLogAt     map[string]time.Time
 	// 用户明确选择"不再提示"的进程。
 	ignored map[string]bool
 
@@ -202,7 +211,7 @@ type CoreService struct {
 }
 
 func NewCoreService() *CoreService {
-	return &CoreService{
+	s := &CoreService{
 		mixedPort: defaultMixedPort,
 		apiPort:   defaultAPIPort,
 		sys:       defaultSystemProxyOps(),
@@ -211,6 +220,10 @@ func NewCoreService() *CoreService {
 		homeLat:   23.02,
 		homeLabel: "本机",
 	}
+	s.procTracker = procid.NewTracker(procid.WindowsSource(), 5*time.Second)
+	s.procTracker.SetFileIDFunc(procid.FileIdentity)
+	s.procTracker.SetLogger(func(format string, args ...any) { s.dbg(format, args...) })
+	return s
 }
 
 // admin 统一走可替换的管理员判断，测试里可以模拟提权。
@@ -264,12 +277,15 @@ type ConnView struct {
 	DestIP      string `json:"destIP"`
 	Process     string `json:"process"`
 	ProcessPath string `json:"processPath"`
-	Chains      string `json:"chains"`
-	Rule        string `json:"rule"`
-	Upload      int64  `json:"upload"`
-	Download    int64  `json:"download"`
-	Start       string `json:"start"`
-	Network     string `json:"network"`
+	// ProcessKey 是稳定的进程匹配身份（path:... / name:...），
+	// 前端用它聚合与设置规则，避免同名不同目录的程序被合并。
+	ProcessKey string `json:"processKey"`
+	Chains     string `json:"chains"`
+	Rule       string `json:"rule"`
+	Upload     int64  `json:"upload"`
+	Download   int64  `json:"download"`
+	Start      string `json:"start"`
+	Network    string `json:"network"`
 }
 
 type TrafficView struct {
@@ -357,6 +373,9 @@ func (s *CoreService) migrateDataDir() {
 		// 跨卷或被占用时退化为逐个复制；只有全部成功才删旧目录，
 		// 否则宁可留着让用户手动处理，也不能把没复制过去的数据删掉。
 		if err := copyDirAll(oldDir, newDir); err != nil {
+			// 复制中途失败会留下半成品目录；删掉它，否则下次启动会误以为
+			// 迁移已完成而跳过，配置就永久缺一半。
+			_ = os.RemoveAll(newDir)
 			s.dbg("data dir migrate skipped: %v", err)
 			return
 		}
@@ -400,7 +419,7 @@ func copyDirAll(src, dst string) error {
 		if fi, statErr := e.Info(); statErr == nil && fi.Mode().Perm() != 0 {
 			mode = fi.Mode().Perm() | 0o200
 		}
-		if err := os.WriteFile(dstPath, b, mode); err != nil {
+		if err := writeFileAtomic(dstPath, b, mode); err != nil {
 			failed = append(failed, e.Name())
 		}
 	}
@@ -428,7 +447,7 @@ func ensureGeodata(dir string) {
 		if st, err := os.Stat(p); err == nil && st.Size() == int64(len(data)) {
 			continue
 		}
-		_ = os.WriteFile(p, data, 0o644)
+		_ = writeFileAtomic(p, data, 0o644)
 	}
 }
 
@@ -527,7 +546,19 @@ func (s *CoreService) Boot() {
 	s.apiPort = pickPort(defaultAPIPort)
 	s.dnsPort = pickPort(defaultDNSPort)
 	s.api = kernel.NewClient(fmt.Sprintf("127.0.0.1:%d", s.apiPort), s.secret)
+	api := s.api
+	apiPort := s.apiPort
 	s.mu.Unlock()
+
+	// 启动成功以控制 API 真正可访问为准，而不是进程活着。
+	mgr.SetStartupValidation(
+		fmt.Sprintf("127.0.0.1:%d", apiPort),
+		func(ctx context.Context) error {
+			_, err := api.Version(ctx)
+			return err
+		},
+		15*time.Second,
+	)
 
 	// 如果上次用过订阅，直接拿本地缓存起，不用等网络。
 	s.loadSavedSubscription()
@@ -603,7 +634,11 @@ func processTargetGroupName(target string) string {
 	return configgen.ProcessGroupPrefix + hex.EncodeToString(sum[:4])
 }
 
-// buildProcessTargetPlan 把进程规则映射成隐藏策略组 + PROCESS-NAME 规则。
+// buildProcessTargetPlan 把进程规则映射成隐藏策略组 + 匹配规则。
+//
+// 键优先是 path:<完整路径>，生成 PROCESS-PATH；旧数据或无法获取路径的
+// 进程降级为 name:<exe 名>，生成 PROCESS-NAME。路径规则可以区分同名
+// 但位于不同目录的程序。
 //
 // 目标分两类：
 //   - 显式节点/策略组：配置解析阶段就存在，组里直接放 [target] 即可。
@@ -615,15 +650,15 @@ func buildProcessTargetPlan(rules map[string]string, targets map[string]bool, pr
 		return plan
 	}
 
-	procs := make([]string, 0, len(rules))
-	for proc := range rules {
-		procs = append(procs, proc)
+	keys := make([]string, 0, len(rules))
+	for key := range rules {
+		keys = append(keys, key)
 	}
-	sort.Strings(procs)
+	sort.Strings(keys)
 
 	groupsByTarget := map[string]bool{}
-	for _, proc := range procs {
-		policy := rules[proc]
+	for _, key := range keys {
+		policy := rules[key]
 		if !strings.HasPrefix(policy, processTargetPrefix) {
 			continue
 		}
@@ -631,7 +666,11 @@ func buildProcessTargetPlan(rules map[string]string, targets map[string]bool, pr
 		if target == "" || strings.HasPrefix(target, configgen.ProcessGroupPrefix) {
 			continue
 		}
-		if sanitizeProcName(proc) == "" {
+		ident, ok := procid.ParseKey(key)
+		if !ok {
+			continue
+		}
+		if _, err := ident.RulePayload(); err != nil {
 			continue
 		}
 
@@ -660,7 +699,9 @@ func buildProcessTargetPlan(rules map[string]string, targets map[string]bool, pr
 			plan.Groups = append(plan.Groups, g)
 			groupsByTarget[target] = true
 		}
-		plan.Rules = append(plan.Rules, fmt.Sprintf("PROCESS-NAME,%s,%s", proc, group))
+		if rule, err := ident.Rule(group); err == nil {
+			plan.Rules = append(plan.Rules, rule)
+		}
 	}
 	return plan
 }
@@ -842,14 +883,29 @@ func (s *CoreService) Attach(app *application.App) { s.app = app }
 // 退出阶段的恢复失败无法阻止进程结束，但备份与 Pending 标记必须保留，
 // 下次启动会优先重试，避免网络配置永久停留在死端口。
 func (s *CoreService) Shutdown() {
+	s.mu.RLock()
+	wd := s.watchdog
+	mgr := s.mgr
+	api := s.api
+	s.mu.RUnlock()
+	// 退出期间绝不允许看门狗再拉起内核。
+	if wd != nil {
+		wd.Stop()
+	}
+
 	if err := s.restoreSystemProxy(); err != nil {
 		s.dbg("shutdown: restore system proxy failed, backup kept: %v", err)
 	}
 	if err := s.restoreWinHTTPIfPending(); err != nil {
 		s.dbg("shutdown: restore WinHTTP failed, backup kept: %v", err)
 	}
-	if s.mgr != nil {
-		_ = s.mgr.Stop()
+	if api != nil {
+		api.CloseIdleConnections()
+	}
+	if mgr != nil {
+		if err := mgr.Close(); err != nil {
+			s.dbg("shutdown: close kernel manager failed: %v", err)
+		}
 	}
 }
 
@@ -930,6 +986,7 @@ func (s *CoreService) StartKernel() error {
 	}
 	s.clearVersionCache()
 	s.invalidateConnCache()
+	s.resumeWatchdog()
 	s.afterStart()
 	return nil
 }
@@ -954,10 +1011,24 @@ func (s *CoreService) StopKernel() error {
 	}
 	s.clearVersionCache()
 	s.invalidateConnCache()
-	return s.mgr.Stop()
+	if s.api != nil {
+		s.api.CloseIdleConnections()
+	}
+	if err := s.mgr.Stop(); err != nil {
+		return err
+	}
+	// 用户主动停止内核后，看门狗不得再把内核拉起来。
+	s.pauseWatchdog()
+	return nil
 }
 
 func (s *CoreService) RestartKernel() error {
+	return s.restartKernel(true)
+}
+
+// restartKernel 的 manual 为 false 时表示由看门狗触发，不能清零失败计数，
+// 否则「启动即崩」会因每次重启都清零而无限重试。
+func (s *CoreService) restartKernel(manual bool) error {
 	if s.mgr == nil {
 		return fmt.Errorf("内核管理器未初始化")
 	}
@@ -979,6 +1050,12 @@ func (s *CoreService) RestartKernel() error {
 	}
 	s.clearVersionCache()
 	s.invalidateConnCache()
+	if s.api != nil {
+		s.api.CloseIdleConnections()
+	}
+	if manual {
+		s.resumeWatchdog()
+	}
 	s.afterStart()
 	return nil
 }
@@ -1344,12 +1421,23 @@ func (s *CoreService) reconcileProxy() {
 	if !enabled {
 		// 用户自己把系统代理关了：还原地址、bypass、PAC 后撤掉接管记录，
 		// 并同步 restoreProxy，避免下次启动又擅自打开。
-		_ = ops.SetServer(st.Server)
-		_ = ops.SetOverride(st.Override)
+		var errs []error
+		errs = append(errs, ops.SetServer(st.Server), ops.SetOverride(st.Override))
 		if st.AutoConfigURL != "" {
-			_ = ops.SetAutoConfigURL(st.AutoConfigURL)
+			errs = append(errs, ops.SetAutoConfigURL(st.AutoConfigURL))
 		} else {
-			_ = ops.ClearAutoConfigURL()
+			errs = append(errs, ops.ClearAutoConfigURL())
+		}
+		if err := errors.Join(errs...); err != nil {
+			// 注册表写失败时保留备份，下次退出/启动继续尝试，
+			// 不能把未完成的还原当成成功而丢掉还原点。
+			s.dbg("reconcile: restore original proxy settings failed, backup kept: %v", err)
+			s.mu.Lock()
+			s.proxyOn = false
+			s.restoreProxy = false
+			s.mu.Unlock()
+			s.saveAppState()
+			return
 		}
 		_ = os.Remove(s.proxyStatePath())
 		s.mu.Lock()
@@ -1556,7 +1644,12 @@ func (s *CoreService) Quitting() bool {
 func (s *CoreService) MarkQuitting() {
 	s.mu.Lock()
 	s.quitting = true
+	wd := s.watchdog
 	s.mu.Unlock()
+	// 先停自动恢复，避免退出过程中内核被重新拉起。
+	if wd != nil {
+		wd.Stop()
+	}
 }
 
 // ---------- 配置备份 ----------
@@ -1603,14 +1696,18 @@ func (s *CoreService) ImportConfig(jsonStr string) error {
 		return fmt.Errorf("不支持的配置版本: %d", bundle.Version)
 	}
 
+	rules, migrated := normalizeProcRules(bundle.ProcRules)
 	s.mu.Lock()
 	s.subs = bundle.Subs
-	s.procRules = bundle.ProcRules
+	s.procRules = rules
 	s.ignored = make(map[string]bool)
 	for _, n := range bundle.Ignored {
 		s.ignored[n] = true
 	}
 	s.mu.Unlock()
+	if migrated {
+		s.dbg("导入的进程规则已迁移为路径/名称身份键（%d 条）", len(rules))
+	}
 
 	s.saveSubs()
 	s.saveAppState()
@@ -1618,12 +1715,18 @@ func (s *CoreService) ImportConfig(jsonStr string) error {
 	// 导入的进程分流规则必须立刻落进 provider 文件并重载内核，
 	// 否则要等下一次别的操作触发写入才生效，表现为"导入完没反应"。
 	if mb, err := json.MarshalIndent(s.ProcessRules(), "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+		if err := writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644); err != nil {
+			return fmt.Errorf("配置已导入，但保存进程规则失败: %w", err)
+		}
 	}
 	if mb, err := json.MarshalIndent(s.IgnoredProcesses(), "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644)
+		if err := writeFileAtomic(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644); err != nil {
+			return fmt.Errorf("配置已导入，但保存忽略列表失败: %w", err)
+		}
 	}
-	_ = s.writeProcRulesYAML()
+	if err := s.writeProcRulesYAML(); err != nil {
+		return fmt.Errorf("配置已导入，但写规则文件失败: %w", err)
+	}
 
 	if s.mgr != nil && s.mgr.IsRunning() {
 		if err := s.RestartKernel(); err != nil {
@@ -1698,34 +1801,93 @@ func (s *CoreService) ListRules() ([]RuleView, error) {
 	return out, nil
 }
 
-// startKernelWatchdog 内核崩溃自动重启。连续失败 3 次后放弃，避免死循环。
+// startKernelWatchdog 内核异常退出后的自动恢复。
+//
+// 策略：10 分钟窗口内最多 5 次重启，等待时间按 2s/4s/8s… 指数退避并封顶
+// 1 分钟；一次运行满 1 分钟后再崩，视为新故障重新计数。用户主动退出会
+// 先 Stop 看门狗，绝不会触发自动重启。
 func (s *CoreService) startKernelWatchdog() {
-	failCount := 0
-	s.mgr.OnExit = func(reason string) {
-		s.dbg("kernel exited unexpectedly: %s (quitting=%v)", reason, s.Quitting())
+	s.mu.RLock()
+	mgr := s.mgr
+	s.mu.RUnlock()
+	if mgr == nil {
+		return
+	}
+
+	wd := kernel.NewWatchdog(kernel.WatchdogOptions{
+		Config: kernel.WatchdogConfig{
+			Window:      10 * time.Minute,
+			MaxRestarts: 5,
+			BaseDelay:   2 * time.Second,
+			MaxDelay:    time.Minute,
+			StableAfter: time.Minute,
+		},
+		Restart: func() error {
+			if s.Quitting() {
+				return fmt.Errorf("程序正在退出，取消自动重启")
+			}
+			return s.restartKernel(false)
+		},
+		OnRetry: func(attempt int, delay time.Duration, info kernel.ExitInfo) {
+			// 第一次崩就悄悄拉起，不打扰用户；连续崩才提示。
+			if attempt >= 2 && s.app != nil {
+				s.app.Event.Emit(
+					"kernel-crashed",
+					fmt.Sprintf("内核反复退出（第 %d 次：%s），%s 后重试", attempt, info.Reason, delay),
+				)
+			}
+		},
+		OnExhausted: func(_ int, message string) {
+			if s.Quitting() {
+				return
+			}
+			// 内核已无法自动恢复，系统代理若还指向它会让整台机器断网。
+			// 优先还原成用户的原始代理设置，失败时保留备份等下次启动重试。
+			if err := s.restoreSystemProxy(); err != nil {
+				s.dbg("watchdog exhausted: restore system proxy failed: %v", err)
+			}
+			if s.app != nil {
+				s.app.Event.Emit("kernel-crashed", message)
+			}
+		},
+		Logf: func(format string, args ...any) { s.dbg(format, args...) },
+	})
+
+	s.mu.Lock()
+	s.watchdog = wd
+	s.mu.Unlock()
+
+	mgr.OnExit = func(info kernel.ExitInfo) {
+		s.dbg("kernel exited unexpectedly: code=%d uptime=%s reason=%s",
+			info.ExitCode, info.Uptime, info.Reason)
+		// 旧内核进程已退出，复用到它的空闲连接必须丢弃。
+		if s.api != nil {
+			s.api.CloseIdleConnections()
+		}
 		if s.Quitting() {
 			return
 		}
-		failCount++
-		if failCount > 3 {
-			s.app.Event.Emit("kernel-crashed", "内核连续崩溃 3 次，已停止自动重启，请查看数据目录下的 debug.log")
-			return
-		}
-		// 第一次崩就悄悄拉起，不打扰用户；连着崩才值得弹通知。
-		if failCount >= 2 {
-			s.app.Event.Emit(
-				"kernel-crashed",
-				fmt.Sprintf("内核反复退出（第 %d 次：%s），正在重试", failCount, reason),
-			)
-		}
-		s.dbg("kernel restart scheduled in %ds (failCount=%d)", failCount*2, failCount)
-		time.Sleep(time.Duration(failCount*2) * time.Second)
-		if s.Quitting() {
-			return
-		}
-		if err := s.RestartKernel(); err == nil {
-			failCount = 0
-		}
+		wd.ReportExit(info)
+	}
+}
+
+// resumeWatchdog 在用户手动启动/重启成功后恢复自动恢复并清空失败历史。
+func (s *CoreService) resumeWatchdog() {
+	s.mu.RLock()
+	wd := s.watchdog
+	s.mu.RUnlock()
+	if wd != nil {
+		wd.Resume()
+	}
+}
+
+// pauseWatchdog 在用户手动停止内核后取消待执行的重启。
+func (s *CoreService) pauseWatchdog() {
+	s.mu.RLock()
+	wd := s.watchdog
+	s.mu.RUnlock()
+	if wd != nil {
+		wd.Pause()
 	}
 }
 
@@ -2139,23 +2301,64 @@ func (s *CoreService) UpdateCore(url string) (string, error) {
 	if url != "" && url != info.URL {
 		return "", fmt.Errorf("下载地址与官方发布不一致，已拒绝")
 	}
+	// 没有摘要或大小信息时不升级：只靠 HTTPS 无法证明二进制就是官方产物。
+	if strings.TrimSpace(info.Digest) == "" || info.Size <= 0 {
+		return "", fmt.Errorf("官方 release 缺少 sha256 摘要或大小信息，已拒绝自动升级")
+	}
+
+	beforeVersion := s.Status().Version
 
 	// exe 被占用时替换会失败，先停内核
 	if err := s.StopKernel(); err != nil {
 		return "", fmt.Errorf("停止内核失败: %w", err)
 	}
 
-	sum, err := s.mgr.DownloadAndReplace(info.URL, info.Digest, 3*time.Minute)
+	res, err := s.mgr.DownloadAndReplace(info.URL, info.Digest, info.Size, 3*time.Minute)
 	if err != nil {
 		// 下载/替换失败要把服务拉回来，不能让用户断网
 		_ = s.RestartKernel()
 		return "", err
 	}
 
-	if err := s.RestartKernel(); err != nil {
-		return sum, fmt.Errorf("内核已替换但重启失败: %w", err)
+	rec := kernel.UpgradeRecord{
+		BeforeVersion: beforeVersion,
+		TargetVersion: info.Latest,
+		Hash:          res.Hash,
+		BackupPath:    res.BackupPath,
+		ReplacedAt:    time.Now().Format(time.RFC3339),
 	}
-	return sum, nil
+
+	if err := s.RestartKernel(); err != nil {
+		// 新内核启动失败：恢复旧版本并重新拉起，保证用户不至于断网。
+		rec.RolledBack = true
+		rec.RollbackReason = err.Error()
+		rec.RolledBackAt = time.Now().Format(time.RFC3339)
+		rollbackErr := s.mgr.RollbackBinary()
+		var restartErr error
+		if rollbackErr == nil {
+			restartErr = s.RestartKernel()
+		}
+		if saveErr := s.mgr.SaveUpgradeRecord(rec); saveErr != nil {
+			s.dbg("save upgrade record failed: %v", saveErr)
+		}
+		s.dbg("core upgrade rolled back: %s -> %s, reason=%v, rollback=%v, restartOld=%v",
+			beforeVersion, info.Latest, err, rollbackErr, restartErr)
+
+		if rollbackErr != nil {
+			return res.Hash, fmt.Errorf("新内核启动失败，且回滚旧内核失败: %v（回滚错误: %w）", err, rollbackErr)
+		}
+		if restartErr != nil {
+			return res.Hash, fmt.Errorf("新内核启动失败，已回滚但旧内核仍无法启动: %v（旧内核错误: %w）", err, restartErr)
+		}
+		return res.Hash, fmt.Errorf("新内核启动失败，已回滚到 %s: %w", beforeVersion, err)
+	}
+
+	if err := s.mgr.SaveUpgradeRecord(rec); err != nil {
+		s.dbg("save upgrade record failed: %v", err)
+	}
+	s.dbg("core upgraded: %s -> %s hash=%s backup=%s",
+		beforeVersion, info.Latest, res.Hash, res.BackupPath)
+	return res.Hash, nil
 }
 
 // ResetCore 回退到内置内核：清除升级标记、删掉磁盘上的内核文件。
@@ -2263,11 +2466,17 @@ func (s *CoreService) Connections() ([]ConnView, error) {
 			host = c.Metadata.DestinationIP
 		}
 		proc := c.Metadata.Process
-		if proc == "" && c.Metadata.ProcessPath != "" {
-			proc = filepath.Base(c.Metadata.ProcessPath)
-		}
+		ident := s.identifyConnection(proc, c.Metadata.ProcessPath)
 		if proc == "" {
-			proc = "—"
+			if ident.Name != "" {
+				proc = ident.Name
+			} else {
+				proc = "—"
+			}
+		}
+		processPath := c.Metadata.ProcessPath
+		if processPath == "" && ident.Kind == procid.KindPath {
+			processPath = ident.Path
 		}
 		dest := c.Metadata.DestinationIP
 		if c.Metadata.DestinationPort != "" {
@@ -2279,7 +2488,8 @@ func (s *CoreService) Connections() ([]ConnView, error) {
 			Dest:        dest,
 			DestIP:      c.Metadata.DestinationIP,
 			Process:     proc,
-			ProcessPath: c.Metadata.ProcessPath,
+			ProcessPath: processPath,
+			ProcessKey:  ident.Key,
 			Chains:      strings.Join(c.Chains, " → "),
 			Rule:        c.Rule,
 			Upload:      c.Upload,
@@ -2289,6 +2499,59 @@ func (s *CoreService) Connections() ([]ConnView, error) {
 		})
 	}
 	return out, nil
+}
+
+// identifyConnection 把 mihomo 上报的进程信息转换为稳定身份。
+//
+// mihomo 通常能给出完整 processPath；权限不足的进程只有名字。
+// 此时用进程快照补齐路径：只有同名进程唯一时才可安全采用，
+// 多实例（如同名的两个 chrome.exe）必须降级为名称规则并记录日志。
+func (s *CoreService) identifyConnection(name, path string) procid.Identity {
+	ident := procid.FromProcess(name, path)
+	if path != "" || name == "" {
+		if ident.Kind == procid.KindName && ident.Degraded {
+			s.logIdentityFallback(ident.Key, ident.DegradeReason)
+		}
+		return ident
+	}
+
+	if s.procTracker != nil {
+		switch res := s.procTracker.LookupName(name); res.State {
+		case procid.LookupUnique:
+			if res.Info.Path != "" {
+				if full := procid.FromProcess(name, res.Info.Path); full.Kind == procid.KindPath {
+					return full
+				}
+			}
+			s.logIdentityFallback(ident.Key, "找到进程但完整路径无法用于规则匹配")
+		case procid.LookupAmbiguous:
+			s.logIdentityFallback(ident.Key,
+				fmt.Sprintf("同名进程有 %d 个，无法确定完整路径", res.Candidates))
+		default:
+			s.logIdentityFallback(ident.Key, "无法从进程快照获取完整路径")
+		}
+	}
+	return ident
+}
+
+// logIdentityFallback 对同一个身份做 10 分钟限频，避免 1.2 秒一次的
+// 连接轮询把 debug.log 刷爆。
+func (s *CoreService) logIdentityFallback(key, reason string) {
+	if key == "" {
+		return
+	}
+	now := time.Now()
+	s.idLogMu.Lock()
+	if s.idLogAt == nil {
+		s.idLogAt = map[string]time.Time{}
+	}
+	if last, ok := s.idLogAt[key]; ok && now.Sub(last) < 10*time.Minute {
+		s.idLogMu.Unlock()
+		return
+	}
+	s.idLogAt[key] = now
+	s.idLogMu.Unlock()
+	s.dbg("process identity degraded: key=%s reason=%s", key, reason)
 }
 
 func (s *CoreService) CloseConnection(id string) error {
@@ -2407,7 +2670,7 @@ func (s *CoreService) saveHistory() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(s.historyPath(), data, 0o644)
+	_ = writeFileAtomic(s.historyPath(), data, 0o644)
 }
 
 // appendSample 追加一条样本，并裁剪到保留窗口内。
@@ -2635,13 +2898,13 @@ func subFileName(rawURL string) string {
 // 准备的解码后节点列表。两者成对写入，避免内核启动时 provider 文件缺失。
 func (s *CoreService) writeSubscriptionFiles(url string, res *subscription.Result) error {
 	dir := dataDir()
-	if err := os.WriteFile(filepath.Join(dir, subFileName(url)), res.Raw, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, subFileName(url)), res.Raw, 0o600); err != nil {
 		return fmt.Errorf("保存订阅配置失败: %w", err)
 	}
 
 	providerPath := filepath.Join(dir, subscription.ProviderFileName(url))
 	if len(res.ProviderContent) > 0 {
-		if err := os.WriteFile(providerPath, res.ProviderContent, 0o600); err != nil {
+		if err := writeFileAtomic(providerPath, res.ProviderContent, 0o600); err != nil {
 			return fmt.Errorf("保存订阅节点列表失败: %w", err)
 		}
 	} else {
@@ -2691,7 +2954,7 @@ func (s *CoreService) migrateSingleSub() {
 	}
 	// 把当前那份原始配置搬到 per-subscription 文件。
 	if cb, err := os.ReadFile(filepath.Join(dir, subConfigFile)); err == nil {
-		_ = os.WriteFile(filepath.Join(dir, subFileName(m.URL)), cb, 0o600)
+		_ = writeFileAtomic(filepath.Join(dir, subFileName(m.URL)), cb, 0o600)
 	}
 	s.mu.Lock()
 	s.subs = []subMeta{m}
@@ -2705,7 +2968,9 @@ func (s *CoreService) saveSubs() {
 	st := subsStore{Items: s.subs, Active: s.activeIdx}
 	s.mu.RUnlock()
 	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), subsFile), mb, 0o600)
+		if err := writeFileAtomic(filepath.Join(dataDir(), subsFile), mb, 0o600); err != nil {
+			s.dbg("save subscriptions failed: %v", err)
+		}
 	}
 }
 
@@ -3072,11 +3337,15 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
 		return err
 	}
 	// 同时维护一份"当前订阅"，兼容旧路径与迁移。
-	_ = os.WriteFile(filepath.Join(dir, subConfigFile), res.Raw, 0o600)
+	if err := writeFileAtomic(filepath.Join(dir, subConfigFile), res.Raw, 0o600); err != nil {
+		return fmt.Errorf("保存当前订阅失败: %w", err)
+	}
 
 	meta := subMetaFromResult(url, res)
 	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dir, subMetaFile), mb, 0o600)
+		if err := writeFileAtomic(filepath.Join(dir, subMetaFile), mb, 0o600); err != nil {
+			return fmt.Errorf("保存订阅元信息失败: %w", err)
+		}
 	}
 
 	s.mu.Lock()
@@ -3393,6 +3662,53 @@ var builtinGroupNames = map[string]bool{
 
 // 策略组识别放在 configgen 里，配置生成和规则渲染都要用同一套判断。
 
+// normalizeProcRules 把旧版「仅 EXE 名」的键迁移为稳定的身份键。
+//
+// 旧数据：chrome.exe
+// 新数据：name:chrome.exe / path:C:\Apps\Chrome\chrome.exe
+//
+// 无法安全写入规则的键（例如含逗号的路径）会被丢弃，并在调用方记录日志。
+func normalizeProcRules(in map[string]string) (map[string]string, bool) {
+	out := make(map[string]string, len(in))
+	keys := make([]string, 0, len(in))
+	for key := range in {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	changed := false
+	seen := make(map[string]bool, len(in))
+	for _, raw := range keys {
+		ident, ok := procid.ParseKey(raw)
+		if !ok {
+			changed = true
+			continue
+		}
+		if ident.Key != raw {
+			changed = true
+		}
+		// 路径身份大小写不敏感：仅大小写不同的键必须先合并，
+		// 否则内核里会出现两条指向同一路径的规则。
+		fold := strings.ToLower(ident.Key)
+		if seen[fold] {
+			changed = true
+			continue
+		}
+		seen[fold] = true
+		out[ident.Key] = in[raw]
+	}
+	return out, changed
+}
+
+// persistProcRules 把当前规则表落盘。调用方负责处理写失败。
+func (s *CoreService) persistProcRules() error {
+	mb, err := json.MarshalIndent(s.ProcessRules(), "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+}
+
 func (s *CoreService) loadProcRules() {
 	b, err := os.ReadFile(filepath.Join(dataDir(), procRulesJSON))
 	if err != nil {
@@ -3403,9 +3719,18 @@ func (s *CoreService) loadProcRules() {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return
 	}
+	normalized, changed := normalizeProcRules(m)
+
 	s.mu.Lock()
-	s.procRules = m
+	s.procRules = normalized
 	s.mu.Unlock()
+
+	if changed {
+		s.dbg("进程规则已迁移为路径/名称身份键（%d 条）", len(normalized))
+		if err := s.persistProcRules(); err != nil {
+			s.dbg("persist migrated process rules failed: %v", err)
+		}
+	}
 }
 
 // loadIgnored 读取"用户已经选择不再提示"的进程列表。
@@ -3446,7 +3771,9 @@ func (s *CoreService) IgnoreProcess(proc string) error {
 	s.mu.Unlock()
 	sort.Strings(snapshot)
 	if mb, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644)
+		if err := writeFileAtomic(filepath.Join(dataDir(), procIgnoredJSON), mb, 0o644); err != nil {
+			return fmt.Errorf("保存忽略列表失败: %w", err)
+		}
 	}
 	return nil
 }
@@ -3484,6 +3811,52 @@ func sanitizeProcName(name string) string {
 	return name
 }
 
+// renderProcRulesPayload 把进程策略渲染成两个 rule-provider 的 payload。
+//
+// 路径身份生成 PROCESS-PATH，名称身份生成 PROCESS-NAME。无法安全写入
+// 规则的键（例如含逗号的路径）会被跳过；迁移阶段已记录相应日志。
+func renderProcRulesPayload(rules map[string]string) (proxyYAML, directYAML string) {
+	var proxyPayloads, directPayloads []string
+
+	keys := make([]string, 0, len(rules))
+	for key := range rules {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		policy := rules[key]
+		if policy != "proxy" && policy != "direct" {
+			continue
+		}
+		ident, ok := procid.ParseKey(key)
+		if !ok {
+			continue
+		}
+		payload, err := ident.RulePayload()
+		if err != nil {
+			continue
+		}
+		if policy == "proxy" {
+			proxyPayloads = append(proxyPayloads, payload)
+		} else {
+			directPayloads = append(directPayloads, payload)
+		}
+	}
+
+	render := func(items []string) string {
+		if len(items) == 0 {
+			return "payload: []\n"
+		}
+		lines := make([]string, 0, len(items))
+		for _, p := range items {
+			lines = append(lines, "  - "+p)
+		}
+		return "payload:\n" + strings.Join(lines, "\n") + "\n"
+	}
+	return render(proxyPayloads), render(directPayloads)
+}
+
 // writeProcRulesYAML 把进程策略渲染成两个 rule-provider 文件。
 //
 // 为什么拆成两个：mihomo 的 classical provider 里 payload **不能自带出口策略**，
@@ -3496,39 +3869,30 @@ func (s *CoreService) writeProcRulesYAML() error {
 		snapshot[k] = v
 	}
 	s.mu.RUnlock()
+	return s.writeProcRuleSnapshotFiles(snapshot)
+}
 
-	var proxyList, directList []string
-	for proc, policy := range snapshot {
-		switch policy {
-		case "proxy":
-			proxyList = append(proxyList, proc)
-		case "direct":
-			directList = append(directList, proc)
-		}
-	}
-	sort.Strings(proxyList)
-	sort.Strings(directList)
-
-	render := func(names []string) string {
-		lines := make([]string, 0, len(names))
-		for _, n := range names {
-			// 再校验一次。规则文件是拼字符串的，脏数据进去会破坏整张表。
-			if sanitizeProcName(n) == "" {
-				continue
-			}
-			lines = append(lines, "  - PROCESS-NAME,"+n)
-		}
-		if len(lines) == 0 {
-			return "payload: []\n"
-		}
-		return "payload:\n" + strings.Join(lines, "\n") + "\n"
-	}
-
-	dir := dataDir()
-	if err := os.WriteFile(filepath.Join(dir, procProxyYAML), []byte(render(proxyList)), 0o644); err != nil {
+// persistProcRuleSnapshot 把一份候选规则表完整落盘（JSON + 两个 provider）。
+// 三个文件分别原子写入；全部成功后才由调用方替换内存状态。
+func (s *CoreService) persistProcRuleSnapshot(rules map[string]string) error {
+	mb, err := json.MarshalIndent(rules, "", "  ")
+	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, procDirectYAML), []byte(render(directList)), 0o644)
+	if err := writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644); err != nil {
+		return err
+	}
+	return s.writeProcRuleSnapshotFiles(rules)
+}
+
+func (s *CoreService) writeProcRuleSnapshotFiles(rules map[string]string) error {
+	proxyYAML, directYAML := renderProcRulesPayload(rules)
+
+	dir := dataDir()
+	if err := writeFileAtomic(filepath.Join(dir, procProxyYAML), []byte(proxyYAML), 0o644); err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(dir, procDirectYAML), []byte(directYAML), 0o644)
 }
 
 // ---------- 运行状态持久化 ----------
@@ -3670,7 +4034,9 @@ func (s *CoreService) persistSubMeta() {
 	}
 	s.mu.RUnlock()
 	if mb, err := json.MarshalIndent(m, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), subMetaFile), mb, 0o600)
+		if err := writeFileAtomic(filepath.Join(dataDir(), subMetaFile), mb, 0o600); err != nil {
+			s.dbg("save subscription meta failed: %v", err)
+		}
 	}
 }
 
@@ -3819,9 +4185,13 @@ func (s *CoreService) ProcessRules() map[string]string {
 // 返回值是"补断开的旧连接条数"。mihomo 只在建连那一刻匹配规则，已建立的
 // 连接不会重新判定，所以改完策略必须把该进程的老连接掐掉，用户才能立刻看到效果。
 func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
-	proc = sanitizeProcName(proc)
-	if proc == "" {
-		return 0, fmt.Errorf("进程名为空或含有非法字符")
+	ident, ok := procid.ParseKey(proc)
+	if !ok {
+		return 0, fmt.Errorf("进程身份无效：需要完整的可执行文件路径或 EXE 名")
+	}
+	if ident.Kind == procid.KindName {
+		// 名称身份无法区分同名程序，属于明确降级；必须留痕。
+		s.logIdentityFallback(ident.Key, ident.DegradeReason)
 	}
 
 	target := ""
@@ -3848,34 +4218,41 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 		}
 	}
 
+	// 查旧值时忽略键的大小写差异；路径身份在 Windows 上不区分大小写。
 	s.mu.RLock()
-	oldPolicy := s.procRules[proc]
+	oldKey := ident.Key
+	oldPolicy := s.procRules[ident.Key]
+	for k, v := range s.procRules {
+		if strings.EqualFold(k, ident.Key) {
+			oldKey, oldPolicy = k, v
+			break
+		}
+	}
 	s.mu.RUnlock()
-	if oldPolicy == policy {
+	if oldKey == ident.Key && oldPolicy == policy {
 		return 0, nil
 	}
 
-	s.mu.Lock()
-	if s.procRules == nil {
-		s.procRules = map[string]string{}
-	}
-	if policy == "follow" {
-		delete(s.procRules, proc)
-	} else {
-		s.procRules[proc] = policy
-	}
-	snapshot := make(map[string]string, len(s.procRules))
+	// 先在副本上完成修改并落盘，成功后才替换内存中的规则表。
+	// 写文件失败时内存保持旧值，界面回滚后不会出现"显示已改但重启丢失"。
+	s.mu.RLock()
+	next := make(map[string]string, len(s.procRules)+1)
 	for k, v := range s.procRules {
-		snapshot[k] = v
+		if !strings.EqualFold(k, ident.Key) {
+			next[k] = v
+		}
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
+	if policy != "follow" {
+		next[ident.Key] = policy
+	}
 
-	if mb, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
-		_ = os.WriteFile(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+	if err := s.persistProcRuleSnapshot(next); err != nil {
+		return 0, fmt.Errorf("保存进程规则失败: %w", err)
 	}
-	if err := s.writeProcRulesYAML(); err != nil {
-		return 0, fmt.Errorf("写规则文件失败: %w", err)
-	}
+	s.mu.Lock()
+	s.procRules = next
+	s.mu.Unlock()
 
 	if s.api == nil || s.mgr == nil || !s.mgr.IsRunning() {
 		return 0, nil
@@ -3897,7 +4274,7 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 			}
 		}
 		s.selectProcessTargets()
-		return s.closeProcessConnections(proc), nil
+		return s.closeProcessConnections(ident), nil
 	}
 
 	// 热刷新：只重新加载这两个 rule-provider，不重载整个配置，
@@ -3909,7 +4286,7 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 			return 0, fmt.Errorf("规则已保存，但热刷新失败（重启内核可生效）: %w", err)
 		}
 	}
-	return s.closeProcessConnections(proc), nil
+	return s.closeProcessConnections(ident), nil
 }
 
 // validateProcessTarget 校验指定出口是否存在。
@@ -3949,8 +4326,8 @@ func (s *CoreService) validateProcessTarget(target string) error {
 }
 
 // closeProcessConnections 掐掉某个进程的旧连接，让新规则立即生效。
-func (s *CoreService) closeProcessConnections(proc string) int {
-	if s.api == nil {
+func (s *CoreService) closeProcessConnections(target procid.Identity) int {
+	if s.api == nil || !target.Valid() {
 		return 0
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -3962,11 +4339,8 @@ func (s *CoreService) closeProcessConnections(proc string) int {
 		return 0
 	}
 	for _, c := range resp.Connections {
-		name := c.Metadata.Process
-		if name == "" && c.Metadata.ProcessPath != "" {
-			name = filepath.Base(c.Metadata.ProcessPath)
-		}
-		if !strings.EqualFold(name, proc) {
+		ident := s.identifyConnection(c.Metadata.Process, c.Metadata.ProcessPath)
+		if !identityMatches(target, ident) {
 			continue
 		}
 		if err := s.api.CloseConnection(ctx, c.ID); err == nil {
@@ -3975,4 +4349,21 @@ func (s *CoreService) closeProcessConnections(proc string) int {
 	}
 	s.invalidateConnCache()
 	return closed
+}
+
+// identityMatches 判断连接身份是否命中目标规则。
+//
+// 路径规则只命中同一路径；名称规则（降级）按 EXE 名命中所有同名进程，
+// 与实际 PROCESS-NAME 规则的影响范围保持一致。
+func identityMatches(target, conn procid.Identity) bool {
+	if !target.Valid() || !conn.Valid() {
+		return false
+	}
+	if target.Equal(conn) {
+		return true
+	}
+	if target.Kind == procid.KindName {
+		return strings.EqualFold(target.Name, conn.Name)
+	}
+	return false
 }

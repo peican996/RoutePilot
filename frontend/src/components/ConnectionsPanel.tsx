@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 
 import type { Conn, NodeView } from "../types";
 import { CONN_PAGE_SIZE, PROC_LIST_MAX } from "../constants";
-import { fmtBytes, fmtDuration } from "../utils";
+import { fmtBytes, fmtDuration, procKeyIsNameOnly, procKeyLabel, procKeyPath } from "../utils";
 
 type Policy = "proxy" | "direct" | "follow";
 type SortKey = "" | "up" | "down";
@@ -57,13 +57,14 @@ export default function ConnectionsPanel({
   const [groupByProc, setGroupByProc] = useState(false);
   const [connLimit, setConnLimit] = useState(CONN_PAGE_SIZE);
 
-  // 按进程聚合连接数。已有规则但当前没连接的进程也要列出来，否则改不回"跟随规则"。
+  // 按进程身份聚合连接数。身份优先是完整路径，同名不同目录不会合并。
+  // 已有规则但当前没连接的进程也要列出来，否则改不回"跟随规则"。
   const procs = useMemo(() => {
     const m = new Map<string, number>();
     for (const c of conns) {
-      const p = c.process && c.process !== "—" ? c.process : "";
-      if (!p) continue;
-      m.set(p, (m.get(p) ?? 0) + 1);
+      const key = c.processKey ?? "";
+      if (!key) continue;
+      m.set(key, (m.get(key) ?? 0) + 1);
     }
     for (const k of Object.keys(procRules)) {
       if (!m.has(k)) m.set(k, 0);
@@ -71,10 +72,24 @@ export default function ConnectionsPanel({
     return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   }, [conns, procRules]);
 
+  // 连接里带有原始大小写的 processPath；键是小写规范化值，
+  // 用这份映射让规则列表也能展示真实路径。
+  const procPaths = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of conns) {
+      if (c.processKey && c.processPath && !m.has(c.processKey)) {
+        m.set(c.processKey, c.processPath);
+      }
+    }
+    return m;
+  }, [conns]);
+
   const filteredProcs = useMemo(() => {
     const q = procFilter.trim().toLowerCase();
     if (!q) return procs;
-    return procs.filter(([name]) => name.toLowerCase().includes(q));
+    return procs.filter(
+      ([key]) => key.toLowerCase().includes(q) || procKeyLabel(key).toLowerCase().includes(q),
+    );
   }, [procs, procFilter]);
 
   // 进程「指定节点」下拉的可选目标：策略组排前面，节点排后面。
@@ -147,27 +162,37 @@ export default function ConnectionsPanel({
           </div>
         ) : (
           <div className="proc-list">
-            {filteredProcs.slice(0, PROC_LIST_MAX).map(([name, count]) => {
-              const value = procRules[name] ?? "follow";
+            {filteredProcs.slice(0, PROC_LIST_MAX).map(([key, count]) => {
+              const value = procRules[key] ?? "follow";
               const isTarget = value.startsWith(TARGET_PREFIX);
               const target = isTarget ? value.slice(TARGET_PREFIX.length) : "";
               const targetValid = isTarget && nodes.some((n) => n.name === target);
               const activePolicy = isTarget ? "" : value;
+              const fullPath = procPaths.get(key) || procKeyPath(key);
+              const label = fullPath ? procKeyLabel(`path:${fullPath}`) : procKeyLabel(key);
               return (
-                <div className="proc-row" key={name}>
-                  <span className="proc-name" title={name}>
-                    {name}
+                <div className="proc-row" key={key}>
+                  <span className="proc-name" title={fullPath || label}>
+                    {label}
+                    {procKeyIsNameOnly(key) && (
+                      <span
+                        style={{ marginLeft: 6, fontSize: 10.5, color: "var(--text-faint)" }}
+                        title="无法获取完整路径，同名程序会共享这条规则"
+                      >
+                        仅名称
+                      </span>
+                    )}
                   </span>
                   <span className="proc-count">{count > 0 ? `${count} 连接` : "未运行"}</span>
                   <div className="segmented sm">
-                    {POLICIES.map(([p, label]) => (
+                    {POLICIES.map(([p, pLabel]) => (
                       <button
                         key={p}
                         className={activePolicy === p ? "active" : ""}
-                        onClick={() => onSetProc(name, p)}
+                        onClick={() => onSetProc(key, p)}
                         disabled={busy}
                       >
-                        {label}
+                        {pLabel}
                       </button>
                     ))}
                   </div>
@@ -177,7 +202,7 @@ export default function ConnectionsPanel({
                     value={isTarget ? value : ""}
                     onChange={(e) => {
                       const next = e.target.value;
-                      if (next) onSetProc(name, next);
+                      if (next) onSetProc(key, next);
                     }}
                     disabled={busy}
                     title="指定该程序使用的节点或策略组"
@@ -271,8 +296,8 @@ export default function ConnectionsPanel({
             )}
             {visibleConns.map((c) => (
               <tr key={c.id}>
-                <td className="proc" title={c.processPath}>
-                  {c.process}
+                <td className="proc" title={c.processPath || c.processKey || c.process}>
+                  {c.processKey ? procKeyLabel(c.processKey) : c.process}
                 </td>
                 <td title={c.host}>
                   <span className="mono" style={{ color: "var(--text-dim)" }}>

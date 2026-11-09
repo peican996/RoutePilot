@@ -1,6 +1,38 @@
 // 界面通用的格式化工具。从 App.tsx 抽出来，避免同一个函数在多处各写一份
 // （之前 fmtBytes 在 App 和 TrafficChart 里各有一份，且对 0 的处理不一致）。
 
+/** 进程身份键的展示名：path:... 显示 basename，name:... 显示名称。 */
+export function procKeyName(key: string): string {
+  if (key.startsWith("path:")) {
+    const p = key.slice("path:".length);
+    const parts = p.split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+  }
+  if (key.startsWith("name:")) return key.slice("name:".length);
+  return key;
+}
+
+/** 进程身份键的完整路径（仅路径身份有）。 */
+export function procKeyPath(key: string): string {
+  return key.startsWith("path:") ? key.slice("path:".length) : "";
+}
+
+/** 同名程序较多时，用父目录名进一步区分展示。 */
+export function procKeyLabel(key: string): string {
+  const name = procKeyName(key);
+  const path = procKeyPath(key);
+  if (!path) return name;
+  const idx = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  if (idx <= 0) return name;
+  const parent = path.slice(0, idx).split(/[\\/]/).pop() || "";
+  return parent ? `${name} · ${parent}` : name;
+}
+
+/** 是否为无法获取路径、只能按 EXE 名匹配的降级身份。 */
+export function procKeyIsNameOnly(key: string): boolean {
+  return key.startsWith("name:");
+}
+
 /** 字节数转人类可读。0 统一返回 "0 B"，保持各处口径一致。 */
 export function fmtBytes(n: number): string {
   if (!n || n <= 0) return "0 B";
@@ -99,5 +131,6 @@ export const STATE_TEXT: Record<string, string> = {
   running: "运行中",
   stopped: "已停止",
   starting: "启动中",
-  error: "异常",
+  stopping: "停止中",
+  failed: "启动失败",
 };

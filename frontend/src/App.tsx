@@ -21,6 +21,7 @@ import LogPanel from "./components/LogPanel";
 import Sidebar from "./components/Sidebar";
 import Topbar from "./components/Topbar";
 import type { Conn, NodeView, Status, SubInfo, SubItem, Tab, Traffic } from "./types";
+import { procKeyLabel } from "./utils";
 
 // UI 里最多保留的日志行数。后端缓冲 400 行，这里留点余量避免来回抖动。
 const LOG_UI_MAX = 500;
@@ -606,7 +607,8 @@ export default function App() {
       const node = leafSet.has(target) ? target : resolveGroupNode(target);
       if (!node || !leafSet.has(node)) continue;
       const e = ensure(node);
-      if (!e.procs.includes(proc)) e.procs.push(proc);
+      const label = procKeyLabel(proc);
+      if (!e.procs.includes(label)) e.procs.push(label);
     }
 
     // 活动连接的真实出口。每个出口最多保留 3 个目标点，
@@ -695,7 +697,7 @@ export default function App() {
       try {
         const closed = await svc.SetProcessRule(proc, policy);
         if (closed > 0) {
-          setNote(`${proc} 的 ${closed} 条旧连接已断开，重连即按新规则走`);
+          setNote(`${procKeyLabel(proc)} 的 ${closed} 条旧连接已断开，重连即按新规则走`);
           schedNoteClear(TOAST_NOTE_MS);
         }
       } catch (e) {

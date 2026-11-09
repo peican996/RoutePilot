@@ -27,6 +27,15 @@ func NewClient(addr, secret string) *Client {
 	}
 }
 
+// CloseIdleConnections 丢弃复用到旧内核进程的空闲连接。
+// 内核停止/重启后如果继续复用这些连接，首个请求会随机失败或命中已关闭端口。
+func (c *Client) CloseIdleConnections() {
+	if c == nil {
+		return
+	}
+	c.hc.CloseIdleConnections()
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
 	var rdr io.Reader
 	if body != nil {

@@ -10,6 +10,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,11 +29,18 @@ const repoAPI = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
 // coreCustomMark 是"内核已被手动升级"的标记文件名。
 const coreCustomMark = ".core_custom"
 
+// upgradeRecordFile 记录最近一次内核升级/回滚结果，便于事后排查。
+const upgradeRecordFile = "core-upgrade.json"
+
+// maxCoreDownload 限制内核压缩包下载大小（官方包约 15-30MB）。
+const maxCoreDownload int64 = 200 << 20
+
 type release struct {
 	TagName string `json:"tag_name"`
 	Assets  []struct {
 		Name               string `json:"name"`
 		BrowserDownloadURL string `json:"browser_download_url"`
+		Size               int64  `json:"size"`
 		// 新版 GitHub release API 会给资产摘要，形如 "sha256:<hex>"。
 		// 用于下载后校验，防止被中间人替换成别的二进制。
 		Digest string `json:"digest"`
@@ -46,7 +54,26 @@ type LatestInfo struct {
 	HasUpdate bool   `json:"hasUpdate"` // 是否有新版
 	URL       string `json:"url"`       // 下载地址
 	AssetName string `json:"assetName"` // 资源文件名
+	Size      int64  `json:"size"`      // 资源字节数，0 表示未知
 	Digest    string `json:"digest"`    // "sha256:<hex>"，为空表示该 release 没提供
+}
+
+// UpgradeResult 是一次成功替换的结果。
+type UpgradeResult struct {
+	Hash       string
+	BackupPath string
+}
+
+// UpgradeRecord 是最近一次升级/回滚的持久化记录。
+type UpgradeRecord struct {
+	BeforeVersion  string `json:"beforeVersion"`
+	TargetVersion  string `json:"targetVersion"`
+	Hash           string `json:"hash"`
+	BackupPath     string `json:"backupPath"`
+	ReplacedAt     string `json:"replacedAt"`
+	RolledBack     bool   `json:"rolledBack"`
+	RollbackReason string `json:"rollbackReason,omitempty"`
+	RolledBackAt   string `json:"rolledBackAt,omitempty"`
 }
 
 // fetchLatest 查询最新 release。timeout 控制整体超时，国内访问 GitHub 可能很慢。
@@ -80,6 +107,7 @@ type winAsset struct {
 	name   string
 	url    string
 	digest string
+	size   int64
 }
 
 func pickWindowsAsset(rel *release) winAsset {
@@ -89,7 +117,7 @@ func pickWindowsAsset(rel *release) winAsset {
 		n := strings.ToLower(a.Name)
 		if strings.Contains(n, "windows") && strings.Contains(n, "amd64") &&
 			strings.HasSuffix(n, ".zip") && strings.Contains(n, "compatible") {
-			return winAsset{a.Name, a.BrowserDownloadURL, a.Digest}
+			return winAsset{a.Name, a.BrowserDownloadURL, a.Digest, a.Size}
 		}
 	}
 	// 没有 compatible 就优先标准 amd64 包，跳过带 go1xx / v2 / v3 的变体，
@@ -103,13 +131,13 @@ func pickWindowsAsset(rel *release) winAsset {
 			strings.Contains(n, "-v2-") || strings.Contains(n, "-v3-") {
 			continue
 		}
-		return winAsset{a.Name, a.BrowserDownloadURL, a.Digest}
+		return winAsset{a.Name, a.BrowserDownloadURL, a.Digest, a.Size}
 	}
 	// 最后兜底：任何 Windows zip
 	for _, a := range rel.Assets {
 		n := strings.ToLower(a.Name)
 		if strings.Contains(n, "windows") && strings.HasSuffix(n, ".zip") {
-			return winAsset{a.Name, a.BrowserDownloadURL, a.Digest}
+			return winAsset{a.Name, a.BrowserDownloadURL, a.Digest, a.Size}
 		}
 	}
 	return winAsset{}
@@ -136,6 +164,7 @@ func CheckUpdate(currentVersion string, timeout time.Duration) (*LatestInfo, err
 		HasUpdate: hasUpdate,
 		URL:       asset.url,
 		AssetName: asset.name,
+		Size:      asset.size,
 		Digest:    asset.digest,
 	}, nil
 }
@@ -149,7 +178,7 @@ func IsCustomCore(dataDir string) bool {
 // markCustom 写入"内核已手动升级"标记。
 func markCustom(dataDir string) error {
 	p := filepath.Join(dataDir, "bin", coreCustomMark)
-	return os.WriteFile(p, []byte(time.Now().Format(time.RFC3339)), 0o644)
+	return atomicWriteBytes(p, []byte(time.Now().Format(time.RFC3339)), 0o644)
 }
 
 // ClearCustomMark 清除标记（回退到内置内核时用）。
@@ -185,12 +214,19 @@ func validateDownloadURL(raw string) error {
 	return nil
 }
 
-// DownloadAndReplace 下载 zip 并替换本地 mihomo.exe。
-// wantDigest 形如 "sha256:<hex>"；非空时必须匹配，否则拒绝替换。
-// 返回新内核的 sha256 前 12 位，方便前端显示。
-func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, timeout time.Duration) (string, error) {
+// DownloadAndReplace 下载 zip、校验并原子替换本地 mihomo.exe。
+//
+// 安全/一致性约束：
+//   - 官方未提供 sha256 摘要时拒绝升级（不能只靠 HTTPS 判断二进制可信）
+//   - 下载大小必须与 release 声明一致，且不超过上限
+//   - 先写临时文件并 Sync，替换失败时旧内核保持原样
+//   - 替换前保留旧内核备份，新版本启动失败可回滚
+func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, wantSize int64, timeout time.Duration) (UpgradeResult, error) {
+	if strings.TrimSpace(wantDigest) == "" {
+		return UpgradeResult{}, fmt.Errorf("官方 release 未提供 sha256 摘要，已拒绝自动升级")
+	}
 	if err := validateDownloadURL(rawURL); err != nil {
-		return "", err
+		return UpgradeResult{}, err
 	}
 
 	client := &http.Client{
@@ -206,59 +242,289 @@ func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, timeout time.Dur
 
 	resp, err := client.Get(rawURL)
 	if err != nil {
-		return "", fmt.Errorf("下载内核失败: %w", err)
+		return UpgradeResult{}, fmt.Errorf("下载内核失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("下载内核失败: HTTP %d", resp.StatusCode)
+		return UpgradeResult{}, fmt.Errorf("下载内核失败: HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxCoreDownload {
+		return UpgradeResult{}, fmt.Errorf("内核包过大：声明 %d 字节", resp.ContentLength)
 	}
 
-	// 限制读取大小，防止异常响应撑爆内存（内核包一般 15MB 上下）
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 200<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCoreDownload+1))
 	if err != nil {
-		return "", fmt.Errorf("读取下载内容失败: %w", err)
+		return UpgradeResult{}, fmt.Errorf("读取下载内容失败: %w", err)
+	}
+	if int64(len(data)) > maxCoreDownload {
+		return UpgradeResult{}, fmt.Errorf("内核包超过 %d 字节上限", maxCoreDownload)
+	}
+	if wantSize > 0 && int64(len(data)) != wantSize {
+		return UpgradeResult{}, fmt.Errorf("内核包大小不符：期望 %d 字节，实际 %d 字节", wantSize, len(data))
 	}
 
 	// 摘要校验针对下载到的 zip 原文，必须在解包前做
-	if wantDigest != "" {
-		sum := sha256.Sum256(data)
-		got := "sha256:" + hex.EncodeToString(sum[:])
-		if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(wantDigest)) {
-			return "", fmt.Errorf("内核包校验失败：摘要不匹配（期望 %s，实际 %s）", wantDigest, got)
-		}
+	sum := sha256.Sum256(data)
+	got := "sha256:" + hex.EncodeToString(sum[:])
+	if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(wantDigest)) {
+		return UpgradeResult{}, fmt.Errorf("内核包校验失败：摘要不匹配（期望 %s，实际 %s）", wantDigest, got)
 	}
 
 	exe, err := extractMihomo(data)
 	if err != nil {
-		return "", err
+		return UpgradeResult{}, err
+	}
+	if err := validatePE(exe); err != nil {
+		return UpgradeResult{}, fmt.Errorf("下载的内核不是有效的 Windows 可执行文件: %w", err)
 	}
 
+	return m.installBinary(exe)
+}
+
+// installBinary 把已校验的内核写入 bin 目录。
+// 这是升级事务的核心：备份旧版 → 临时文件 → 原子替换 → 写升级标记。
+func (m *Manager) installBinary(exe []byte) (UpgradeResult, error) {
 	binDir := filepath.Join(m.dataDir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		return "", err
+		return UpgradeResult{}, err
 	}
 	target := filepath.Join(binDir, "mihomo.exe")
 
-	// 先写临时文件，再原子替换，避免写一半的文件被当成内核启动。
-	tmp := target + ".new"
-	if err := os.WriteFile(tmp, exe, 0o755); err != nil {
-		return "", fmt.Errorf("写入新内核失败: %w", err)
-	}
-	_ = os.Remove(target)
-	if err := os.Rename(tmp, target); err != nil {
-		return "", fmt.Errorf("替换内核失败: %w", err)
+	// 1. 保留当前可用内核。替换失败时它就是用户唯一能用的版本。
+	backupPath := ""
+	if _, err := os.Stat(target); err == nil {
+		backupPath = target + ".bak"
+		if err := copyFileAtomic(target, backupPath); err != nil {
+			return UpgradeResult{}, fmt.Errorf("备份旧内核失败（未做任何替换）: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return UpgradeResult{}, fmt.Errorf("检查旧内核失败: %w", err)
 	}
 
+	// 2. 新内核先落到同目录临时文件并同步到磁盘。
+	tmp, err := os.CreateTemp(binDir, ".mihomo-download-*")
+	if err != nil {
+		return UpgradeResult{}, fmt.Errorf("创建临时内核文件失败: %w", err)
+	}
+	tmpPath := tmp.Name()
+	replaced := false
+	defer func() {
+		_ = tmp.Close()
+		if !replaced {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o755); err != nil {
+		return UpgradeResult{}, err
+	}
+	if _, err := tmp.Write(exe); err != nil {
+		return UpgradeResult{}, fmt.Errorf("写入新内核失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return UpgradeResult{}, fmt.Errorf("同步新内核失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return UpgradeResult{}, fmt.Errorf("关闭临时内核失败: %w", err)
+	}
+
+	// 3. 原子替换；失败时旧文件不会被删除。
+	if err := replaceFileWithRetry(tmpPath, target); err != nil {
+		return UpgradeResult{}, fmt.Errorf("替换内核失败（旧内核仍可用）: %w", err)
+	}
+	replaced = true
+
+	// 4. 标记失败会让下次启动回退到内置内核，因此按升级失败处理并回滚。
 	if err := markCustom(m.dataDir); err != nil {
-		return "", fmt.Errorf("写入升级标记失败: %w", err)
+		if backupPath != "" {
+			if rbErr := restoreFromBackup(backupPath, target); rbErr != nil {
+				return UpgradeResult{}, fmt.Errorf("写入升级标记失败: %v；回滚旧内核也失败: %w", err, rbErr)
+			}
+			return UpgradeResult{}, fmt.Errorf("写入升级标记失败，已回滚旧内核: %w", err)
+		}
+		return UpgradeResult{}, fmt.Errorf("写入升级标记失败: %w", err)
 	}
 
 	m.mu.Lock()
 	m.exePath = target
+	m.lastBackup = backupPath
 	m.mu.Unlock()
 
 	sum := sha256.Sum256(exe)
-	return hex.EncodeToString(sum[:])[:12], nil
+	return UpgradeResult{
+		Hash:       hex.EncodeToString(sum[:])[:12],
+		BackupPath: backupPath,
+	}, nil
+}
+
+// RollbackBinary 用最近一次升级前的备份恢复内核。
+// 备份在校验通过前不会被删除；调用方负责在新内核启动失败后调用本方法。
+func (m *Manager) RollbackBinary() error {
+	m.mu.Lock()
+	backup := m.lastBackup
+	m.mu.Unlock()
+	if backup == "" {
+		return fmt.Errorf("没有可用的旧内核备份")
+	}
+	target := filepath.Join(m.dataDir, "bin", "mihomo.exe")
+	if err := restoreFromBackup(backup, target); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.exePath = target
+	m.mu.Unlock()
+	return nil
+}
+
+// LastBackupPath 返回当前升级事务的备份路径（可能为空）。
+func (m *Manager) LastBackupPath() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastBackup
+}
+
+// SaveUpgradeRecord 持久化最近一次升级/回滚结果。
+func (m *Manager) SaveUpgradeRecord(rec UpgradeRecord) error {
+	mb, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteBytes(filepath.Join(m.dataDir, upgradeRecordFile), mb, 0o644)
+}
+
+// LastUpgradeRecord 读取最近一次升级记录。文件不存在返回零值。
+func (m *Manager) LastUpgradeRecord() (UpgradeRecord, error) {
+	b, err := os.ReadFile(filepath.Join(m.dataDir, upgradeRecordFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return UpgradeRecord{}, nil
+		}
+		return UpgradeRecord{}, err
+	}
+	var rec UpgradeRecord
+	if err := json.Unmarshal(b, &rec); err != nil {
+		return UpgradeRecord{}, err
+	}
+	return rec, nil
+}
+
+func restoreFromBackup(backup, target string) error {
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return fmt.Errorf("读取旧内核备份失败（备份已保留）: %w", err)
+	}
+	if err := validatePE(data); err != nil {
+		return fmt.Errorf("旧内核备份无效: %w", err)
+	}
+	if err := atomicWriteBytes(target, data, 0o755); err != nil {
+		return fmt.Errorf("恢复旧内核失败（备份已保留）: %w", err)
+	}
+	return nil
+}
+
+// validatePE 做最小可执行文件校验：MZ 头 + PE 签名。
+// 摘要校验已保证内容来自官方 release，这里额外挡住解包错文件的情况。
+func validatePE(exe []byte) error {
+	if len(exe) < 0x40 || exe[0] != 'M' || exe[1] != 'Z' {
+		return fmt.Errorf("缺少 MZ 头")
+	}
+	off := int(binary.LittleEndian.Uint32(exe[0x3c:0x40]))
+	if off <= 0 || off+4 > len(exe) {
+		return fmt.Errorf("PE 头偏移无效")
+	}
+	if !bytes.Equal(exe[off:off+4], []byte{'P', 'E', 0, 0}) {
+		return fmt.Errorf("缺少 PE 签名")
+	}
+	return nil
+}
+
+// replaceFileWithRetry 用 Rename 原子替换目标。
+// Windows 上内核刚退出时文件句柄可能短暂未释放，做几次短重试。
+func replaceFileWithRetry(src, dst string) error {
+	var err error
+	for i := 0; i < 4; i++ {
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(150*(i+1)) * time.Millisecond)
+	}
+	return err
+}
+
+// copyFileAtomic 把 src 复制到同目录临时文件后再原子替换 dst。
+func copyFileAtomic(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	done := false
+	defer func() {
+		_ = tmp.Close()
+		if !done {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.Copy(tmp, in); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return err
+	}
+	done = true
+	return nil
+}
+
+// atomicWriteBytes 用于标记文件与升级记录，避免写一半崩溃留下坏文件。
+func atomicWriteBytes(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	done := false
+	defer func() {
+		_ = f.Close()
+		if !done {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	done = true
+	return nil
 }
 
 // extractMihomo 从 zip 里解出内核 exe。
@@ -295,18 +561,26 @@ func (m *Manager) EnsureBinary(embedded []byte) (string, error) {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return "", fmt.Errorf("创建内核目录失败: %w", err)
 	}
+	cleanupUpgradeTemps(binDir)
 	target := filepath.Join(binDir, "mihomo.exe")
 
-	// 手动升级过就用磁盘上的版本
+	// 手动升级过就用磁盘上的版本（先校验文件仍然可用）
 	if IsCustomCore(m.dataDir) {
-		if _, err := os.Stat(target); err == nil {
-			m.mu.Lock()
-			m.exePath = target
-			m.mu.Unlock()
-			return target, nil
+		if data, err := os.ReadFile(target); err == nil {
+			if validatePE(data) == nil {
+				m.mu.Lock()
+				m.exePath = target
+				m.mu.Unlock()
+				return target, nil
+			}
+			m.Logs.Add("已升级的内核文件无效，回退到内置版本")
+			ClearCustomMark(m.dataDir)
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("读取已升级内核失败: %w", err)
+		} else {
+			// 文件丢了就退回落到内置版本
+			ClearCustomMark(m.dataDir)
 		}
-		// 文件丢了就退回落到内置版本
-		ClearCustomMark(m.dataDir)
 	}
 
 	needWrite := true
@@ -318,18 +592,53 @@ func (m *Manager) EnsureBinary(embedded []byte) (string, error) {
 		}
 	}
 	if needWrite {
-		tmp := target + ".tmp"
-		if err := os.WriteFile(tmp, embedded, 0o755); err != nil {
+		tmp, err := os.CreateTemp(binDir, ".mihomo-embed-*")
+		if err != nil {
+			return "", fmt.Errorf("创建临时内核文件失败: %w", err)
+		}
+		tmpPath := tmp.Name()
+		done := false
+		defer func() {
+			_ = tmp.Close()
+			if !done {
+				_ = os.Remove(tmpPath)
+			}
+		}()
+		if err := tmp.Chmod(0o755); err != nil {
+			return "", err
+		}
+		if _, err := tmp.Write(embedded); err != nil {
 			return "", fmt.Errorf("写入内核失败: %w", err)
 		}
-		// 旧进程可能仍占用文件，先删再改名。
-		_ = os.Remove(target)
-		if err := os.Rename(tmp, target); err != nil {
-			return "", fmt.Errorf("替换内核失败: %w", err)
+		if err := tmp.Sync(); err != nil {
+			return "", fmt.Errorf("同步内核失败: %w", err)
 		}
+		if err := tmp.Close(); err != nil {
+			return "", fmt.Errorf("关闭临时内核失败: %w", err)
+		}
+		// 不再先删除旧文件：Rename 在 Windows 上会替换目标，
+		// 失败时旧内核保持可用，不会出现"两边都没有"的空窗。
+		if err := replaceFileWithRetry(tmpPath, target); err != nil {
+			return "", fmt.Errorf("替换内核失败（旧内核仍可用）: %w", err)
+		}
+		done = true
 	}
 	m.mu.Lock()
 	m.exePath = target
 	m.mu.Unlock()
 	return target, nil
+}
+
+// cleanupUpgradeTemps 清理上次升级中断留下的临时文件。
+// 正式内核与 .bak 备份不会被动。
+func cleanupUpgradeTemps(binDir string) {
+	for _, pattern := range []string{".mihomo-download-*", ".mihomo-embed-*"} {
+		matches, _ := filepath.Glob(filepath.Join(binDir, pattern))
+		for _, p := range matches {
+			_ = os.Remove(p)
+		}
+	}
+	for _, name := range []string{"mihomo.exe.tmp", "mihomo.exe.new"} {
+		_ = os.Remove(filepath.Join(binDir, name))
+	}
 }
