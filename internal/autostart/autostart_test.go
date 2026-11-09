@@ -21,7 +21,7 @@ func decodeUTF16LE(t *testing.T, data []byte) string {
 // 计划任务 XML 用 HighestAvailable 才能让 TUN 随开机静默启动；
 // 路径里的特殊字符必须转义，否则 schtasks 会解析失败。
 func TestTaskXML(t *testing.T) {
-	exe := `C:\Program Files\A&B\NexusLink.exe`
+	exe := `C:\Program Files\A&B\RoutePilot.exe`
 	data, err := taskXMLWithRunLevel(exe, "HighestAvailable")
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +30,7 @@ func TestTaskXML(t *testing.T) {
 	text := decodeUTF16LE(t, data)
 	for _, want := range []string{
 		"<RunLevel>HighestAvailable</RunLevel>",
-		"<Command>C:\\Program Files\\A&amp;B\\NexusLink.exe</Command>",
+		"<Command>C:\\Program Files\\A&amp;B\\RoutePilot.exe</Command>",
 		"<LogonTrigger>",
 	} {
 		if !strings.Contains(text, want) {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"proxdeck/internal/configgen"
+	"routepilot/internal/configgen"
 )
 
 // T12：两个不同目录下的同名 EXE。当前规则只能按 EXE 名匹配，

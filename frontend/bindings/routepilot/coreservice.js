@@ -444,7 +444,8 @@ export function SetMode(mode) {
 
 /**
  * SetProcessRule 设置某个程序的分流策略。
- * policy 取 "proxy" / "direct" / "follow"（follow 表示删除该记录、回到订阅规则）。
+ * policy 取 "proxy" / "direct" / "follow"，或 "target:<节点/策略组名>"。
+ * follow 表示删除该记录、回到订阅规则。
  * 
  * 返回值是"补断开的旧连接条数"。mihomo 只在建连那一刻匹配规则，已建立的
  * 连接不会重新判定，所以改完策略必须把该进程的老连接掐掉，用户才能立刻看到效果。
@@ -497,6 +498,9 @@ export function SetTrafficAlertLimit(mb) {
 /**
  * Shutdown 在应用退出时调用。只有确实是我们开的代理才需要还原，
  * 否则会把用户原本正在用的代理设置一并抹掉。
+ * 
+ * 退出阶段的恢复失败无法阻止进程结束，但备份与 Pending 标记必须保留，
+ * 下次启动会优先重试，避免网络配置永久停留在死端口。
  * @returns {$CancellablePromise<void>}
  */
 export function Shutdown() {

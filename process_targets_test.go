@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"proxdeck/internal/configgen"
-	"proxdeck/internal/subscription"
+	"routepilot/internal/configgen"
+	"routepilot/internal/subscription"
 )
 
 func TestProcessTargetPlanExplicitTarget(t *testing.T) {
@@ -37,7 +37,7 @@ func TestProcessTargetPlanProviderTarget(t *testing.T) {
 	plan := buildProcessTargetPlan(
 		map[string]string{"curl.exe": "target:ProviderNode"},
 		nil,
-		[]string{"nexuslink"},
+		[]string{"routepilot"},
 	)
 	if len(plan.Groups) != 1 {
 		t.Fatalf("provider 目标应生成隐藏组：%v", plan.Groups)
@@ -48,7 +48,7 @@ func TestProcessTargetPlanProviderTarget(t *testing.T) {
 		t.Fatalf("provider 组应含 DIRECT 兜底：%v", g)
 	}
 	use, _ := g["use"].([]any)
-	if len(use) != 1 || use[0] != "nexuslink" {
+	if len(use) != 1 || use[0] != "routepilot" {
 		t.Fatalf("provider 组应引用 provider：%v", g)
 	}
 	if !plan.Selections[0].ProviderBacked {
@@ -108,7 +108,7 @@ func TestSubscriptionTargetsBase64(t *testing.T) {
 		Format:    "base64",
 		Nodes:     []subscription.NodeInfo{{Name: "NodeA"}},
 		Groups:    []string{"节点选择"},
-		Providers: []string{"nexuslink"},
+		Providers: []string{"routepilot"},
 	}
 	targets, providers := subscriptionTargets(res)
 	if targets["NodeA"] {
@@ -117,7 +117,7 @@ func TestSubscriptionTargetsBase64(t *testing.T) {
 	if !targets["节点选择"] {
 		t.Fatal("base64 策略组应可作为目标")
 	}
-	if len(providers) != 1 || providers[0] != "nexuslink" {
+	if len(providers) != 1 || providers[0] != "routepilot" {
 		t.Fatalf("provider 列表不符：%v", providers)
 	}
 }

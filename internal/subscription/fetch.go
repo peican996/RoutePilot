@@ -246,7 +246,7 @@ func Parse(body []byte, subURL string, allowInsecure bool) (*Result, error) {
 			res.ProviderContent = []byte(strings.Join(uris, "\n"))
 			res.Nodes = nodesFromURIs(uris)
 			res.Groups = []string{"节点选择"}
-			res.Providers = []string{"nexuslink"}
+			res.Providers = []string{"routepilot"}
 			return res, nil
 		}
 	}
@@ -258,7 +258,7 @@ func Parse(body []byte, subURL string, allowInsecure bool) (*Result, error) {
 		res.ProviderContent = []byte(strings.Join(uris, "\n"))
 		res.Nodes = nodesFromURIs(uris)
 		res.Groups = []string{"节点选择"}
-		res.Providers = []string{"nexuslink"}
+		res.Providers = []string{"routepilot"}
 		return res, nil
 	}
 

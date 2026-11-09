@@ -59,7 +59,7 @@ func TestParseBase64NodeList(t *testing.T) {
 	if res.Nodes[0].Name != "Node1" || res.Nodes[0].Type != "trojan" {
 		t.Fatalf("节点元信息不符：%+v", res.Nodes[0])
 	}
-	if len(res.Providers) != 1 || res.Providers[0] != "nexuslink" {
+	if len(res.Providers) != 1 || res.Providers[0] != "routepilot" {
 		t.Fatalf("base64 订阅应记录 provider：%v", res.Providers)
 	}
 	if !strings.Contains(string(res.ProviderContent), "trojan://pass@example.com:443#Node1") {

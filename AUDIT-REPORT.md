@@ -1,4 +1,4 @@
-# NexusLink 生产级代码审查报告（第一阶段）
+# RoutePilot 生产级代码审查报告（第一阶段）
 
 - 审查日期：2026-11-09
 - 审查基线：`70adff3 feat: 地图按真实出口展示多出口路径`
@@ -129,7 +129,7 @@ main.go
 
 - 模块：系统代理
 - 位置：`service.go:1054-1099`（`reconcileProxy` 只要 `proxy.json` 存在且 `ProxyEnable=1` 就认领）；`service.go:666-679`（重启后按 `restoreProxy` 无条件重新开启）
-- 触发条件：用户或其它代理软件在 NexusLink 接管期间修改了 `ProxyServer`；用户手动关闭系统代理后退出再启动。
+- 触发条件：用户或其它代理软件在 RoutePilot 接管期间修改了 `ProxyServer`；用户手动关闭系统代理后退出再启动。
 - 根因：`proxy.json` 只记录"曾经接管过"，没有校验当前 `ProxyServer` 是否等于我们上次写入的 `Addr`；`restoreProxy` 是启动时无条件消费的旧意图。
 - 影响：
   - 启动时把外部软件的新代理地址改回我们的端口。

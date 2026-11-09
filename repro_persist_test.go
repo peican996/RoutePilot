@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"proxdeck/internal/subscription"
+	"routepilot/internal/subscription"
 )
 
 // T10（订阅/进程规则）：文件被截断时加载静默返回空，随后一次保存

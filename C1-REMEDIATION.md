@@ -136,17 +136,17 @@ C1 引入的是"接管记录"级别的状态，不改变内核生命周期：
 （无输出，exit=0）
 
 > go test -count=1 ./...
-ok  	proxdeck	                2.573s
-ok  	proxdeck/internal/autostart	1.298s
-ok  	proxdeck/internal/configgen	1.293s
-ok  	proxdeck/internal/elevate	[no test files]
-ok  	proxdeck/internal/geoip  	[no test files]
-ok  	proxdeck/internal/kernel 	1.664s
-ok  	proxdeck/internal/subscription	1.580s
-ok  	proxdeck/internal/sysproxy	[no test files]
+ok  	routepilot	                2.573s
+ok  	routepilot/internal/autostart	1.298s
+ok  	routepilot/internal/configgen	1.293s
+ok  	routepilot/internal/elevate	[no test files]
+ok  	routepilot/internal/geoip  	[no test files]
+ok  	routepilot/internal/kernel 	1.664s
+ok  	routepilot/internal/subscription	1.580s
+ok  	routepilot/internal/sysproxy	[no test files]
 exit=0
 
-> go build -ldflags "-s -w -H windowsgui" -o bin/NexusLink.exe .
+> go build -ldflags "-s -w -H windowsgui" -o bin/RoutePilot.exe .
 exit=0
 ```
 
@@ -154,7 +154,7 @@ C1 专项：
 
 ```
 > go test -count=1 -run 'TestT0|TestT1' .
-ok  	proxdeck	2.272s
+ok  	routepilot	2.272s
 ```
 
 新增/相关用例：
