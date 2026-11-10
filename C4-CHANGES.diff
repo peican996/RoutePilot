@@ -1,0 +1,4079 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5cded34..36844de 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -53,4 +53,50 @@ jobs:
+           fi
+ 
+       - name: Go test
+-        run: go test ./...
++        run: go test -count=1 ./...
++
++      # repro 标签下的复现/集成测试单独跑，确保故障场景不会回归
++      - name: Go test (repro)
++        run: go test -count=1 -tags repro ./...
++
++      # Windows amd64 编译：确认可执行文件真的能产出，而不是只过单测
++      - name: Windows amd64 build
++        env:
++          GOOS: windows
++          GOARCH: amd64
++        run: go build -o bin/RoutePilot.exe .
++
++  race:
++    runs-on: windows-latest
++    env:
++      PYTHONUTF8: '1'
++      CGO_ENABLED: '1'
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-go@v5
++        with:
++          go-version: '1.26'
++          cache: true
++
++      - uses: actions/setup-node@v4
++        with:
++          node-version: '20.19'
++          cache: npm
++          cache-dependency-path: frontend/package-lock.json
++
++      - name: Frontend build
++        working-directory: frontend
++        run: |
++          npm ci
++          npm run build
++
++      - name: Placeholder assets
++        run: python scripts/fetch-assets.py --placeholders
++
++      # -race 需要 CGO 编译器；Windows runner 默认没有 gcc。
++      - name: Install MinGW
++        run: choco install mingw -y --no-progress
++
++      - name: Go test -race
++        run: go test -race -count=1 ./...
+diff --git a/C4-AUDIT-REPORT.md b/C4-AUDIT-REPORT.md
+new file mode 100644
+index 0000000..457d26e
+--- /dev/null
++++ b/C4-AUDIT-REPORT.md
+@@ -0,0 +1,159 @@
++# C4 稳定性与故障恢复审计报告
++
++- 基线：`main` @ `e9172ff`
++- 审计范围：TUN/系统代理并发、内核生命周期、订阅安全与事务、配置持久化、多文件一致性
++- 结论：六项问题在基线上**全部真实存在**，均已定位到具体代码路径并在本轮修复。
++
++---
++
++## 1. TUN 与系统代理并发控制
++
++**风险等级：P1（系统状态失控）**
++
++代码位置：`service.go` `setTUN()`（原 2039-2150 行）
++
++原始问题：
++
++1. `setTUN()` 完全没有使用 `proxyMu`，注册表的还原、关闭、WinHTTP 还原都是裸写。
++2. `tunOn` 在重启内核**之前**就被置为 `true`（原 2090-2096 行），提交早于实际操作。
++3. 在"系统代理已关闭、`tunOn` 尚未置位"的窗口内，`SetSystemProxy(true)` 只检查
++   `s.tunOn`，会成功重新打开系统代理；随后 TUN 重启成功，形成 TUN + 系统代理双接管。
++4. `reconcileProxy()` 在同一窗口被 afterStart 调用时，也会按旧状态重新接管代理。
++5. 关闭 TUN 失败时，`tunPrevProxyOn` 被用掉但恢复意图没有写入启动恢复流程，
++   下次启动无法补做代理恢复。
++
++根因：TUN 开关是一个跨"注册表 + 内核重启 + 内存状态"的复合事务，
++却被拆成无锁的多段代码，且状态提交顺序错误。
++
++---
++
++## 2. Manager 启动成功与进程退出竞态
++
++**风险等级：P1（错误报告运行状态）**
++
++代码位置：`internal/kernel/manager.go` `startLocked()` 407-420 行、`waitProcess()` 516-555 行
++
++原始问题：
++
++```
++waitProcess:  r.exitErr = err; close(r.exited);  ← 先关退出信号
++              m.mu.Lock(); m.run = nil; state = Failed/Stopped  ← 后清理
++startLocked:  m.mu.Lock(); if m.run == r { state = Running }   ← 只看 run
++```
++
++进程在探测成功与提交 Running 之间退出时，`startLocked` 可能在 `waitProcess`
++拿到锁之前进入临界区，看到 `m.run == r` 就提交 Running 并返回 nil。
++调用方据此认为内核已就绪，实际上进程已经退出。
++
++根因：启动成功判定依赖"run 指针仍存在"，而不是"进程仍存活"；
++`exited` 通道提供的同步关系没有被使用。
++
++---
++
++## 3. 订阅跨主机重定向凭据泄漏
++
++**风险等级：P1（凭据泄漏）**
++
++代码位置：`internal/subscription/guard.go` `newGuardedClient()` 224-235 行、
++`internal/subscription/fetch.go` `doWithDeps()`
++
++原始问题：
++
++- 使用 `http.Client` 默认重定向，`CheckRedirect` 只重新校验 URL，**不限制跨主机**。
++- Go 的默认重定向会把上一跳 URL 写入 `Referer`；订阅 URL 通常是
++  `https://panel/api/v1/client/subscribe?token=SECRET`，于是 token 会以
++  `Referer: https://panel/...?token=SECRET` 的形式发送给第三方域名。
++- 没有显式处理 `Authorization` / `Cookie`；重定向目标带 userinfo 时会被
++  Go 自动转成 Basic Auth。
++- `https → http` 降级没有被禁止。
++
++根因：把安全边界完全交给 `http.Client` 默认行为，而默认行为为了兼容性
++会主动携带 Referer。
++
++---
++
++## 4. 订阅操作缺少提交串行化
++
++**风险等级：P2（数据一致性 / 半提交）**
++
++代码位置：`service.go` `Subscribe()`、`SwitchSubscription()`、
++`removeSubscription()`、`ClearSubscription()`、`applySubscription()`、
++`maybeAutoRefresh()`
++
++原始问题：
++
++- 所有订阅变更都只依赖 `s.mu` 保护内存字段，没有跨"文件落盘 + 内存提交 +
++  激活切换"的事务边界。
++- 刷新 A 的网络请求返回后直接调用 `applySubscription(A)`，期间用户若
++  切到 B，A 的结果会把 `subURL/activeIdx/subConfig` 全部覆盖回 A。
++- 切换、删除、清空与自动更新并发时，可能出现 `subs` 列表、`activeIdx`、
++  `subConfig` 与磁盘文件来自不同版本。
++- 自动更新已经有一段"重新读 active"的逻辑，但它是"检查后再写"，
++  不构成原子提交。
++
++根因：缺少统一的提交锁与"期望激活项"校验。
++
++---
++
++## 5. 配置损坏被静默当作空配置
++
++**风险等级：P1（用户配置永久丢失）**
++
++代码位置：`service.go` `loadSubs()`、`loadProcRules()`、`loadSiteRules()`、
++`loadIgnored()`、`loadAppState()`、`migrateSingleSub()`
++
++原始问题：
++
++- JSON 解析失败时直接 `return`，内存保持空值；程序继续运行。
++- 之后任何一次保存（`saveSubs` / `saveProcRules` / `saveAppState`）都会
++  `writeFileAtomic` 覆盖原文件，损坏前的用户数据永久丢失。
++- `loadAppState` 损坏时同样静默返回，TUN / 系统代理 / WinHTTP 的恢复线索
++  一起消失，可能留下指向死端口的系统代理。
++- 没有区分"文件不存在 / 空文件 / 截断 / 非法字段 / 版本不兼容"。
++
++根因：加载失败没有可诊断的返回状态，也没有"先保留再继续"的保护。
++
++---
++
++## 6. 多文件配置提交不一致
++
++**风险等级：P2（内核读到自相矛盾的规则）**
++
++代码位置：`service.go` `persistProcRuleSnapshot()`、`writeProcRuleSnapshotFiles()`、
++`writeProcRulesYAML()`；`internal/configgen/gen.go` 264/271 行固定路径
++
++原始问题：
++
++- 进程规则由三个文件组成：`process-rules.json`、`process-proxy.yaml`、
++  `process-direct.yaml`。
++- 三者分别原子写入，单个文件不会截断，但**跨文件没有事务**：
++  写第一个后崩溃，会留下"新 JSON + 旧 provider"或两个 provider 新旧混合。
++- 内核启动时直接按固定路径读取，无法判断这三个文件是否属于同一版本。
++
++根因：把"单文件原子"误当成"多文件一致"。
++
++---
++
++## 7. 影响范围
++
++| 问题 | 受影响功能 | 用户可见后果 |
++| --- | --- | --- |
++| TUN/代理并发 | TUN、托盘代理开关、启动恢复 | 双代理、断网、TUN 已开但代理仍指向旧端口 |
++| Manager 竞态 | 内核启动、看门狗、UI 状态 | 显示"运行中"但实际已退出，流量全部失败 |
++| 重定向泄漏 | 订阅更新 | 机场 token 泄漏给第三方域名 |
++| 订阅并发 | 多订阅切换/刷新/自动更新 | 切换到 B 又被刷新 A 覆盖，配置与 UI 不一致 |
++| 配置损坏 | 订阅、进程规则、网站规则、忽略列表、运行状态 | 一次异常断电后用户配置永久丢失 |
++| 多文件一致性 | 进程分流 | 内核读到混合版本规则，分流行为不可预测 |
++
++---
++
++## 8. 修复优先级与本轮处理
++
++| 序号 | 问题 | 等级 | 本轮 |
++| --- | --- | --- | --- |
++| 1 | TUN/系统代理并发 | P1 | 已修复 |
++| 2 | Manager 启动/退出竞态 | P1 | 已修复 |
++| 3 | 订阅重定向凭据泄漏 | P1 | 已修复 |
++| 4 | 订阅提交串行化 | P2 | 已修复 |
++| 5 | 配置损坏保护 | P1 | 已修复 |
++| 6 | 多文件一致性 | P2 | 已修复（generation + manifest） |
+diff --git a/C4-FAILURE-MATRIX.md b/C4-FAILURE-MATRIX.md
+new file mode 100644
+index 0000000..a29ce31
+--- /dev/null
++++ b/C4-FAILURE-MATRIX.md
+@@ -0,0 +1,199 @@
++# C4 关键故障恢复矩阵
++
++说明：
++- "验证结果"只写实际执行过的内容；未实机验证的场景明确标注为"设计分析/未实机"。
++- 自动化测试全部使用 `fakeRegistry` 与临时数据目录，不会改动本机系统设置。
++
++---
++
++## 1. 内核启动过程中程序崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 应用已启动，`mgr.Start()` 正在等待 API 就绪 |
++| 故障发生点 | `startLocked()` 的 `awaitReady` 与 `state=Running` 之间 |
++| 重启后读取 | `app-state.json`（TUN/代理意图）、`proxy.json`、内核二进制与配置 |
++| 恢复行为 | 进程已退出时不再提交 Running；下次启动重新走完整 Start |
++| 残留风险 | 无系统代理残留（接管在 afterStart 之后）；可能残留 `bin` 下内核进程，由 Job Object 随父进程结束 |
++| 数据丢失 | 无 |
++| 验证 | `TestStartRejectsExitBeforeRunningCommit`、`TestStartAfterExitBeforeRunningCanRetry`（确定性 hook） |
++
++---
++
++## 2. 内核运行过程中程序崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | Manager Running，Windows Job Object 已绑定内核 |
++| 故障发生点 | 应用进程任意时刻被强杀 |
++| 重启后读取 | `app-state.json`、`proxy.json`、`kernel.log` |
++| 恢复行为 | Job Object `KILL_ON_JOB_CLOSE` 结束内核；下次启动重新拉起；`product.json` 序号防重复接管 |
++| 残留风险 | 上一次的 kernel.log 保留用于复盘 |
++| 数据丢失 | 无（进程规则/订阅均为原子写） |
++| 验证 | 既有 `TestJobAttached`、真实内核生命周期测试；本机未做强制杀进程实测 |
++
++---
++
++## 3. 系统代理开启后程序崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | `proxyOn=true`，注册表指向 `127.0.0.1:17890`，`proxy.json` 记录原配置 |
++| 故障发生点 | 接管成功后的任意时刻 |
++| 重启后读取 | `app-state.json` 的 `proxyOn`、`proxy.json` 的 Addr/Server/Override/PAC |
++| 恢复行为 | 启动时 `recoverPendingProxyRestore` 处理 Pending；否则 `reconcileProxy` 确认地址仍是我们写入的端口后继续接管；退出时还原 |
++| 残留风险 | 若内核启动失败，`failBoot` 主动还原代理 |
++| 数据丢失 | 无 |
++| 验证 | `TestT01CrashRecoveryRestoresOriginal`、`TestT01CrashRecoveryReconcilesActiveTakeover`、`TestR1BootRetriesPendingRestore` |
++
++---
++
++## 4. TUN 开启后程序崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | `tunOn=true`，系统代理已还原并关闭，虚拟网卡存在 |
++| 故障发生点 | TUN 重启成功后的任意时刻 |
++| 重启后读取 | `app-state.json` 的 `tun`、`tunPrevProxyOn` |
++| 恢复行为 | 管理员启动时按 `tun` 生成含 TUN 的配置；非管理员不会声称 TUN 已开；系统代理保持关闭 |
++| 残留风险 | 崩溃瞬间 Windows 路由表可能短暂残留 Meta 网卡，内核重启后重建 |
++| 数据丢失 | 无 |
++| 验证 | `TestTUNDisableSuccessRestoresProxy`、`TestTUNDisableFailureDoesNotRestoreProxy`；真实内核 TUN 未在自动化中启用（需要管理员） |
++
++---
++
++## 5. 系统代理恢复过程中程序崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 正在把注册表还原为用户原配置，`proxy.json` 已标记 `Pending` |
++| 故障发生点 | `restoreProxyTransactionLocked` 写注册表与删除备份之间 |
++| 重启后读取 | `proxy.json`（`saved=true, pending=true`） |
++| 恢复行为 | 启动阶段优先重试；成功后才删除备份 |
++| 残留风险 | 若用户/外部软件在失败后改了代理，`proxyStillOurs` 判定为外部接管并放弃还原，不覆盖 |
++| 数据丢失 | 无；备份保留到校验通过 |
++| 验证 | `TestT02RestoreFailureKeepsBackupAndRetries`、`TestR1ExternalChangeAfterFailedRestoreIsNotOverwritten`、`TestR1RestoreIsIdempotent` |
++
++---
++
++## 6. 订阅下载完成但配置提交失败
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 旧订阅可用，刷新已拿到新内容 |
++| 故障发生点 | `applySubscriptionExpect` 写文件/写元信息失败 |
++| 重启后读取 | `subs.json`、`sub-*.yaml`、`subscription.yaml` |
++| 恢复行为 | 返回错误，内存与激活订阅不变；旧订阅继续可用 |
++| 残留风险 | 已写入的新 `sub-<url>.yaml` 可能留下，但不会被激活 |
++| 数据丢失 | 无 |
++| 验证 | `TestRefreshDoesNotOverrideConcurrentSwitch`、`TestSubscriptionOpsConcurrentConsistency` |
++
++---
++
++## 7. 多文件配置写入中途崩溃
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 已有一代完整 `procgen` |
++| 故障发生点 | 新 generation 文件写到一半，或文件写完但 `current.json` 未发布 |
++| 重启后读取 | `procgen/current.json` → `current.json.prev` → 旧版平铺文件 |
++| 恢复行为 | 只接受 manifest + 三文件哈希全部匹配的版本；否则回退上一代/旧格式 |
++| 残留风险 | 半成品 generation 文件会被清理；旧版平铺文件可能短暂混合，但不被当前版本读取 |
++| 数据丢失 | 无 |
++| 验证 | `TestProcGenManifestFailureKeepsPrevious`、`TestProcGenTruncatedFileFallsBack`、`TestProcGenCorruptManifestFallsBackPrev`、`TestProcGenCleanupKeepsTwoGenerations`、`TestRealKernelLoadsProcGenProvider` |
++
++---
++
++## 8. 配置文件损坏
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 用户已有订阅/规则/窗口状态 |
++| 故障发生点 | 断电导致 JSON 截断、磁盘位翻转、手工编辑错误 |
++| 重启后读取 | 各 JSON 文件 |
++| 恢复行为 | 区分缺失/空/损坏/版本不兼容；损坏文件改名为 `.corrupt-<时间>`；界面显示启动错误；后续保存写入新文件 |
++| 残留风险 | 用户需要手工从备份恢复；程序不会静默覆盖 |
++| 数据丢失 | 不再发生不可逆丢失（原文件保留） |
++| 验证 | `TestCorruptConfigIsPreservedAndReported`（7 子用例）、`TestEmptyConfigIsTreatedAsCorrupt`、`TestFutureVersionConfigIsRejected`、`TestSaveAfterCorruptDoesNotDestroyBackup` |
++
++---
++
++## 9. 内核升级过程中断电
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 旧内核可运行，升级包已下载 |
++| 故障发生点 | 临时文件写入 / rename / `.bak` 生成任意阶段 |
++| 重启后读取 | `mihomo.exe`、`mihomo.exe.bak`、`core-upgrade.json` |
++| 恢复行为 | C3 已实现"临时文件 + Sync + rename + 备份 + 启动失败回滚"；C4 未改动该路径 |
++| 残留风险 | 极端情况下 `.bak` 与当前文件都不可用，需要重新下载内核 |
++| 数据丢失 | 用户配置不受影响 |
++| 验证 | 既有 `internal/kernel/update_test.go`、`upgrade_test.go`；本轮未重复执行断电模拟 |
++
++---
++
++## 10. 系统休眠和唤醒
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | TUN 或系统代理接管中 |
++| 故障发生点 | 休眠/唤醒导致网卡与路由重建 |
++| 重启后读取 | 不重启程序；Status 轮询与 Watchdog 继续工作 |
++| 恢复行为 | TUN 由 mihomo 的 auto-route 恢复；系统代理是注册表状态，不随休眠变化 |
++| 残留风险 | 少数网卡驱动唤醒后 TUN 路由丢失，需要重启内核；当前没有专门的网络变更监听 |
++| 数据丢失 | 无 |
++| 验证 | **未实机验证**（自动化无法安全触发休眠）。列为 P3 已知限制 |
++
++---
++
++## 11. 网络断开和恢复
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 内核运行，订阅与节点可用 |
++| 故障发生点 | 断网导致订阅拉取失败 / 节点不可用 |
++| 重启后读取 | `subs.json` 与本地 `sub-*.yaml` |
++| 恢复行为 | 拉取失败只记录 `subInfo.Error`，旧订阅与本地配置继续可用；网络健康检查每 2 分钟探测 |
++| 残留风险 | 自动更新在断网期间跳过，网络恢复后下一轮补齐 |
++| 数据丢失 | 无 |
++| 验证 | `TestLegalSubscriptionUpdateStillWorks`（连通性）；断网切换未实机演练 |
++
++---
++
++## 12. Watchdog 连续重启失败
++
++| 项 | 内容 |
++| --- | --- |
++| 故障前状态 | 内核异常退出，看门狗开始退避 |
++| 故障发生点 | 重启持续失败（端口占用、二进制损坏） |
++| 重启后读取 | `app-state.json`、`proxy.json` |
++| 恢复行为 | 滑动窗口 + 指数退避 + 上限 5 次；熔断时还原系统代理与 WinHTTP 并通知 UI；`restoreSystemProxy` 失败保留备份 |
++| 残留风险 | 熔断后需要用户手动处理（释放端口/更新内核） |
++| 数据丢失 | 无 |
++| 验证 | `TestWatchdogExhaustsAfterMaxRestarts`、`TestWatchdogRestartFailureCountsTowardLimit`、`TestWatchdogR1RestartFailureAndOnExitDeduplicated`、`TestR1WatchdogExhaustedRestoreSerializedWithUser`、`TestWatchdogR1StopDuringRestart` |
++
++---
++
++## 13. 管理员实机验证步骤
++
++普通测试不会改本机设置。需要真实验证时：
++
++```powershell
++# 备份原值
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyEnable
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyServer
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ProxyOverride
++reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v AutoConfigURL
++```
++
++1. 管理员启动，确认内核 Running、TUN 关闭。
++2. 开系统代理 → 确认注册表指向 `127.0.0.1:17890`、PAC 为空。
++3. 开 TUN，并**立即**在托盘反复点"系统代理"：应提示"TUN 正在切换"或被 TUN 拒绝；
++   最终 `ProxyEnable=0` 且 Meta 网卡 Up。
++4. 关 TUN → 确认系统代理按原状态恢复。
++5. 强杀进程 → 重启：确认代理/TUN 状态与 `app-state.json` 一致，无死端口。
++6. 手工把 `app-state.json` 改坏 → 重启：界面应显示配置损坏提示，目录出现
++   `app-state.json.corrupt-*`，原内容仍在。
++7. 检查数据目录 `procgen/`：`current.json` 与 3 个文件存在；手工截断其中一个 →
++   重启应回退上一代或旧版平铺文件，内核仍能启动。
++8. 订阅跨站跳转：用一个会 302 到其他域名的订阅地址，确认更新被拒绝且日志说明原因。
+diff --git a/C4-INDEPENDENT-REVIEW.md b/C4-INDEPENDENT-REVIEW.md
+new file mode 100644
+index 0000000..d155400
+--- /dev/null
++++ b/C4-INDEPENDENT-REVIEW.md
+@@ -0,0 +1,275 @@
++# C4 独立验收与回归审查
++
++审查方式：不引用 `C4-REMEDIATION.md` 的结论，重新阅读当前代码、逐项对照基线
++`e9172ff` 的差异，并实际执行测试。
++
++---
++
++## 1. 逐项验收
++
++### 1.1 TUN 与系统代理并发
++
++**修改前控制流**
++
++```
++setTUN: 关代理(无锁) → tunOn=true(提前) → RestartKernel
++SetSystemProxy(true): 只检查 tunOn → 在窗口期可成功打开代理
++```
++
++**修改后控制流**
++
++```
++setTUN: mu 内置 tunChanging=true → proxyMu 内关代理/WinHTTP
++      → 释放 proxyMu → RestartKernel
++      → 成功: tunOn=true, proxyOn=false
++      → 失败: 按 kernelAlive 回滚注册表/内存，保留 restoreProxy 意图
++SetSystemProxy(true): 持有 proxyMu 后读 tunChanging/tunOn → 拒绝
++reconcileProxy: tunChanging 时直接返回
++```
++
++关键代码：`service.go` `setTUN()`、`setSystemProxyLocked()`、
++`reconcileProxyLocked()`、`withProxyTx()`。
++
++**测试**：`c4_tun_test.go` 7 项，全部实际执行通过。
++
++**残余触发路径**：
++- 外部代理软件在"准备段结束 → 重启完成"之间改注册表：程序不会覆盖它，
++  但也不会重新校验；TUN 成功后系统代理保持外部值。属于可接受行为（不破坏用户设置）。
++- `tunChanging` 只在内存中，崩溃后不会残留（进程结束即消失），由 `app-state.json`
++  的已提交状态恢复。
++
++**结论：已解决，有确定性测试。**
++
++---
++
++### 1.2 Manager 启动成功与进程退出竞态
++
++**修改前**
++
++```go
++m.mu.Lock()
++if m.run == r { m.state = StateRunning; return nil }
++```
++
++**修改后**
++
++```go
++m.mu.Lock()
++if m.run != r { ... return ErrProcessExited }
++select {
++case <-r.exited:            // 进程已退出（waitProcess 可能还没拿到锁）
++    m.run = nil
++    m.state = StateFailed
++    return ErrProcessExited
++default:
++    m.state = StateRunning
++}
++```
++
++`r.exitErr` 在 `close(r.exited)` 之前写入，读取有 happens-before 保证。
++先摘除 `m.run` 还避免了随后 `waitProcess` 把 Failed 改回 Stopped、
++或让后续 Start 误判"已在运行"。
++
++**测试**：`TestStartRejectsExitBeforeRunningCommit`、
++`TestStartAfterExitBeforeRunningCanRetry`。使用真实子进程 + `before-running`
++hook，等待 `r.exited` 关闭后再放行，没有 sleep 或超时掩盖。
++
++**残余路径**：`Stop`/`abortStart` 路径未改动，仍由 `opMu` 串行化；
++本次只补了"提交 Running"这一处缺失的同步检查。
++
++**结论：已解决，有确定性测试。**
++
++---
++
++### 1.3 订阅重定向凭据泄漏
++
++**修改前**：`http.Client` 自动跟随，`CheckRedirect` 只校验 URL，
++Referer 由 Go 自动写入且包含原始查询串。
++
++**修改后**：
++- `CheckRedirect` 返回 `ErrUseLastResponse`；
++- `doWithDeps` 手动循环，每一跳都用全新 Header（仅 UA/Accept）；
++- `redirectAllowed`：默认拒绝跨站；禁止 https→http；禁止 userinfo；
++- 每跳继续执行 `validateSubscriptionURL`，拨号层继续做 DNS 全量校验。
++
++**测试**：`internal/subscription/redirect_test.go` 8 项，全部通过。
++其中跨站用例断言第三方服务器收到 **0 次请求**；同站用例断言 `Referer` 为空、
++跳转后的查询串不包含原始 token。
++
++**残余路径 / 行为变化**：
++- 合法但依赖跨站 CDN 的订阅会被拒绝。这是有意的默认安全策略，
++  用户需要填写最终地址。属于 **产品决策风险**，不是漏洞。
++- `sameSiteHost` 用标签边界比较，未引入 Public Suffix List；
++  `a.co.uk → co.uk` 会被视为同站。实际可利用性低（需要控制公共后缀域），
++  标记 P3。
++
++**结论：已解决；跨站订阅兼容性需产品确认。**
++
++---
++
++### 1.4 订阅提交串行化
++
++**修改前**：刷新结果直接写 `subURL/activeIdx/subConfig`，与切换/删除并发时互相覆盖。
++
++**修改后**：
++- `subsMu` 覆盖"落盘 + 内存提交"，网络下载在锁外；
++- `applySubscriptionExpect` 在锁内校验 `expectActive`，不匹配返回
++  `errSubscriptionChanged`；
++- 刷新/自动更新传 `expectActive`，用户显式添加/切换不传；
++- 删除/清空/切换使用同一把锁，且释放后才调用 `RestartKernel`。
++
++**测试**：`TestRefreshDoesNotOverrideConcurrentSwitch` 精确复现"下载中切换"；
++`TestSubscriptionOpsConcurrentConsistency` 7 个并发操作无死锁、无重复条目。
++
++**残余风险**：
++- 两个用户操作（显式 Subscribe A 与 Switch B）并发时，后者提交顺序决定结果，
++  这是"最后操作生效"，不是数据损坏。标记 P3。
++- 已修复审查中发现的一个小问题：下载期间用户切换"忽略证书校验"，
++  提交时曾会被旧值覆盖；现在保留内存中的最新标志。
++
++**结论：已解决。**
++
++---
++
++### 1.5 配置损坏保护
++
++**修改前**：解析失败静默返回，后续保存覆盖原文件。
++
++**修改后**：`readConfigJSON` 返回 `missing/empty/corrupt/unsupported/ok`；
++损坏文件改名为 `.corrupt-<时间>`；`bootErr` + `debug.log` 双通道提示；
++新增 `version` 字段识别未来版本。
++
++**测试**：7 个文件的非法 JSON/类型错误/截断，外加空文件、版本不兼容、
++缺失文件、保存后备份不被破坏，全部通过。
++
++**残余风险**：
++- `proxy.json` 走的是独立读取路径（保持原逻辑：损坏则保留原文件并提示，
++  不做改名），因此不会被后续保存覆盖，但也不会自动备份成 `.corrupt-*`。
++  标记 P3。
++- 损坏的 `app-state.json` 无法恢复 WinHTTP 备份内容；原文件保留在
++  `.corrupt-*` 中供人工取回。标记 P2（信息可恢复，但需要人工介入）。
++
++**结论：已解决（不静默、不覆盖、可诊断）。**
++
++---
++
++### 1.6 多文件配置一致性
++
++**修改后**：generation 目录 + manifest 提交点；current 校验失败回退 prev，
++再回退旧版平铺文件；发布前写文件并逐个回读哈希。
++
++**测试**：发布/解析、manifest 未发布、current 损坏、文件截断、旧版回退、
++清理、路径穿越，全部通过；真实 mihomo 能从 procgen 加载 provider。
++
++**残余风险**：
++- 旧版平铺文件在 manifest 发布后 best-effort 更新；若此时崩溃，平铺文件可能是
++  混合版本。当前版本不读它们，只有降级到旧版本时才有影响。标记 P3。
++- 每次启动都会发布一个新 generation（规则不变也发），清理只保留 2 代；
++  磁盘开销可忽略，但属于可以优化的 P3。
++
++**结论：已解决。**
++
++---
++
++## 2. 锁与状态图
++
++### 2.1 实际嵌套关系
++
++```
++lifeMu  ──(Stop/Restart/Shutdown)──> proxyMu ──> s.mu
++subsMu  ──(提交/切换/删除)─────────> s.mu
++procGenMu ──(发布/解析)────────────> s.mu
++```
++
++`lifeMu` 与 `subsMu` **从不嵌套**：订阅操作在释放 `subsMu` 后才调用
++`RestartKernel`（需要 `lifeMu`）。文档中的链式顺序描述的是单次嵌套路径，
++不是同时持有。
++
++### 2.2 TUN 状态机
++
++```
++                    ┌─────────── tunChanging=true ───────────┐
++关闭 ──开TUN──> 准备(proxyMu) ──> 重启(无 proxyMu) ──> 提交/回滚
++                    │
++                    └─ 并发 SetSystemProxy(true) → 拒绝
++                    └─ 并发 reconcileProxy      → 跳过
++```
++
++合法组合只有：`(false,false)`、`(false,true)`、`(true,false)`。
++`(true,true)` 由两层拦截（tunChanging + tunOn）共同排除。
++
++---
++
++## 3. 审查中新发现并已修复的问题
++
++| # | 问题 | 等级 | 处理 |
++| --- | --- | --- | --- |
++| N1 | 内核未运行时关闭 TUN，`tunPrevProxyOn` 被清空，恢复意图丢失 | P2 | 成功分支改为写入 `restoreProxy` 并落盘；新增测试 |
++| N2 | `procgen/current.json` 被手工改成 `../` 路径可读取目录外文件 | P3 | 校验文件名必须是纯 basename；新增测试 |
++| N3 | 下载期间切换"忽略证书校验"，提交时被旧值覆盖 | P3 | 提交时保留内存最新 `Insecure` |
++
++---
++
++## 4. 仍未解决的问题（按等级）
++
++### P0
++无。
++
++### P1
++无（本轮范围内的已知 P1 均已修复并有用例）。
++
++### P2
++1. **跨站重定向默认拒绝可能影响部分机场订阅**：需要产品确认是否提供
++   显式白名单；当前行为是安全优先。
++2. **TUN 关闭失败且内核已死**：本次已把恢复意图写入启动流程，
++   但真正恢复要等到下次启动，期间系统代理处于"用户原配置"状态。
++   这是能力限制，不是状态谎言。
++3. **配置损坏需要人工介入**：程序保证不覆盖、可诊断，但不会自动从
++   `.corrupt-*` 合并恢复。
++4. **TUN/系统代理的真实注册表与网卡行为未在本机实机验证**：
++   自动化只覆盖 fakeRegistry 与真实 mihomo（不含 TUN 网卡）。
++
++### P3
++1. `sameSiteHost` 未使用 Public Suffix List。
++2. `proxy.json` 损坏路径没有 `.corrupt-*` 副本（保留原文件、不覆盖）。
++3. 系统休眠/唤醒、网络切换没有专门监听。
++4. 每次启动发布新 generation，存在可优化的磁盘 churn。
++5. 本机无法执行 `-race`；CI race job 尚未实际跑过一次。
++
++---
++
++## 5. 测试真实性核对
++
++| 声明 | 是否真实执行 |
++| --- | --- |
++| `go test ./...` | 是 |
++| `-count=3 ./internal/kernel .` | 是 |
++| `-tags repro ./...` | 是 |
++| `-tags realkernel`（3 项 + procgen） | 是，真实 mihomo 进程 |
++| `go vet` / `gofmt` | 是 |
++| 前端生产构建 | 是 |
++| Windows amd64 编译 | 是（`go build ./...`，未覆盖运行中的 bin exe） |
++| `go test -race` | **否**：本机无 gcc；未标记为通过 |
++| Windows 实机 TUN/注册表 | **否**：未执行，已列出步骤 |
++
++---
++
++## 6. 发布条件判断
++
++| 条件 | 状态 |
++| --- | --- |
++| 所有 P0/P1 已修复并有测试 | 是（本轮范围内） |
++| TUN/系统代理无已知竞态 | 代码路径上已排除；实机未验证 |
++| 内核生命周期无已知状态竞争 | 是（启动/退出、Stop/Restart 均有确定性测试） |
++| 订阅安全边界无已知绕过 | 是（跨站/降级/userinfo/SSRF 均有测试） |
++| 配置不会因解析/写入失败被静默覆盖 | 是 |
++| 关键故障矩阵有明确结果 | 部分：12 项中 9 项有自动化或既有测试，3 项明确未实机 |
++| 自动化测试通过 | 是（除 race 未执行） |
++
++**结论：可以作为发布候选，但不建议直接宣布 GA。阻断项如下：**
++
++1. 在具备 CGO 的环境实际跑通 `go test -race ./...`（CI 已配置，需一次成功记录）。
++2. 管理员实机完成 TUN + 系统代理并发、崩溃恢复、procgen 回退三项验证。
++3. 产品确认"跨站重定向默认拒绝"是否可接受，或补充显式白名单。
++
++在上述三项完成前，标记为 **Release Candidate / 待实机验收**。
+diff --git a/C4-REMEDIATION.md b/C4-REMEDIATION.md
+new file mode 100644
+index 0000000..a9eb32f
+--- /dev/null
++++ b/C4-REMEDIATION.md
+@@ -0,0 +1,206 @@
++# C4 整改报告
++
++基线：`main` @ `e9172ff`
++原则：不新增功能、不做大规模重构，只修稳定性/安全/一致性。
++
++---
++
++## 1. 修改文件清单
++
++| 文件 | 类型 | 内容 |
++| --- | --- | --- |
++| `service.go` | 修改 | TUN 事务、代理状态机、订阅提交锁、配置损坏处理、procgen 接入 |
++| `config_files.go` | 新增 | `readConfigJSON` / `configReadState` / 损坏文件保留与上报 |
++| `procgen.go` | 新增 | generation 目录 + manifest 发布、校验、回退、清理 |
++| `internal/kernel/manager.go` | 修改 | 启动成功前检查 `r.exited` |
++| `internal/subscription/guard.go` | 修改 | 手动重定向策略、跨站拒绝、Referer/凭据剥离 |
++| `internal/subscription/fetch.go` | 修改 | 手动跟随重定向循环、总超时、逐跳校验 |
++| `internal/configgen/gen.go` | 修改 | 支持版本化 provider 路径（默认兼容旧路径） |
++| `.github/workflows/ci.yml` | 修改 | repro、Windows amd64 构建、race job |
++| `c4_tun_test.go` | 新增 | TUN 与代理并发/回滚测试 |
++| `c4_subscription_test.go` | 新增 | 刷新与切换并发、提交一致性测试 |
++| `c4_config_test.go` | 新增 | 损坏/空/版本不兼容/不覆盖测试 |
++| `c4_procgen_test.go` | 新增 | 发布、崩溃点、回退、清理测试 |
++| `internal/kernel/start_exit_race_test.go` | 新增 | 启动与退出竞态确定性测试 |
++| `internal/subscription/redirect_test.go` | 新增 | 跨站重定向与 Referer 泄漏测试 |
++| `realkernel_procgen_test.go` | 新增 | 真实 mihomo 加载 procgen provider |
++| `internal/subscription/guard_test.go` | 修改 | 私有 DNS 重定向用例改用同站点子域，保留 DNS 校验覆盖 |
++
++---
++
++## 2. 锁设计
++
++### 2.1 锁清单与顺序
++
++单次嵌套路径（不是同时持有全部）：
++
++```
++lifeMu  ──> proxyMu ──> s.mu
++subsMu  ──> s.mu
++procGenMu ──> s.mu
++```
++
++- `lifeMu`：Start/Stop/Restart/Shutdown 生命周期事务。
++- `proxyMu`：系统代理注册表事务（开关、校正、还原、WinHTTP、TUN 的注册表部分）。
++- `subsMu`：订阅"落盘 + 内存提交"事务；网络下载**不持锁**。
++- `procGenMu`：进程规则 generation 发布/解析/清理。
++- `s.mu`：只保护内存字段，持有期间禁止注册表 I/O、文件 I/O、网络 I/O。
++
++`lifeMu` 与 `subsMu` 从不嵌套：订阅操作在释放 `subsMu` 后才调用
++`RestartKernel`（需要 `lifeMu`）。
++
++不允许的反向路径：
++
++- 持有 `s.mu` 时不能取 `proxyMu/subMu/procGenMu`。
++- 持有 `subsMu` 时不能调用 `RestartKernel()`（会取 `lifeMu`），因此重启都在释放后执行。
++- `afterStart` 只取 `proxyMu`，绝不取 `lifeMu`，避免与 Stop/Restart 形成环。
++
++### 2.2 TUN 为什么不能整段持有 proxyMu
++
++TUN 切换包含"重启内核"，而重启后的 `afterStart` 需要 `proxyMu` 做端口校正。
++如果 `setTUN` 持锁重启，`waitAfterTasks` 会等待一个永远拿不到锁的任务，形成死锁。
++
++因此 TUN 事务拆成三段：
++
++1. **准备段（持 proxyMu）**：还原并关闭系统代理、还原 WinHTTP。
++2. **重启段（不持 proxyMu）**：`tunChanging=true` 阻止代理事务进入。
++3. **提交/回滚段**：按重启结果提交 `tunOn`，或恢复注册表与内存状态。
++
++`tunChanging/tunTarget` 是这段窗口的显式状态，不是用 sleep 掩盖。
++
++---
++
++## 3. 状态转换
++
++### 3.1 TUN
++
++```
++关闭 --开TUN--> [tunChanging=true, target=true]
++                  ├─ 准备失败 ──────────────→ tunOn=false, 备份/Pending 保留
++                  ├─ 重启失败 + 内核存活 ───→ tunOn=false, 重新接管系统代理
++                  ├─ 重启失败 + 内核已死 ───→ tunOn=false, 恢复用户原代理, restoreProxy 记录
++                  └─ 重启成功 ──────────────→ tunOn=true, proxyOn=false
++
++开启 --关TUN--> [tunChanging=true, target=false]
++                  ├─ 重启失败 + 内核存活 ───→ tunOn=true, 不碰系统代理
++                  ├─ 重启失败 + 内核已死 ───→ tunOn=false, restoreProxy=true
++                  └─ 重启成功 ──────────────→ tunOn=false → 按记录恢复系统代理
++```
++
++合法状态组合（`tunChanging=false` 时）：
++
++| tunOn | proxyOn | 含义 |
++| --- | --- | --- |
++| false | false | 都不接管 |
++| false | true | 仅系统代理接管 |
++| true | false | 仅 TUN 接管（合法且唯一允许的 TUN 组合） |
++| true | true | **禁止**，由 `tunChanging` 与 SetSystemProxy 拒绝共同保证 |
++
++### 3.2 内核状态
++
++`Stopped/Failed → Starting → Running` 的提交新增了退出信号检查：
++
++```go
++select {
++case <-r.exited:
++    m.run = nil
++    m.state = StateFailed
++    return ErrProcessExited
++default:
++    m.state = StateRunning
++}
++```
++
++`exited` 关闭发生在 `r.exitErr` 写入之后，因此读取 `exitErr` 有 happens-before 保证。
++
++### 3.3 订阅
++
++```
++下载（无锁） → subsMu → 检查 expectActive → 写文件 → 提交内存 → 释放 → 重启内核
++```
++
++- `Subscribe`：`expectActive=""`，用户明确添加/更新，允许激活。
++- `RefreshSubscription` / 自动更新：`expectActive=当前激活 URL`，期间被切换则返回
++  `errSubscriptionChanged`，不覆盖用户操作。
++- 切换/删除/清空：全程 `subsMu`，文件与内存同一事务。
++
++---
++
++## 4. 持久化协议变化
++
++### 4.1 配置文件读取
++
++新增 `readConfigJSON` 返回明确状态：
++
++| 状态 | 含义 | 行为 |
++| --- | --- | --- |
++| `missing` | 文件不存在 | 正常首次启动，不报错 |
++| `empty` | 存在但只有空白 | 视为截断：保留备份 + 启动错误 |
++| `corrupt` | JSON 解析失败 / 字段类型非法 | 保留备份 + 启动错误 |
++| `unsupported` | `version` 高于程序支持 | 保留备份 + 启动错误，不按旧结构解释 |
++
++保留方式：把原文件改名为 `<name>.corrupt-YYYYMMDD-HHMMSS`，后续保存写入新文件，
++原内容不会被覆盖。
++
++`appState` 与 `subsStore` 新增 `version` 字段（当前为 1，旧文件缺省为 0）。
++
++### 4.2 进程规则 generation
++
++新布局：
++
++```
++procgen/
++  proxy-<gen>.yaml
++  direct-<gen>.yaml
++  rules-<gen>.json
++  current.json          # 提交点：文件名 + sha256 列表
++  current.json.prev     # 上一代提交点
++```
++
++发布顺序：
++
++1. 三个文件写入新 generation 目录；
++2. 逐个回读并校验 SHA-256；
++3. 保存上一代 `current.json` 为 `.prev`；
++4. 原子 rename 发布 `current.json`；
++5. 尽力同步旧版平铺文件（降级兼容）；
++6. 清理不在 current/prev 中的旧 generation。
++
++加载顺序：`current` → `current.json.prev` → 旧版 `process-rules.json`。
++任何一代只有"manifest 存在 + 三个文件哈希全部匹配"才会被采用。
++
++内核配置通过 `configgen.Options.ProcessProxyPath/ProcessDirectPath` 指向
++`./procgen/xxx.yaml`；路径为空时回退旧的 `./process-*.yaml`。
++
++---
++
++## 5. 订阅重定向策略
++
++明确策略（`redirectAllowed`）：
++
++| 场景 | 处理 |
++| --- | --- |
++| 同主机 / 父子域跳转 | 允许 |
++| 跨站跳转（不同注册域） | 拒绝 `ErrCrossHostRedirect` |
++| `https → http` | 拒绝 `ErrInsecureRedirect` |
++| 目标带 userinfo | 拒绝 `ErrBlockedAddress` |
++| 目标 IP/内网/数字主机 | 仍由 `validateSubscriptionURL` + 拨号校验拦截 |
++
++实现方式：`http.Client.CheckRedirect` 返回 `ErrUseLastResponse`，由
++`doWithDeps` 手动循环跟随；每一跳都新建请求，Header 只包含
++`User-Agent` 与 `Accept`，不携带 Referer/Authorization/Cookie。
++总超时覆盖所有跳转，最多 5 跳。
++
++---
++
++## 6. 兼容性说明
++
++1. **旧数据可直接启动**：没有 `procgen/` 时回退旧版平铺文件；旧 JSON 没有
++   `version` 字段按 0 处理。
++2. **降级兼容**：每次发布仍会尽力更新旧版平铺文件，回退到旧版本程序时规则可用。
++3. **路径格式**：配置中的 procgen 路径统一使用正斜杠，Windows 下 mihomo 可正常读取。
++4. **跨站重定向行为变化**：以前会跟随任意公网跳转，现在默认拒绝。若用户订阅确实
++   依赖跨站 CDN，需要直接填写最终地址。这是有意的安全收紧。
++5. **损坏文件处理变化**：以前静默清空，现在会改名保留并在界面显示启动错误；
++   用户可从 `.corrupt-*` 文件手工恢复。
++6. **新增 `version` 字段**对旧版本是无害的未知字段，旧版本会忽略。
+diff --git a/C4-TEST-REPORT.md b/C4-TEST-REPORT.md
+new file mode 100644
+index 0000000..d3d43fd
+--- /dev/null
++++ b/C4-TEST-REPORT.md
+@@ -0,0 +1,132 @@
++# C4 测试报告
++
++## 1. 环境
++
++| 项 | 值 |
++| --- | --- |
++| OS | Windows 10 Pro 2009 / Build 26200（Windows 11） |
++| CPU 架构 | amd64 |
++| Go | `go1.27.3 windows/amd64` |
++| Node | 前端使用仓库现有 node_modules，Vite 8.3.6 |
++| 内核资源 | `assets/mihomo.exe`（v1.19.33）、wintun、GeoIP 均在仓库内 |
++| CGO 编译器 | **不可用**（`gcc` 不在 PATH） |
++
++---
++
++## 2. 执行结果
++
++| 命令 | 结果 |
++| --- | --- |
++| `go test -count=1 ./...` | 通过 |
++| `go test -count=3 ./internal/kernel .` | 通过（kernel 31.357s / root 4.197s） |
++| `go test -count=1 -tags repro ./...` | 通过 |
++| `go test -tags realkernel -run TestRealKernel ./internal/kernel` | 通过（3 项） |
++| `go test -tags realkernel -run TestRealKernelLoadsProcGenProvider .` | 通过 |
++| `go vet ./...` | 通过（无输出） |
++| `gofmt -l .` | 通过（无输出） |
++| `npm run build`（frontend） | 通过（67 modules，dist 299.14 kB） |
++| `GOOS=windows GOARCH=amd64 go build ./...` | 通过（exit 0） |
++| `go test -race -count=1 ./...` | **未执行成功**：`-race requires cgo`；`CGO_ENABLED=1` 时报 `cgo: C compiler "gcc" not found` |
++
++原始输出（节选）：
++
++```
++ok  	routepilot	2.811s
++ok  	routepilot/internal/autostart	0.738s
++ok  	routepilot/internal/configgen	0.736s
++ok  	routepilot/internal/kernel	11.613s
++ok  	routepilot/internal/procid	0.778s
++ok  	routepilot/internal/subscription	2.511s
++```
++
++```
++--- PASS: TestRealKernelDistinguishesSameNameProcessPaths (0.32s)
++--- PASS: TestRealKernelSmartRoutingRulesStart (0.22s)
++--- PASS: TestRealKernelLifecycle (0.22s)
++--- PASS: TestRealKernelLoadsProcGenProvider (0.39s)
++```
++
++---
++
++## 3. 未执行项与原因
++
++| 项目 | 原因 | 替代验证 |
++| --- | --- | --- |
++| 本地 `go test -race` | 本机无 gcc，CGO 不可用 | 已新增 CI race job（windows-latest + `choco install mingw` + `CGO_ENABLED=1`）；本轮未在 CI 实际运行 |
++| 真实断电 / 休眠唤醒 | 自动化环境无法安全模拟 | 用 generation 发布点、退出信号、故障注入覆盖同类的"半写/崩溃"路径；实机步骤见矩阵文档 |
++| 真实注册表操作 | 避免修改用户电脑 | 全部使用 `fakeRegistry` 故障注入；管理员实机步骤见 `C4-FAILURE-MATRIX.md` 第 13 节 |
++| 新构建 exe 的实机运行 | 当前用户正在运行旧版（bin 下 exe 被占用） | 已完成 Windows amd64 编译检查；C4 变更未部署到运行实例，避免中断用户网络 |
++
++> 说明：没有把未执行的测试写成通过。`realkernel` 测试是真实 mihomo 进程，
++> 已在本机实际执行。
++
++---
++
++## 4. 新增测试覆盖
++
++### 4.1 TUN 与系统代理（`c4_tun_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestTUNToggleBlocksConcurrentProxyEnable` | TUN 重启阶段并发 `SetSystemProxy(true)` 被拒绝；最终无双接管 |
++| `TestTUNEnableFailureRestoresProxyTakeover` | TUN 开启失败回滚到切换前的代理接管状态 |
++| `TestTUNEnableRestoreFailureKeepsPendingBackup` | 切 TUN 前代理恢复失败：保留 Pending 备份、不重启内核 |
++| `TestTUNDisableFailureDoesNotRestoreProxy` | 关 TUN 失败：不宣称代理已恢复，保留恢复意图 |
++| `TestTUNDisableSuccessRestoresProxy` | 关 TUN 成功按记录恢复代理 |
++| `TestTUNDisableWithoutKernelPersistsRestoreIntent` | 内核未运行时关 TUN：不写注册表，但把恢复意图写入启动流程 |
++| `TestReconcileSkippedDuringTUNToggle` | TUN 切换期间 reconcile 不写注册表 |
++
++### 4.2 内核启动/退出竞态（`start_exit_race_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestStartRejectsExitBeforeRunningCommit` | `before-running` hook 阻塞 → 子进程退出 → 放行 → Start 返回 `ErrProcessExited`，状态不为 Running |
++| `TestStartAfterExitBeforeRunningCanRetry` | 退出后 run 被清空，下一次 Start 不误报 `ErrAlreadyRunning` |
++
++### 4.3 订阅安全（`redirect_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestCrossHostRedirectRejectedWithoutLeakingToken` | 带 token 跳转第三方：拒绝，第三方 0 请求 |
++| `TestSameHostRedirectSendsNoReferer` | 同主机跳转允许，但无 Referer、无原始查询参数 |
++| `TestSameSiteSubdomainRedirectAllowed` | 同站点子域跳转可用 |
++| `TestRedirectToPrivateStillBlocked` | 重定向到内网仍被 SSRF 拦截 |
++| `TestRedirectDowngradeRejected` | https → http 拒绝 |
++| `TestRedirectWithUserInfoRejected` | 目标带 userinfo 拒绝 |
++| `TestSameSiteHostBoundary` | `evil-example.com` 不被当成 `example.com` 子域 |
++| `TestDirectSubscriptionStillWorks` | 正常订阅拉取不受影响 |
++
++### 4.4 订阅事务（`c4_subscription_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestRefreshDoesNotOverrideConcurrentSwitch` | 下载期间切换 B，刷新 A 返回 `errSubscriptionChanged`，B 保持激活 |
++| `TestSubscriptionOpsConcurrentConsistency` | 7 个并发 apply/switch，无死锁，条目不重复、下标与激活一致 |
++| `TestRemoveInactiveKeepsActive` | 删除非激活订阅不影响当前配置 |
++
++### 4.5 配置损坏（`c4_config_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestCorruptConfigIsPreservedAndReported` | 5 类配置 × 非法 JSON / 类型错误 / 截断：备份 + bootErr + 状态回退 |
++| `TestEmptyConfigIsTreatedAsCorrupt` | 空文件按截断处理 |
++| `TestFutureVersionConfigIsRejected` | `version: 99` 不被解释、被保留 |
++| `TestMissingConfigIsNormal` | 首次启动不报错、不产生备份 |
++| `TestSaveAfterCorruptDoesNotDestroyBackup` | 后续保存只写新文件，备份内容不变 |
++
++### 4.6 generation 发布（`c4_procgen_test.go`）
++
++| 测试 | 覆盖 |
++| --- | --- |
++| `TestProcGenPublishAndResolve` | 发布后可解析、文件齐全、options 使用 procgen 路径 |
++| `TestProcGenManifestFailureKeepsPrevious` | manifest 未发布：旧版本继续可用 |
++| `TestProcGenCorruptManifestFallsBackPrev` | current 损坏回退 prev，重启加载同样回退 |
++| `TestProcGenTruncatedFileFallsBack` | 最新一代文件截断，哈希校验失败回退 |
++| `TestLoadProcRulesFallsBackToLegacy` | 无 generation 时使用旧版平铺文件 |
++| `TestProcGenCleanupKeepsTwoGenerations` | 多次发布只保留 current + prev |
++| `TestProcGenRejectsPathTraversalManifest` | manifest 中 `../` 路径被拒绝 |
++
++### 4.7 真实内核（`realkernel_procgen_test.go`）
++
++真实 mihomo 从 `./procgen/*.yaml` 加载 classical rule-provider 成功启动，
++且 `/providers/rules` 返回 `pp-direct`。
+diff --git a/c4_config_test.go b/c4_config_test.go
+new file mode 100644
+index 0000000..ae30229
+--- /dev/null
++++ b/c4_config_test.go
+@@ -0,0 +1,215 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// 损坏配置必须：保留原文件（改名备份）、记录可诊断错误、不得静默当作空配置。
++func TestCorruptConfigIsPreservedAndReported(t *testing.T) {
++	cases := []struct {
++		name   string
++		file   string
++		body   string
++		load   func(*CoreService)
++		verify func(*testing.T, *CoreService)
++	}{
++		{
++			name: "app-state 非法 JSON",
++			file: appStateFile,
++			body: `{"tun": true, "mode": `,
++			load: (*CoreService).loadAppState,
++			verify: func(t *testing.T, s *CoreService) {
++				s.mu.RLock()
++				mode := s.mode
++				s.mu.RUnlock()
++				if mode != "rule" {
++					t.Fatalf("损坏后应回退 rule 模式，实际 %q", mode)
++				}
++			},
++		},
++		{
++			name: "app-state 字段类型非法",
++			file: appStateFile,
++			body: `{"tun": "yes"}`,
++			load: (*CoreService).loadAppState,
++		},
++		{
++			name: "app-state 截断",
++			file: appStateFile,
++			body: `{"tun": true, "proxyOn":`,
++			load: (*CoreService).loadAppState,
++		},
++		{
++			name: "subs 损坏",
++			file: subsFile,
++			body: `{"items": [{"url": `,
++			load: (*CoreService).loadSubs,
++			verify: func(t *testing.T, s *CoreService) {
++				s.mu.RLock()
++				n := len(s.subs)
++				s.mu.RUnlock()
++				if n != 0 {
++					t.Fatalf("损坏订阅不应被加载: %d", n)
++				}
++			},
++		},
++		{
++			name: "proc-rules 损坏",
++			file: procRulesJSON,
++			body: `{"name:chrome.exe": `,
++			load: (*CoreService).loadProcRules,
++		},
++		{
++			name: "site-rules 损坏",
++			file: siteRulesJSON,
++			body: `[{"domain": "example.com",`,
++			load: (*CoreService).loadSiteRules,
++		},
++		{
++			name: "ignored 损坏",
++			file: procIgnoredJSON,
++			body: `["chrome.exe"`,
++			load: (*CoreService).loadIgnored,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			svc := configTestService(t)
++			path := filepath.Join(dataDir(), tc.file)
++			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
++				t.Fatal(err)
++			}
++
++			tc.load(svc)
++
++			if _, err := os.Stat(path); !os.IsNotExist(err) {
++				t.Fatal("损坏文件必须被移走，避免后续保存覆盖原始内容")
++			}
++			backups, _ := filepath.Glob(path + ".corrupt-*")
++			if len(backups) != 1 {
++				t.Fatalf("应生成一个损坏备份，实际 %d", len(backups))
++			}
++			data, err := os.ReadFile(backups[0])
++			if err != nil || string(data) != tc.body {
++				t.Fatalf("备份内容与原文件不一致: %q", data)
++			}
++			svc.mu.RLock()
++			bootErr := svc.bootErr
++			svc.mu.RUnlock()
++			if !strings.Contains(bootErr, filepath.Base(path)) {
++				t.Fatalf("启动错误应指明损坏文件，实际 %q", bootErr)
++			}
++			if tc.verify != nil {
++				tc.verify(t, svc)
++			}
++		})
++	}
++}
++
++// 空文件按截断处理，同样保留并提示。
++func TestEmptyConfigIsTreatedAsCorrupt(t *testing.T) {
++	svc := configTestService(t)
++	path := filepath.Join(dataDir(), appStateFile)
++	if err := os.WriteFile(path, []byte("   \n\t"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	svc.loadAppState()
++	if _, err := os.Stat(path); !os.IsNotExist(err) {
++		t.Fatal("空配置文件必须被保留为备份")
++	}
++	if backups, _ := filepath.Glob(path + ".corrupt-*"); len(backups) != 1 {
++		t.Fatal("空配置文件应生成备份")
++	}
++	svc.mu.RLock()
++	bootErr := svc.bootErr
++	svc.mu.RUnlock()
++	if !strings.Contains(bootErr, "内容为空") {
++		t.Fatalf("错误信息应区分空文件，实际 %q", bootErr)
++	}
++}
++
++// 版本高于当前程序：不得按旧结构解释，也不得覆盖。
++func TestFutureVersionConfigIsRejected(t *testing.T) {
++	svc := configTestService(t)
++	path := filepath.Join(dataDir(), appStateFile)
++	if err := os.WriteFile(path, []byte(`{"version": 99, "tun": true}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	svc.loadAppState()
++
++	if _, err := os.Stat(path); !os.IsNotExist(err) {
++		t.Fatal("未来版本配置必须被移走")
++	}
++	svc.mu.RLock()
++	bootErr := svc.bootErr
++	tun := svc.tunOn
++	svc.mu.RUnlock()
++	if !strings.Contains(bootErr, "版本") {
++		t.Fatalf("应提示版本不兼容，实际 %q", bootErr)
++	}
++	if tun {
++		t.Fatal("不能按未来版本配置开启 TUN")
++	}
++}
++
++// 文件不存在属于正常首次启动：不提示、不产生备份。
++func TestMissingConfigIsNormal(t *testing.T) {
++	svc := configTestService(t)
++	svc.loadAppState()
++	svc.loadSubs()
++	svc.loadProcRules()
++	svc.loadSiteRules()
++	svc.loadIgnored()
++
++	svc.mu.RLock()
++	bootErr := svc.bootErr
++	svc.mu.RUnlock()
++	if bootErr != "" {
++		t.Fatalf("首次启动不应有配置错误: %q", bootErr)
++	}
++	entries, _ := filepath.Glob(filepath.Join(dataDir(), "*.corrupt-*"))
++	if len(entries) != 0 {
++		t.Fatalf("首次启动不应产生损坏备份: %v", entries)
++	}
++}
++
++// 损坏文件被保留后，后续保存只能写入新文件，不能破坏备份。
++func TestSaveAfterCorruptDoesNotDestroyBackup(t *testing.T) {
++	svc := configTestService(t)
++	path := filepath.Join(dataDir(), appStateFile)
++	bad := `{"tun": true,`
++	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	svc.loadAppState()
++	backups, _ := filepath.Glob(path + ".corrupt-*")
++	if len(backups) != 1 {
++		t.Fatal("应生成损坏备份")
++	}
++
++	svc.saveAppState()
++
++	got, err := os.ReadFile(backups[0])
++	if err != nil || string(got) != bad {
++		t.Fatalf("备份被后续保存破坏: %q", got)
++	}
++	fresh, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal("保存应生成新的配置文件")
++	}
++	if !strings.Contains(string(fresh), `"version": 1`) {
++		t.Fatalf("新配置应带当前版本号: %s", fresh)
++	}
++}
++
++func configTestService(t *testing.T) *CoreService {
++	t.Helper()
++	old := dataDirOverride
++	dataDirOverride = t.TempDir()
++	t.Cleanup(func() { dataDirOverride = old })
++	return NewCoreService()
++}
+diff --git a/c4_procgen_test.go b/c4_procgen_test.go
+new file mode 100644
+index 0000000..6f653a5
+--- /dev/null
++++ b/c4_procgen_test.go
+@@ -0,0 +1,235 @@
++package main
++
++import (
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++var errTestInjected = errors.New("injected failure")
++
++func procGenTestService(t *testing.T) *CoreService {
++	t.Helper()
++	old := dataDirOverride
++	dataDirOverride = t.TempDir()
++	t.Cleanup(func() { dataDirOverride = old })
++	return NewCoreService()
++}
++
++func sampleProcRules() map[string]string {
++	return map[string]string{
++		"name:chrome.exe":  "direct",
++		"name:firefox.exe": "proxy",
++	}
++}
++
++// 发布后必须能解析出同一代三个文件，且 options() 使用 procgen 路径。
++func TestProcGenPublishAndResolve(t *testing.T) {
++	svc := procGenTestService(t)
++	rules := sampleProcRules()
++	if err := svc.publishProcRules(rules); err != nil {
++		t.Fatalf("发布失败: %v", err)
++	}
++
++	paths, got, ok := svc.resolvePublishedProcRules()
++	if !ok {
++		t.Fatal("应能解析出已发布版本")
++	}
++	if len(got) != len(rules) || got["name:chrome.exe"] != "direct" {
++		t.Fatalf("规则内容不符: %+v", got)
++	}
++	for _, p := range []string{paths.Proxy, paths.Direct, paths.Rules} {
++		if _, err := os.Stat(p); err != nil {
++			t.Fatalf("发布文件缺失 %s: %v", p, err)
++		}
++	}
++
++	opt := svc.options()
++	if !strings.HasPrefix(opt.ProcessProxyPath, "./procgen/") ||
++		!strings.HasPrefix(opt.ProcessDirectPath, "./procgen/") {
++		t.Fatalf("options 未使用 procgen 路径: %q %q", opt.ProcessProxyPath, opt.ProcessDirectPath)
++	}
++}
++
++// 写完文件但 manifest 发布失败：current.json 不变，旧版本继续可用。
++func TestProcGenManifestFailureKeepsPrevious(t *testing.T) {
++	svc := procGenTestService(t)
++	v1 := map[string]string{"name:chrome.exe": "direct"}
++	if err := svc.publishProcRules(v1); err != nil {
++		t.Fatal(err)
++	}
++
++	origHook := procPublishHook
++	t.Cleanup(func() { procPublishHook = origHook })
++	procPublishHook = func(stage string) error {
++		if stage == "before-manifest" {
++			return errTestInjected
++		}
++		return nil
++	}
++
++	if err := svc.publishProcRules(map[string]string{"name:chrome.exe": "proxy"}); err == nil {
++		t.Fatal("manifest 发布失败时 publish 必须报错")
++	}
++	procPublishHook = origHook
++
++	_, got, ok := svc.resolvePublishedProcRules()
++	if !ok {
++		t.Fatal("旧版本应继续可用")
++	}
++	if got["name:chrome.exe"] != "direct" {
++		t.Fatalf("解析到未提交的新版本: %+v", got)
++	}
++}
++
++// current.json 损坏：回退上一代 manifest。
++func TestProcGenCorruptManifestFallsBackPrev(t *testing.T) {
++	svc := procGenTestService(t)
++	if err := svc.publishProcRules(map[string]string{"name:a.exe": "direct"}); err != nil {
++		t.Fatal(err)
++	}
++	if err := svc.publishProcRules(map[string]string{"name:a.exe": "proxy"}); err != nil {
++		t.Fatal(err)
++	}
++
++	cur := filepath.Join(procGenDir(), procGenManifestName)
++	if err := os.WriteFile(cur, []byte("{broken"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++
++	_, got, ok := svc.resolvePublishedProcRules()
++	if !ok {
++		t.Fatal("应回退到上一代")
++	}
++	if got["name:a.exe"] != "direct" {
++		t.Fatalf("回退版本内容不符: %+v", got)
++	}
++
++	// 再启动时 loadProcRules 也不能被损坏 manifest 影响。
++	svc2 := procGenTestServiceAt(t, dataDir())
++	svc2.loadProcRules()
++	svc2.mu.RLock()
++	rules := svc2.procRules
++	svc2.mu.RUnlock()
++	if rules["name:a.exe"] != "direct" {
++		t.Fatalf("启动加载未回退: %+v", rules)
++	}
++}
++
++// 某一代文件被截断：哈希校验失败，回退上一代。
++func TestProcGenTruncatedFileFallsBack(t *testing.T) {
++	svc := procGenTestService(t)
++	if err := svc.publishProcRules(map[string]string{"name:a.exe": "direct"}); err != nil {
++		t.Fatal(err)
++	}
++	if err := svc.publishProcRules(map[string]string{"name:a.exe": "proxy"}); err != nil {
++		t.Fatal(err)
++	}
++
++	cur := filepath.Join(procGenDir(), procGenManifestName)
++	mb, err := os.ReadFile(cur)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var m procGenManifest
++	if err := json.Unmarshal(mb, &m); err != nil {
++		t.Fatal(err)
++	}
++	// 模拟写一半崩溃：把最新一代的 proxy 文件截断。
++	if err := os.WriteFile(filepath.Join(procGenDir(), m.Proxy), []byte("PROCESS-NAME,a.exe"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	_, got, ok := svc.resolvePublishedProcRules()
++	if !ok {
++		t.Fatal("应回退到上一代")
++	}
++	if got["name:a.exe"] != "direct" {
++		t.Fatalf("截断后仍使用了不完整版本: %+v", got)
++	}
++}
++
++// 没有 generation 时回退旧版平铺文件，升级前数据不能丢。
++func TestLoadProcRulesFallsBackToLegacy(t *testing.T) {
++	svc := procGenTestService(t)
++	legacy := filepath.Join(dataDir(), procRulesJSON)
++	if err := os.WriteFile(legacy, []byte(`{"name:chrome.exe":"direct"}`), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	svc.loadProcRules()
++
++	svc.mu.RLock()
++	rules := svc.procRules
++	proxyPath := svc.procProxyPath
++	svc.mu.RUnlock()
++	if rules["name:chrome.exe"] != "direct" {
++		t.Fatalf("旧版规则未加载: %+v", rules)
++	}
++	if proxyPath != procProxyYAML {
++		t.Fatalf("旧版回退路径不符: %s", proxyPath)
++	}
++}
++
++// 多次发布后只保留当前与上一代，避免无限增长。
++func TestProcGenCleanupKeepsTwoGenerations(t *testing.T) {
++	svc := procGenTestService(t)
++	for i := 0; i < 4; i++ {
++		if err := svc.publishProcRules(map[string]string{"name:a.exe": "direct"}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	entries, err := os.ReadDir(procGenDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	names := make([]string, 0, len(entries))
++	for _, e := range entries {
++		names = append(names, e.Name())
++	}
++	names = sortGenFiles(names)
++	// 2 代 × 3 个文件 + current + prev = 8。
++	if len(names) > 8 {
++		t.Fatalf("旧 generation 未清理: %v", names)
++	}
++}
++
++// manifest 被手工改成路径穿越：必须拒绝，不能读取 procgen 目录外的文件。
++func TestProcGenRejectsPathTraversalManifest(t *testing.T) {
++	svc := procGenTestService(t)
++	if err := svc.publishProcRules(map[string]string{"name:a.exe": "direct"}); err != nil {
++		t.Fatal(err)
++	}
++	cur := filepath.Join(procGenDir(), procGenManifestName)
++	mb, err := os.ReadFile(cur)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var m procGenManifest
++	if err := json.Unmarshal(mb, &m); err != nil {
++		t.Fatal(err)
++	}
++	bad := m
++	bad.Proxy = "../outside.yaml"
++	badBytes, _ := json.Marshal(bad)
++	if err := os.WriteFile(cur, badBytes, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	// 同时移除 prev，确保回退路径也不可用，验证的是"拒绝"而不是"回退"。
++	_ = os.Remove(cur + ".prev")
++
++	if _, _, ok := svc.resolvePublishedProcRules(); ok {
++		t.Fatal("路径穿越的 manifest 必须被拒绝")
++	}
++}
++
++func procGenTestServiceAt(t *testing.T, dir string) *CoreService {
++	t.Helper()
++	old := dataDirOverride
++	dataDirOverride = dir
++	t.Cleanup(func() { dataDirOverride = old })
++	return NewCoreService()
++}
+diff --git a/c4_subscription_test.go b/c4_subscription_test.go
+new file mode 100644
+index 0000000..f8a605b
+--- /dev/null
++++ b/c4_subscription_test.go
+@@ -0,0 +1,178 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"routepilot/internal/subscription"
++)
++
++const testSubYAML = "proxies:\n" +
++	"  - name: n1\n    type: ss\n    server: 1.2.3.4\n    port: 443\n" +
++	"    cipher: aes-128-gcm\n    password: x\n"
++
++// setupTwoSubs 构造两个已保存订阅（A 为激活），用于验证事务串行化。
++func setupTwoSubs(t *testing.T) (*CoreService, string, string) {
++	t.Helper()
++	old := dataDirOverride
++	dataDirOverride = t.TempDir()
++	t.Cleanup(func() { dataDirOverride = old })
++
++	svc := NewCoreService()
++	urlA := "https://a.example/sub?token=AAA"
++	urlB := "https://b.example/sub?token=BBB"
++	for _, u := range []string{urlA, urlB} {
++		res, err := subscription.Parse([]byte(testSubYAML), u, false)
++		if err != nil {
++			t.Fatalf("构造订阅失败: %v", err)
++		}
++		if err := svc.writeSubscriptionFiles(u, res); err != nil {
++			t.Fatalf("写订阅文件失败: %v", err)
++		}
++	}
++	svc.subs = []subMeta{{URL: urlA}, {URL: urlB}}
++	svc.activeIdx = 0
++	svc.subURL = urlA
++	return svc, urlA, urlB
++}
++
++// 刷新 A 的下载尚未返回时用户切到 B：刷新提交必须放弃，不能把 B 覆盖回去。
++func TestRefreshDoesNotOverrideConcurrentSwitch(t *testing.T) {
++	svc, _, urlB := setupTwoSubs(t)
++
++	fetchStarted := make(chan struct{})
++	releaseFetch := make(chan struct{})
++	var once sync.Once
++	origFetch := fetchSubscription
++	t.Cleanup(func() { fetchSubscription = origFetch })
++	fetchSubscription = func(_ context.Context, u string, _ bool) (*subscription.Result, error) {
++		once.Do(func() { close(fetchStarted) })
++		<-releaseFetch
++		return subscription.Parse([]byte(testSubYAML), u, false)
++	}
++
++	refreshDone := make(chan error, 1)
++	go func() { refreshDone <- svc.RefreshSubscription() }()
++
++	select {
++	case <-fetchStarted:
++	case <-time.After(3 * time.Second):
++		t.Fatal("刷新未进入网络阶段")
++	}
++
++	// 下载期间切换订阅：此时 subsMu 未被占用。
++	if err := svc.SwitchSubscription(1); err != nil {
++		t.Fatalf("切换订阅失败: %v", err)
++	}
++	if got := svc.currentSubURL(); got != urlB {
++		t.Fatalf("切换后激活订阅应为 B，实际 %s", got)
++	}
++
++	close(releaseFetch)
++	select {
++	case err := <-refreshDone:
++		if !errors.Is(err, errSubscriptionChanged) {
++			t.Fatalf("期望 errSubscriptionChanged，实际 %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("刷新未返回")
++	}
++
++	if got := svc.currentSubURL(); got != urlB {
++		t.Fatalf("刷新结果覆盖了用户切换: %s", got)
++	}
++	if svc.subs[svc.activeIdx].URL != urlB {
++		t.Fatal("激活下标与 subURL 不一致")
++	}
++}
++
++// 并发刷新/切换/删除不能死锁，且最终状态内部一致。
++func TestSubscriptionOpsConcurrentConsistency(t *testing.T) {
++	svc, urlA, urlB := setupTwoSubs(t)
++
++	resA, _ := subscription.Parse([]byte(testSubYAML), urlA, false)
++	resB, _ := subscription.Parse([]byte(testSubYAML), urlB, false)
++
++	var wg sync.WaitGroup
++	for i := 0; i < 4; i++ {
++		wg.Add(1)
++		url := urlA
++		res := resA
++		if i%2 == 1 {
++			url, res = urlB, resB
++		}
++		go func() {
++			defer wg.Done()
++			_ = svc.applySubscription(url, res)
++		}()
++	}
++	for i := 0; i < 3; i++ {
++		wg.Add(1)
++		idx := i % 2
++		go func() {
++			defer wg.Done()
++			_ = svc.SwitchSubscription(idx)
++		}()
++	}
++
++	done := make(chan struct{})
++	go func() {
++		wg.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("并发订阅操作死锁")
++	}
++
++	svc.mu.RLock()
++	active := svc.subURL
++	idx := svc.activeIdx
++	count := len(svc.subs)
++	config := svc.subConfig
++	svc.mu.RUnlock()
++	if count != 2 {
++		t.Fatalf("并发提交产生了重复/丢失条目: %d", count)
++	}
++	if active != urlA && active != urlB {
++		t.Fatalf("激活订阅异常: %s", active)
++	}
++	if config == nil {
++		t.Fatal("激活订阅的配置不应为空")
++	}
++	if idx < 0 || idx >= count {
++		t.Fatalf("激活下标越界: idx=%d count=%d", idx, count)
++	}
++	svc.mu.RLock()
++	activeOK := svc.subs[idx].URL == active
++	svc.mu.RUnlock()
++	if !activeOK {
++		t.Fatalf("激活下标与激活地址不一致: idx=%d active=%s", idx, active)
++	}
++}
++
++// 删除非激活订阅不改变当前激活配置。
++func TestRemoveInactiveKeepsActive(t *testing.T) {
++	svc, urlA, _ := setupTwoSubs(t)
++	svc.mu.Lock()
++	svc.activeIdx = 0
++	svc.subURL = urlA
++	svc.mu.Unlock()
++
++	if err := svc.RemoveSubscription(1); err != nil {
++		t.Fatalf("删除非激活订阅失败: %v", err)
++	}
++	if got := svc.currentSubURL(); got != urlA {
++		t.Fatalf("删除非激活订阅后激活项被改变: %s", got)
++	}
++	svc.mu.RLock()
++	n := len(svc.subs)
++	svc.mu.RUnlock()
++	if n != 1 {
++		t.Fatalf("剩余订阅数应为 1，实际 %d", n)
++	}
++}
+diff --git a/c4_tun_test.go b/c4_tun_test.go
+new file mode 100644
+index 0000000..f10dcea
+--- /dev/null
++++ b/c4_tun_test.go
+@@ -0,0 +1,250 @@
++package main
++
++import (
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// 准备一个"系统代理正由本程序接管"的服务。
++func tunService(t *testing.T, fake *fakeRegistry) *CoreService {
++	t.Helper()
++	svc := newC1Service(t, fake)
++	cp := proxyBackup{
++		Addr: "127.0.0.1:17890", Server: "127.0.0.1:8080",
++		Override: "old-bypass", Enabled: true, Saved: true,
++	}
++	svc.proxyOn = true
++	svc.backup = cp
++	writeState(t, svc, cp)
++	return svc
++}
++
++// TUN 开启事务进行到"内核重启"阶段时，并发的 SetSystemProxy(true) 必须被拒绝，
++// 否则会出现 TUN 与系统代理同时接管的双接管状态。
++func TestTUNToggleBlocksConcurrentProxyEnable(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := tunService(t, fake)
++
++	restartEntered := make(chan struct{})
++	releaseRestart := make(chan struct{})
++	var once sync.Once
++	restart := func() error {
++		once.Do(func() { close(restartEntered) })
++		<-releaseRestart
++		return nil
++	}
++
++	tunDone := make(chan error, 1)
++	go func() { tunDone <- svc.setTUN(true, restart) }()
++
++	select {
++	case <-restartEntered:
++	case <-time.After(3 * time.Second):
++		t.Fatal("TUN 事务未进入内核重启阶段")
++	}
++
++	// 此时注册表已关闭、tunOn 尚未提交，但 tunChanging=true。
++	beforeEnable := fake.enableCalls
++	if err := svc.SetSystemProxy(true); err == nil {
++		t.Fatal("TUN 切换期间必须拒绝开启系统代理")
++	}
++	if fake.enableCalls != beforeEnable {
++		t.Fatal("被拒绝的请求不能写注册表")
++	}
++
++	close(releaseRestart)
++	if err := <-tunDone; err != nil {
++		t.Fatalf("TUN 开启失败: %v", err)
++	}
++
++	svc.mu.RLock()
++	tunOn, proxyOn, changing := svc.tunOn, svc.proxyOn, svc.tunChanging
++	svc.mu.RUnlock()
++	if !tunOn || proxyOn || changing {
++		t.Fatalf("提交状态不符: tunOn=%v proxyOn=%v changing=%v", tunOn, proxyOn, changing)
++	}
++	if fake.enabled {
++		t.Fatal("TUN 已开启时系统代理必须保持关闭")
++	}
++	if err := svc.SetSystemProxy(true); err == nil {
++		t.Fatal("TUN 已开启后仍应拒绝开启系统代理")
++	}
++}
++
++// TUN 开启失败：必须回滚到"切换前"的系统代理接管状态。
++func TestTUNEnableFailureRestoresProxyTakeover(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := tunService(t, fake)
++
++	err := svc.setTUN(true, func() error { return errors.New("injected restart failure") })
++	if err == nil {
++		t.Fatal("内核重启失败时 SetTUN 必须报错")
++	}
++
++	svc.mu.RLock()
++	tunOn, proxyOn, bk, changing := svc.tunOn, svc.proxyOn, svc.backup, svc.tunChanging
++	svc.mu.RUnlock()
++	if tunOn {
++		t.Fatal("失败后不能宣称 TUN 已开启")
++	}
++	if changing {
++		t.Fatal("失败后必须清除切换中标记")
++	}
++	if !proxyOn || !bk.Saved {
++		t.Fatalf("失败后应重新接管系统代理: proxyOn=%v backupSaved=%v", proxyOn, bk.Saved)
++	}
++	if !fake.enabled || fake.server != "127.0.0.1:17890" {
++		t.Fatalf("系统代理未恢复到本程序地址: enabled=%v server=%s", fake.enabled, fake.server)
++	}
++}
++
++// 切 TUN 前恢复系统代理失败：必须保留 Pending 备份，交给下次启动重试。
++func TestTUNEnableRestoreFailureKeepsPendingBackup(t *testing.T) {
++	fake := &fakeRegistry{
++		server:          "127.0.0.1:17890",
++		enabled:         true,
++		override:        "ours",
++		failSetOverride: true,
++	}
++	svc := tunService(t, fake)
++
++	restartCalled := int32(0)
++	err := svc.setTUN(true, func() error {
++		atomic.AddInt32(&restartCalled, 1)
++		return nil
++	})
++	if !errors.Is(err, errTUNRestoreFailed) {
++		t.Fatalf("期望 errTUNRestoreFailed，实际 %v", err)
++	}
++	if atomic.LoadInt32(&restartCalled) != 0 {
++		t.Fatal("恢复系统代理失败后不能继续重启内核")
++	}
++
++	svc.mu.RLock()
++	tunOn, proxyOn, bk, changing := svc.tunOn, svc.proxyOn, svc.backup, svc.tunChanging
++	svc.mu.RUnlock()
++	if tunOn || proxyOn || changing {
++		t.Fatalf("失败后状态不符: tunOn=%v proxyOn=%v changing=%v", tunOn, proxyOn, changing)
++	}
++	if !bk.Saved || !bk.Pending {
++		t.Fatalf("必须保留 Pending 备份: %+v", bk)
++	}
++	st, ok := readState(t, svc)
++	if !ok || !st.Pending {
++		t.Fatalf("磁盘备份必须保留并标记 Pending: %+v", st)
++	}
++}
++
++// TUN 关闭失败：不能错误宣告"系统代理已恢复"。
++func TestTUNDisableFailureDoesNotRestoreProxy(t *testing.T) {
++	fake := &fakeRegistry{server: "", enabled: false}
++	svc := newC1Service(t, fake)
++	svc.tunOn = true
++	svc.tunPrevProxyOn = true
++	svc.proxyOn = false
++
++	var alive int32 = 1
++	svc.kernelRunningFn = func() bool { return atomic.LoadInt32(&alive) == 1 }
++	restart := func() error {
++		atomic.StoreInt32(&alive, 0)
++		return errors.New("injected restart failure")
++	}
++	beforeEnable := fake.enableCalls
++
++	err := svc.setTUN(false, restart)
++	if err == nil {
++		t.Fatal("关闭 TUN 失败时必须返回错误")
++	}
++	svc.mu.RLock()
++	tunOn, proxyOn, prev, restore := svc.tunOn, svc.proxyOn, svc.tunPrevProxyOn, svc.restoreProxy
++	svc.mu.RUnlock()
++	if tunOn {
++		t.Fatal("内核已停时不能宣称 TUN 仍开启")
++	}
++	if proxyOn {
++		t.Fatal("关闭 TUN 失败时不能宣称系统代理已恢复")
++	}
++	if !prev {
++		t.Fatal("恢复意图必须保留，供下次启动继续处理")
++	}
++	if !restore {
++		t.Fatal("失败后必须把恢复意图写入启动恢复流程")
++	}
++	if fake.enableCalls != beforeEnable {
++		t.Fatal("失败路径不应写注册表开启代理")
++	}
++}
++
++// TUN 关闭成功：按记录恢复系统代理接管。
++func TestTUNDisableSuccessRestoresProxy(t *testing.T) {
++	fake := &fakeRegistry{server: "", enabled: false}
++	svc := newC1Service(t, fake)
++	svc.tunOn = true
++	svc.tunPrevProxyOn = true
++	svc.proxyOn = false
++
++	if err := svc.setTUN(false, func() error { return nil }); err != nil {
++		t.Fatalf("关闭 TUN 失败: %v", err)
++	}
++	svc.mu.RLock()
++	tunOn, proxyOn, prev := svc.tunOn, svc.proxyOn, svc.tunPrevProxyOn
++	svc.mu.RUnlock()
++	if tunOn || !proxyOn || prev {
++		t.Fatalf("关闭后状态不符: tunOn=%v proxyOn=%v prev=%v", tunOn, proxyOn, prev)
++	}
++	if !fake.enabled || fake.server != "127.0.0.1:17890" {
++		t.Fatalf("系统代理未恢复接管: enabled=%v server=%s", fake.enabled, fake.server)
++	}
++}
++
++// 内核未运行时关闭 TUN：不能当场接管代理，但恢复意图必须留给下次启动。
++func TestTUNDisableWithoutKernelPersistsRestoreIntent(t *testing.T) {
++	fake := &fakeRegistry{server: "", enabled: false}
++	svc := newC1Service(t, fake)
++	svc.tunOn = true
++	svc.tunPrevProxyOn = true
++	svc.kernelRunningFn = func() bool { return false }
++
++	if err := svc.setTUN(false, func() error {
++		t.Fatal("内核未运行时不应当调用重启")
++		return nil
++	}); err != nil {
++		t.Fatalf("关闭 TUN 失败: %v", err)
++	}
++	svc.mu.RLock()
++	tunOn, restore := svc.tunOn, svc.restoreProxy
++	svc.mu.RUnlock()
++	if tunOn {
++		t.Fatal("TUN 应已关闭")
++	}
++	if !restore {
++		t.Fatal("内核未运行时必须把代理恢复意图写入启动恢复流程")
++	}
++	if fake.enableCalls != 0 {
++		t.Fatal("内核未运行不应写注册表")
++	}
++}
++
++// reconcileProxy 在 TUN 切换期间必须跳过，不能把系统代理重新打开。
++func TestReconcileSkippedDuringTUNToggle(t *testing.T) {
++	fake := &fakeRegistry{server: "127.0.0.1:17890", enabled: true, override: "ours"}
++	svc := tunService(t, fake)
++
++	svc.mu.Lock()
++	svc.tunChanging = true
++	svc.tunTarget = true
++	svc.mu.Unlock()
++	beforeEnable := fake.enableCalls
++
++	svc.reconcileProxy()
++
++	if fake.enableCalls != beforeEnable {
++		t.Fatal("TUN 切换期间 reconcileProxy 不得写注册表")
++	}
++	if !fake.enabled || fake.server != "127.0.0.1:17890" {
++		t.Fatal("TUN 切换期间 reconcileProxy 改变了注册表")
++	}
++}
+diff --git a/config_files.go b/config_files.go
+new file mode 100644
+index 0000000..cf1c5fa
+--- /dev/null
++++ b/config_files.go
+@@ -0,0 +1,99 @@
++package main
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"time"
++)
++
++// currentConfigVersion 是本程序写出的配置格式版本。
++// 读取到更高版本说明用户降级了程序：不能按旧结构解释，更不能覆盖。
++const currentConfigVersion = 1
++
++// configReadState 区分配置文件的各种异常情况，避免把损坏当成空配置。
++type configReadState string
++
++const (
++	configMissing     configReadState = "missing"     // 文件不存在，属于正常首次启动
++	configEmpty       configReadState = "empty"       // 文件存在但内容为空/只有空白（通常是截断）
++	configCorrupt     configReadState = "corrupt"     // JSON 解析失败
++	configUnsupported configReadState = "unsupported" // 版本高于当前程序
++	configOK          configReadState = "ok"
++)
++
++// readConfigJSON 读取并解析一个 JSON 配置文件。
++//
++// 与直接 json.Unmarshal 的区别：明确区分"不存在"（可以安全地当作首次启动）
++// 与"空文件/损坏"（绝不能静默当作空配置继续，否则下一次保存会覆盖用户数据）。
++func readConfigJSON(path string, dst any) (configReadState, error) {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return configMissing, nil
++		}
++		return configCorrupt, err
++	}
++	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
++	if len(bytes.TrimSpace(b)) == 0 {
++		return configEmpty, nil
++	}
++	if err := json.Unmarshal(b, dst); err != nil {
++		return configCorrupt, err
++	}
++	return configOK, nil
++}
++
++// preserveCorruptFile 把损坏的配置改名保留，返回备份路径。
++// 改名而不是复制：原路径必须腾空，否则后续合法保存会把损坏内容覆盖掉，
++// 用户就再也拿不回原始数据。改名失败时退化为复制，并保留原文件。
++func preserveCorruptFile(path string) (string, error) {
++	backup := fmt.Sprintf("%s.corrupt-%s", path, time.Now().Format("20060102-150405"))
++	if err := os.Rename(path, backup); err == nil {
++		return backup, nil
++	} else if data, rerr := os.ReadFile(path); rerr == nil {
++		if werr := os.WriteFile(backup, data, 0o600); werr != nil {
++			return "", fmt.Errorf("备份损坏文件失败: %w", werr)
++		}
++		return backup, err
++	}
++	return "", fmt.Errorf("无法保留损坏文件")
++}
++
++// reportConfigProblem 统一记录配置异常：写 debug.log 并在界面启动错误里提示。
++// 必须让用户知道"配置没被读取"，而不是以为自己的规则/订阅凭空消失了。
++func (s *CoreService) reportConfigProblem(path string, state configReadState, cause error) {
++	name := filepath.Base(path)
++	var desc string
++	switch state {
++	case configEmpty:
++		desc = "内容为空或已被截断"
++	case configCorrupt:
++		desc = "格式损坏"
++	case configUnsupported:
++		desc = fmt.Sprintf("版本高于当前程序（支持 %d）", currentConfigVersion)
++	default:
++		return
++	}
++
++	backup, berr := preserveCorruptFile(path)
++	msg := fmt.Sprintf("配置文件 %s %s，已停止使用", name, desc)
++	if backup != "" {
++		msg += "，原文件已备份为 " + filepath.Base(backup)
++	}
++	if cause != nil {
++		msg += "（" + cause.Error() + "）"
++	}
++	if berr != nil {
++		msg += "；" + berr.Error()
++	}
++	s.dbg("%s", msg)
++	s.appendBootErr(msg)
++}
++
++// configVersionUnsupported 判断一个已解析配置的版本是否超出当前程序能力。
++func configVersionUnsupported(version int) bool {
++	return version > currentConfigVersion
++}
+diff --git a/internal/configgen/gen.go b/internal/configgen/gen.go
+index 13a379a..26af32f 100644
+--- a/internal/configgen/gen.go
++++ b/internal/configgen/gen.go
+@@ -25,6 +25,11 @@ type Options struct {
+ 	// 规则内容由上层动态写文件，改完通过 API 热刷新，不重载整个配置。
+ 	ProcessRules bool
+ 
++	// ProcessProxyPath / ProcessDirectPath 是进程规则 provider 的文件路径。
++	// 上层用 generation 目录发布时传入版本化路径；为空时回退旧版平铺文件。
++	ProcessProxyPath  string
++	ProcessDirectPath string
++
+ 	// ProcessCustomRules 是"进程 → 指定节点/策略组"的直接规则，例如
+ 	// PROCESS-NAME,chrome.exe,nx-pp-xxxx。改这部分需要重载配置，
+ 	// 但不需要重启内核进程。
+@@ -259,16 +264,24 @@ func Build(o Options) map[string]any {
+ 	// 所以按策略拆成两个 provider，而不是把出口写进规则里。
+ 	var prepend []any
+ 	if o.ProcessRules {
++		directPath := o.ProcessDirectPath
++		if directPath == "" {
++			directPath = "./process-direct.yaml"
++		}
++		proxyPath := o.ProcessProxyPath
++		if proxyPath == "" {
++			proxyPath = "./process-proxy.yaml"
++		}
+ 		providers := map[string]any{
+ 			"pp-direct": map[string]any{
+-				"type": "file", "behavior": "classical", "path": "./process-direct.yaml",
++				"type": "file", "behavior": "classical", "path": directPath,
+ 			},
+ 		}
+ 		prepend = append(prepend, "RULE-SET,pp-direct,DIRECT")
+ 
+ 		if group := MainProxyGroup(cfg); group != "" {
+ 			providers["pp-proxy"] = map[string]any{
+-				"type": "file", "behavior": "classical", "path": "./process-proxy.yaml",
++				"type": "file", "behavior": "classical", "path": proxyPath,
+ 			}
+ 			prepend = append(prepend, fmt.Sprintf("RULE-SET,pp-proxy,%s", group))
+ 		}
+diff --git a/internal/kernel/manager.go b/internal/kernel/manager.go
+index eed41ed..ecfa879 100644
+--- a/internal/kernel/manager.go
++++ b/internal/kernel/manager.go
+@@ -414,6 +414,24 @@ func (m *Manager) startLocked(configPath string) error {
+ 		m.mu.Unlock()
+ 		return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
+ 	}
++	// 仅比较 m.run 还不够：waitProcess 先 close(exited) 再抢 m.mu，
++	// 这中间存在窗口——进程已经退出，但 m.run 仍指向 r。
++	// 此时若直接提交 Running，会向调用方谎报"启动成功"。
++	// exited 已关闭说明 cmd.Wait 返回、r.exitErr 已写入（happens-before），
++	// 必须在锁内显式检查，不能靠等待或 sleep。
++	select {
++	case <-r.exited:
++		// 先摘掉 run，避免随后 waitProcess 拿到锁时把状态改回 Stopped，
++		// 或让 Stop/Start 误以为这个已退出的进程仍然受管。
++		if m.run == r {
++			m.run = nil
++		}
++		m.state = StateFailed
++		m.lastErr = exitReason(r.exitErr)
++		m.mu.Unlock()
++		return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
++	default:
++	}
+ 	m.state = StateRunning
+ 	m.lastErr = ""
+ 	m.mu.Unlock()
+diff --git a/internal/kernel/start_exit_race_test.go b/internal/kernel/start_exit_race_test.go
+new file mode 100644
+index 0000000..ac4ef3e
+--- /dev/null
++++ b/internal/kernel/start_exit_race_test.go
+@@ -0,0 +1,132 @@
++package kernel
++
++import (
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++// 进程在"探测成功"与"提交 Running"之间退出：
++// Start 必须返回 ErrProcessExited，且最终状态不能停留在 Running。
++//
++// 测试用 before-running hook 精确卡住提交点，等子进程真正退出
++// （r.exited 关闭）后再放行，不依赖 sleep 或延长超时。
++func TestStartRejectsExitBeforeRunningCommit(t *testing.T) {
++	m := newFakeManager(t, "crash")
++
++	hookEntered := make(chan struct{})
++	release := make(chan struct{})
++	var once sync.Once
++	m.hook = func(stage string) {
++		if stage == "before-running" {
++			once.Do(func() { close(hookEntered) })
++			<-release
++		}
++	}
++
++	startDone := make(chan error, 1)
++	go func() { startDone <- m.Start("dummy.yaml") }()
++
++	select {
++	case <-hookEntered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Start 未到达 before-running 阶段")
++	}
++
++	m.mu.Lock()
++	r := m.run
++	m.mu.Unlock()
++	if r == nil {
++		t.Fatal("before-running 阶段应存在 processRun")
++	}
++
++	// 确定性子进程退出：fake kernel 的 "crash" 模式在 100ms 后 os.Exit(3)。
++	select {
++	case <-r.exited:
++	case <-time.After(5 * time.Second):
++		t.Fatal("子进程未在预期时间内退出")
++	}
++
++	close(release)
++	select {
++	case err := <-startDone:
++		if !errors.Is(err, ErrProcessExited) {
++			t.Fatalf("进程已退出时 Start 必须返回 ErrProcessExited，实际 %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("Start 未返回")
++	}
++
++	if st := m.Status().State; st == StateRunning {
++		t.Fatal("进程已退出却把状态提交为 Running")
++	}
++	if m.IsRunning() {
++		t.Fatal("IsRunning 不应为 true")
++	}
++}
++
++// 同一场景下再次 Start：不应被上一次已退出的 run 卡住（不能报"已在运行"）。
++func TestStartAfterExitBeforeRunningCanRetry(t *testing.T) {
++	m := newFakeManager(t, "crash")
++
++	hookEntered := make(chan struct{})
++	release := make(chan struct{})
++	var once sync.Once
++	m.hook = func(stage string) {
++		if stage == "before-running" {
++			once.Do(func() { close(hookEntered) })
++			<-release
++		}
++	}
++
++	startDone := make(chan error, 1)
++	go func() { startDone <- m.Start("dummy.yaml") }()
++	select {
++	case <-hookEntered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Start 未到达 before-running 阶段")
++	}
++	m.mu.Lock()
++	r := m.run
++	m.mu.Unlock()
++	if r == nil {
++		t.Fatal("before-running 阶段应存在 processRun")
++	}
++	select {
++	case <-r.exited:
++	case <-time.After(5 * time.Second):
++		t.Fatal("子进程未在预期时间内退出")
++	}
++	close(release)
++	select {
++	case <-startDone:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Start 未返回")
++	}
++
++	// 已退出的 run 必须已被摘掉，否则下一次启动会误报 ErrAlreadyRunning。
++	m.mu.Lock()
++	run := m.run
++	state := m.state
++	m.mu.Unlock()
++	if run != nil {
++		t.Fatal("进程退出后 run 未清空")
++	}
++	if state == StateRunning {
++		t.Fatal("进程退出后状态仍为 Running")
++	}
++
++	// 第二次启动会再次遇到同一个立即退出的假内核，但错误不能是
++	// "已在运行"——那说明旧 run 没有被正确清理。
++	m.hook = nil
++	err := m.Start("dummy.yaml")
++	if errors.Is(err, ErrAlreadyRunning) {
++		t.Fatalf("旧 run 未清理，第二次启动被误判为已在运行: %v", err)
++	}
++	if err == nil {
++		// 极少数情况下假内核在提交前尚未退出，Start 可能成功；
++		// 只要不是 ErrAlreadyRunning 就说明清理路径正确。
++		_ = m.Stop()
++	}
++}
+diff --git a/internal/subscription/fetch.go b/internal/subscription/fetch.go
+index 65af22e..419654c 100644
+--- a/internal/subscription/fetch.go
++++ b/internal/subscription/fetch.go
+@@ -61,39 +61,92 @@ func do(ctx context.Context, u string, insecure bool) ([]byte, http.Header, erro
+ }
+ 
+ func doWithDeps(ctx context.Context, u string, insecure bool, deps fetchDeps) ([]byte, http.Header, error) {
+-	if _, err := validateSubscriptionURL(u); err != nil {
+-		return nil, nil, err
+-	}
+-
+-	c := newGuardedClient(insecure, deps)
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+-	if err != nil {
+-		return nil, nil, err
+-	}
+-	req.Header.Set("User-Agent", clashUA)
+-	req.Header.Set("Accept", "*/*")
+-	resp, err := c.Do(req)
++	current, err := validateSubscriptionURL(u)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+-	defer resp.Body.Close()
+-	if resp.StatusCode != http.StatusOK {
+-		return nil, nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
+-	}
+-	if resp.ContentLength > maxSubscriptionBytes {
+-		return nil, nil, fmt.Errorf("%w：声明长度 %d 字节", ErrResponseTooLarge, resp.ContentLength)
++	if deps.timeout <= 0 {
++		deps.timeout = defaultFetchDeps().timeout
+ 	}
+-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
+-	if err != nil {
+-		return nil, nil, err
+-	}
+-	if int64(len(body)) > maxSubscriptionBytes {
+-		return nil, nil, fmt.Errorf("%w：超过 %d 字节", ErrResponseTooLarge, maxSubscriptionBytes)
++	// 总时长覆盖多次重定向，避免每跳各自重置超时。
++	ctx, cancel := context.WithTimeout(ctx, deps.timeout)
++	defer cancel()
++
++	c := newGuardedClient(insecure, deps)
++	for hop := 0; ; hop++ {
++		// 每一跳都重建请求：全新 Header 里没有任何 Referer/Authorization/Cookie，
++		// 原始订阅 URL（含 token）不会以任何形式带给重定向目标。
++		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
++		if err != nil {
++			return nil, nil, err
++		}
++		req.Header.Set("User-Agent", clashUA)
++		req.Header.Set("Accept", "*/*")
++		req.Header.Del("Referer")
++		req.Header.Del("Authorization")
++		req.Header.Del("Cookie")
++
++		resp, err := c.Do(req)
++		if err != nil {
++			return nil, nil, err
++		}
++
++		if isRedirectStatus(resp.StatusCode) {
++			loc := resp.Header.Get("Location")
++			// 丢弃并关闭中间响应体，避免连接无法复用。
++			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
++			_ = resp.Body.Close()
++			if loc == "" {
++				return nil, nil, fmt.Errorf("订阅返回 HTTP %d 但没有 Location", resp.StatusCode)
++			}
++			if hop >= maxRedirects {
++				return nil, nil, fmt.Errorf("%w（超过 %d 次）", ErrTooManyRedirects, maxRedirects)
++			}
++			next, err := current.Parse(loc)
++			if err != nil {
++				return nil, nil, fmt.Errorf("重定向地址无法解析: %w", err)
++			}
++			// 每一跳都重新做完整 URL 校验；域名/IP 还会在拨号时重新解析，
++			// 形成"URL 校验 + 拨号校验"的双重 SSRF 防护。
++			if _, err := validateSubscriptionURL(next.String()); err != nil {
++				return nil, nil, fmt.Errorf("重定向目标被拒绝: %w", err)
++			}
++			if err := redirectAllowed(current, next); err != nil {
++				return nil, nil, err
++			}
++			current = next
++			continue
++		}
++
++		defer resp.Body.Close()
++		if resp.StatusCode != http.StatusOK {
++			return nil, nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
++		}
++		if resp.ContentLength > maxSubscriptionBytes {
++			return nil, nil, fmt.Errorf("%w：声明长度 %d 字节", ErrResponseTooLarge, resp.ContentLength)
++		}
++		body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
++		if err != nil {
++			return nil, nil, err
++		}
++		if int64(len(body)) > maxSubscriptionBytes {
++			return nil, nil, fmt.Errorf("%w：超过 %d 字节", ErrResponseTooLarge, maxSubscriptionBytes)
++		}
++		if len(body) == 0 {
++			return nil, nil, fmt.Errorf("订阅返回空内容")
++		}
++		return body, resp.Header.Clone(), nil
+ 	}
+-	if len(body) == 0 {
+-		return nil, nil, fmt.Errorf("订阅返回空内容")
++}
++
++func isRedirectStatus(code int) bool {
++	switch code {
++	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
++		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
++		return true
++	default:
++		return false
+ 	}
+-	return body, resp.Header.Clone(), nil
+ }
+ 
+ // download 拉取订阅内容。
+diff --git a/internal/subscription/guard.go b/internal/subscription/guard.go
+index 1c4c56d..878cf78 100644
+--- a/internal/subscription/guard.go
++++ b/internal/subscription/guard.go
+@@ -26,6 +26,11 @@ var (
+ 	ErrBlockedAddress   = errors.New("订阅地址指向受限网络地址")
+ 	ErrTooManyRedirects = errors.New("订阅重定向次数过多")
+ 	ErrResponseTooLarge = errors.New("订阅响应体超过大小限制")
++	// ErrCrossHostRedirect 表示订阅试图跳转到不同站点。默认拒绝：
++	// 订阅 URL 通常带 token，跨站跳转等于把凭据路径交给第三方。
++	ErrCrossHostRedirect = errors.New("订阅跨主机重定向已被拒绝")
++	// ErrInsecureRedirect 表示 https 被降级到 http。
++	ErrInsecureRedirect = errors.New("订阅重定向不允许从 https 降级到 http")
+ )
+ 
+ // fetchDeps 把网络依赖抽出来，测试可以注入解析结果与底层拨号，
+@@ -221,20 +226,48 @@ func newGuardedClient(insecure bool, deps fetchDeps) *http.Client {
+ 	return &http.Client{
+ 		Timeout:   deps.timeout,
+ 		Transport: tr,
++		// 重定向由 doWithDeps 手动跟随：每一次跳转都重建请求头，
++		// 从根上避免 http.Client 自动把带 token 的地址写进 Referer。
+ 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+-			if len(via) >= maxRedirects {
+-				return fmt.Errorf("%w（超过 %d 次）", ErrTooManyRedirects, maxRedirects)
+-			}
+-			// 每一次重定向都重新做完整 URL 校验；域名/IP 还会在拨号时
+-			// 重新解析并校验，双重防护。
+-			if _, err := validateSubscriptionURL(req.URL.String()); err != nil {
+-				return fmt.Errorf("重定向目标被拒绝: %w", err)
+-			}
+-			return nil
++			return http.ErrUseLastResponse
+ 		},
+ 	}
+ }
+ 
++// redirectAllowed 决定是否跟随一次重定向，全部校验都返回可诊断的错误。
++//
++// 策略：
++//   - 默认只允许同站跳转（同主机，或一方是另一方的子域）；
++//   - 跨站默认拒绝，防止订阅 token 随跳转落到第三方；
++//   - 禁止 https → http 降级；
++//   - 禁止重定向目标携带 userinfo（会被 Go 自动转成 Authorization）。
++func redirectAllowed(prev, next *url.URL) error {
++	if next.User != nil {
++		return fmt.Errorf("%w: 重定向目标携带 userinfo", ErrBlockedAddress)
++	}
++	if prev.Scheme == "https" && next.Scheme != "https" {
++		return fmt.Errorf("%w: %s → %s", ErrInsecureRedirect, prev.Scheme, next.Scheme)
++	}
++	if !sameSiteHost(prev.Hostname(), next.Hostname()) {
++		return fmt.Errorf("%w: %s → %s", ErrCrossHostRedirect, prev.Hostname(), next.Hostname())
++	}
++	return nil
++}
++
++// sameSiteHost 判断两个主机是否属于同一站点：相等，或存在父子域关系。
++// 用标签边界比较，避免 evil-example.com 被当成 example.com 的子域。
++func sameSiteHost(a, b string) bool {
++	a = strings.ToLower(strings.TrimSuffix(a, "."))
++	b = strings.ToLower(strings.TrimSuffix(b, "."))
++	if a == "" || b == "" {
++		return false
++	}
++	if a == b {
++		return true
++	}
++	return strings.HasSuffix(a, "."+b) || strings.HasSuffix(b, "."+a)
++}
++
+ func isNumericHost(host string) bool {
+ 	host = strings.ToLower(host)
+ 	if host == "" {
+diff --git a/internal/subscription/guard_test.go b/internal/subscription/guard_test.go
+index 2adb96d..e8d4b2e 100644
+--- a/internal/subscription/guard_test.go
++++ b/internal/subscription/guard_test.go
+@@ -169,7 +169,8 @@ func TestSSRFBlocksRedirectToPrivateDNS(t *testing.T) {
+ 	var srv *httptest.Server
+ 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		if r.URL.Path == "/start" {
+-			http.Redirect(w, r, fmt.Sprintf("http://evil.test:%d/final", localPort(t, srv)), http.StatusFound)
++			// 用同站点子域，确保先通过重定向策略，真正考验 DNS 解析校验。
++			http.Redirect(w, r, fmt.Sprintf("http://evil.public.test:%d/final", localPort(t, srv)), http.StatusFound)
+ 			return
+ 		}
+ 		_, _ = w.Write([]byte("bad"))
+@@ -178,7 +179,7 @@ func TestSSRFBlocksRedirectToPrivateDNS(t *testing.T) {
+ 
+ 	port := localPort(t, srv)
+ 	deps := testDeps(t, srv, map[string][]net.IP{
+-		"evil.test": {net.ParseIP("192.168.0.9")},
++		"evil.public.test": {net.ParseIP("192.168.0.9")},
+ 	})
+ 	_, _, err := doWithDeps(context.Background(),
+ 		fmt.Sprintf("http://public.test:%d/start", port), false, deps)
+diff --git a/internal/subscription/redirect_test.go b/internal/subscription/redirect_test.go
+new file mode 100644
+index 0000000..e34f9b2
+--- /dev/null
++++ b/internal/subscription/redirect_test.go
+@@ -0,0 +1,250 @@
++package subscription
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// dualDeps 让 public.test / evil.test 分别落到两个不同的测试服务器，
++// 用于验证跨主机重定向是否会被拒绝、以及被拒绝时第三方是否收到请求。
++func dualDeps(t *testing.T, primary, other *httptest.Server) fetchDeps {
++	t.Helper()
++	dialer := &net.Dialer{}
++	return fetchDeps{
++		resolve: func(_ context.Context, host string) ([]net.IP, error) {
++			switch strings.ToLower(host) {
++			case "public.test", "sub.public.test":
++				return []net.IP{net.ParseIP("93.184.216.34")}, nil
++			case "evil.test":
++				return []net.IP{net.ParseIP("93.184.216.35")}, nil
++			default:
++				return nil, fmt.Errorf("unexpected host %s", host)
++			}
++		},
++		dialTCP: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			host, _, err := net.SplitHostPort(addr)
++			if err != nil {
++				return nil, err
++			}
++			switch host {
++			case "93.184.216.34":
++				return dialer.DialContext(ctx, network, primary.Listener.Addr().String())
++			case "93.184.216.35":
++				return dialer.DialContext(ctx, network, other.Listener.Addr().String())
++			}
++			return nil, fmt.Errorf("unexpected dial target %s", addr)
++		},
++		timeout: 5 * time.Second,
++	}
++}
++
++// 带 token 的订阅跳转到另一个公网域名：必须拒绝，第三方不能收到任何请求。
++func TestCrossHostRedirectRejectedWithoutLeakingToken(t *testing.T) {
++	var evilHits int32
++	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		atomic.AddInt32(&evilHits, 1)
++		_, _ = w.Write([]byte("attacker got token=" + r.URL.Query().Get("token")))
++	}))
++	defer evil.Close()
++
++	var primary *httptest.Server
++	primary = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r,
++			fmt.Sprintf("http://evil.test:%d/collect?token=%s", localPort(t, evil), r.URL.Query().Get("token")),
++			http.StatusFound)
++	}))
++	defer primary.Close()
++
++	deps := dualDeps(t, primary, evil)
++	subURL := fmt.Sprintf("http://public.test:%d/sub?token=SECRET-TOKEN", localPort(t, primary))
++
++	_, _, err := doWithDeps(context.Background(), subURL, false, deps)
++	if err == nil {
++		t.Fatal("跨主机重定向必须被拒绝")
++	}
++	if !errors.Is(err, ErrCrossHostRedirect) {
++		t.Fatalf("期望 ErrCrossHostRedirect，实际 %v", err)
++	}
++	if n := atomic.LoadInt32(&evilHits); n != 0 {
++		t.Fatalf("第三方收到了 %d 次请求，订阅凭据可能泄漏", n)
++	}
++}
++
++// 同主机重定向仍然允许，但绝不能携带 Referer（原始 URL 的 token 就在其中）。
++func TestSameHostRedirectSendsNoReferer(t *testing.T) {
++	var mu sync.Mutex
++	var referer, rawQuery string
++	seen := 0
++
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/start":
++			http.Redirect(w, r, "/final", http.StatusFound)
++		case "/final":
++			mu.Lock()
++			referer = r.Header.Get("Referer")
++			rawQuery = r.URL.RawQuery
++			seen++
++			mu.Unlock()
++			_, _ = io.WriteString(w, "ok")
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer srv.Close()
++
++	deps := testDeps(t, srv, nil)
++	subURL := fmt.Sprintf("http://public.test:%d/start?token=SECRET-TOKEN", localPort(t, srv))
++
++	body, _, err := doWithDeps(context.Background(), subURL, false, deps)
++	if err != nil {
++		t.Fatalf("同主机重定向应允许: %v", err)
++	}
++	if string(body) != "ok" {
++		t.Fatalf("最终响应体不符: %q", body)
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if seen != 1 {
++		t.Fatalf("最终地址应只请求一次，实际 %d 次", seen)
++	}
++	if referer != "" {
++		t.Fatalf("重定向请求不应携带 Referer，实际 %q", referer)
++	}
++	if strings.Contains(rawQuery, "token") {
++		t.Fatalf("跳转后的请求不应继承原始查询参数: %q", rawQuery)
++	}
++}
++
++// 同站点子域跳转被视为可信：sub.public.test → public.test 允许。
++func TestSameSiteSubdomainRedirectAllowed(t *testing.T) {
++	content := "proxies:\n  - name: n1\n    type: ss\n"
++	var primary *httptest.Server
++	primary = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.WriteString(w, content)
++	}))
++	defer primary.Close()
++
++	var edge *httptest.Server
++	edge = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r,
++			fmt.Sprintf("http://public.test:%d/sub", localPort(t, primary)),
++			http.StatusMovedPermanently)
++	}))
++	defer edge.Close()
++
++	deps := fetchDeps{
++		resolve: func(_ context.Context, host string) ([]net.IP, error) {
++			switch strings.ToLower(host) {
++			case "sub.public.test":
++				return []net.IP{net.ParseIP("93.184.216.34")}, nil
++			default:
++				return []net.IP{net.ParseIP("93.184.216.35")}, nil
++			}
++		},
++		dialTCP: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			host, _, _ := net.SplitHostPort(addr)
++			target := primary.Listener.Addr().String()
++			if host == "93.184.216.34" {
++				target = edge.Listener.Addr().String()
++			}
++			return (&net.Dialer{}).DialContext(ctx, network, target)
++		},
++		timeout: 5 * time.Second,
++	}
++
++	body, _, err := doWithDeps(context.Background(),
++		fmt.Sprintf("http://sub.public.test:%d/sub?token=T", localPort(t, edge)), false, deps)
++	if err != nil {
++		t.Fatalf("同站点子域重定向应允许: %v", err)
++	}
++	if string(body) != content {
++		t.Fatalf("应拿到最终订阅内容，实际 %q", body)
++	}
++}
++
++// 跨主机重定向被拒绝不能绕过 SSRF：内网目标仍然先被 URL/DNS 校验拦下。
++func TestRedirectToPrivateStillBlocked(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r, "http://10.0.0.9/secret", http.StatusFound)
++	}))
++	defer srv.Close()
++
++	deps := testDeps(t, srv, nil)
++	_, _, err := doWithDeps(context.Background(),
++		fmt.Sprintf("http://public.test:%d/start", localPort(t, srv)), false, deps)
++	if err == nil {
++		t.Fatal("重定向到内网必须被拒绝")
++	}
++	if !errors.Is(err, ErrBlockedAddress) {
++		t.Fatalf("期望 ErrBlockedAddress，实际 %v", err)
++	}
++}
++
++// https 被降级到 http：必须拒绝。
++func TestRedirectDowngradeRejected(t *testing.T) {
++	from, _ := url.Parse("https://public.test/sub")
++	to, _ := url.Parse("http://public.test/sub")
++	if err := redirectAllowed(from, to); !errors.Is(err, ErrInsecureRedirect) {
++		t.Fatalf("期望 ErrInsecureRedirect，实际 %v", err)
++	}
++}
++
++// 重定向目标带 userinfo：会被 Go 自动转成 Authorization，必须拒绝。
++func TestRedirectWithUserInfoRejected(t *testing.T) {
++	from, _ := url.Parse("https://public.test/sub")
++	to, _ := url.Parse("https://user:pass@public.test/sub")
++	if err := redirectAllowed(from, to); !errors.Is(err, ErrBlockedAddress) {
++		t.Fatalf("期望 ErrBlockedAddress，实际 %v", err)
++	}
++}
++
++// 主机相似但不同站（evil-example.com vs example.com）不能误判为同站点。
++func TestSameSiteHostBoundary(t *testing.T) {
++	cases := []struct {
++		a, b string
++		want bool
++	}{
++		{"example.com", "example.com", true},
++		{"cdn.example.com", "example.com", true},
++		{"example.com", "cdn.example.com", true},
++		{"evil-example.com", "example.com", false},
++		{"example.com.evil.test", "example.com", false},
++		{"Example.COM.", "example.com", true},
++	}
++	for _, c := range cases {
++		if got := sameSiteHost(c.a, c.b); got != c.want {
++			t.Fatalf("sameSiteHost(%q,%q)=%v，期望 %v", c.a, c.b, got, c.want)
++		}
++	}
++}
++
++// 合法订阅更新不受重定向策略影响：直接 200 仍正常返回。
++func TestDirectSubscriptionStillWorks(t *testing.T) {
++	content := "proxies:\n  - name: n1\n    type: ss\n"
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = io.WriteString(w, content)
++	}))
++	defer srv.Close()
++
++	deps := testDeps(t, srv, nil)
++	body, _, err := doWithDeps(context.Background(),
++		fmt.Sprintf("http://public.test:%d/sub", localPort(t, srv)), false, deps)
++	if err != nil {
++		t.Fatalf("正常订阅拉取不应失败: %v", err)
++	}
++	if string(body) != content {
++		t.Fatalf("内容不符: %q", body)
++	}
++}
+diff --git a/procgen.go b/procgen.go
+new file mode 100644
+index 0000000..f90a4e4
+--- /dev/null
++++ b/procgen.go
+@@ -0,0 +1,327 @@
++package main
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"time"
++)
++
++// 进程规则的三个文件（规则表 JSON + 两个 mihomo classical provider）必须
++// 作为一个整体发布：分别原子写只能保证"单个文件不截断"，不能保证
++// "三个文件属于同一版本"。中途崩溃会留下新旧混合，内核可能读到
++// 一套自相矛盾的进程规则。
++//
++// 最小可靠方案：generation 目录 + manifest。
++//
++//	procgen/proxy-<gen>.yaml
++//	procgen/direct-<gen>.yaml
++//	procgen/rules-<gen>.json
++//	procgen/current.json      ← 最后原子写入，指向本代全部文件与哈希
++//	procgen/current.json.prev ← 上一代 manifest，用于 current 损坏时回退
++//
++// 启动时只认"manifest + 哈希全部校验通过"的那一代；否则回退上一代，
++// 再否则回退旧版平铺文件（process-rules.json 等），保证升级/降级都可用。
++const (
++	procGenDirName      = "procgen"
++	procGenManifestName = "current.json"
++	procGenVersion      = 1
++)
++
++// procGenPaths 是当前已发布版本三个文件的绝对路径。
++type procGenPaths struct {
++	Gen    int64
++	Proxy  string
++	Direct string
++	Rules  string
++}
++
++// procGenManifest 是 procgen 版本的提交点。
++type procGenManifest struct {
++	Version   int               `json:"version"`
++	Gen       int64             `json:"gen"`
++	Proxy     string            `json:"proxy"`
++	Direct    string            `json:"direct"`
++	Rules     string            `json:"rules"`
++	Hashes    map[string]string `json:"hashes"`
++	CreatedAt int64             `json:"createdAt"`
++}
++
++// procPublishHook 仅用于测试注入"写完文件但尚未发布 manifest"等故障点。
++var procPublishHook = func(stage string) error { return nil }
++
++func procGenDir() string {
++	return filepath.Join(dataDir(), procGenDirName)
++}
++
++// publishProcRules 把一份规则快照写成新 generation，校验后原子发布 manifest。
++// 任一步失败都不会改变 current.json，旧版本继续可用。
++func (s *CoreService) publishProcRules(rules map[string]string) error {
++	s.procGenMu.Lock()
++	defer s.procGenMu.Unlock()
++
++	proxyYAML, directYAML := renderProcRulesPayload(rules)
++	rulesJSON, err := json.MarshalIndent(rules, "", "  ")
++	if err != nil {
++		return err
++	}
++
++	gen := time.Now().UnixNano()
++	dir := procGenDir()
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("创建进程规则目录失败: %w", err)
++	}
++
++	m := procGenManifest{
++		Version:   procGenVersion,
++		Gen:       gen,
++		Proxy:     fmt.Sprintf("proxy-%d.yaml", gen),
++		Direct:    fmt.Sprintf("direct-%d.yaml", gen),
++		Rules:     fmt.Sprintf("rules-%d.json", gen),
++		Hashes:    map[string]string{},
++		CreatedAt: time.Now().UnixMilli(),
++	}
++	payloads := map[string][]byte{
++		m.Proxy:  []byte(proxyYAML),
++		m.Direct: []byte(directYAML),
++		m.Rules:  rulesJSON,
++	}
++
++	cleanup := func() {
++		for name := range payloads {
++			_ = os.Remove(filepath.Join(dir, name))
++		}
++	}
++
++	for name, data := range payloads {
++		path := filepath.Join(dir, name)
++		if err := writeFileAtomic(path, data, 0o644); err != nil {
++			cleanup()
++			return fmt.Errorf("写入进程规则 %s 失败: %w", name, err)
++		}
++		sum := sha256.Sum256(data)
++		m.Hashes[name] = hex.EncodeToString(sum[:])
++	}
++
++	// 模拟"文件写完、manifest 未发布"的中断：调用方会看到错误，
++	// 但 current.json 仍指向上一个完整版本。
++	if err := procPublishHook("before-manifest"); err != nil {
++		cleanup()
++		return err
++	}
++
++	// manifest 最后写，它就是整个版本的提交点。
++	if err := s.writeProcGenManifestLocked(m); err != nil {
++		cleanup()
++		return fmt.Errorf("发布进程规则版本失败: %w", err)
++	}
++
++	paths := &procGenPaths{
++		Gen:    gen,
++		Proxy:  filepath.Join(dir, m.Proxy),
++		Direct: filepath.Join(dir, m.Direct),
++		Rules:  filepath.Join(dir, m.Rules),
++	}
++	s.setProcGenPaths(paths)
++	// 旧版平铺文件只用于降级兼容，写失败不影响当前版本。
++	s.writeLegacyProcSnapshot(rules)
++	s.cleanupProcGensLocked(m)
++	return nil
++}
++
++// writeLegacyProcSnapshot 尽力维护旧版平铺文件，方便回退到老版本程序。
++func (s *CoreService) writeLegacyProcSnapshot(rules map[string]string) {
++	mb, err := json.MarshalIndent(rules, "", "  ")
++	if err != nil {
++		return
++	}
++	if err := writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644); err != nil {
++		s.dbg("写入旧版进程规则失败: %v", err)
++		return
++	}
++	if err := s.writeProcRuleSnapshotFiles(rules); err != nil {
++		s.dbg("写入旧版进程规则 provider 失败: %v", err)
++	}
++}
++
++// writeProcGenManifestLocked 先保存上一代 manifest，再原子替换 current。
++func (s *CoreService) writeProcGenManifestLocked(m procGenManifest) error {
++	mb, err := json.MarshalIndent(m, "", "  ")
++	if err != nil {
++		return err
++	}
++	dir := procGenDir()
++	cur := filepath.Join(dir, procGenManifestName)
++	tmp := cur + ".next"
++	prev := cur + ".prev"
++	if err := writeFileAtomic(tmp, mb, 0o644); err != nil {
++		return err
++	}
++	if _, statErr := os.Stat(cur); statErr == nil {
++		_ = os.Remove(prev)
++		if err := copyFile(cur, prev); err != nil {
++			_ = os.Remove(tmp)
++			return fmt.Errorf("备份上一版 manifest 失败: %w", err)
++		}
++	}
++	if err := os.Rename(tmp, cur); err != nil {
++		_ = os.Remove(tmp)
++		return err
++	}
++	return nil
++}
++
++// resolvePublishedProcRules 返回当前可用的版本与规则内容。
++// 优先 current，哈希校验失败时回退 prev；都不行返回 ok=false，
++// 由调用方回退旧版平铺文件。
++func (s *CoreService) resolvePublishedProcRules() (*procGenPaths, map[string]string, bool) {
++	s.procGenMu.Lock()
++	defer s.procGenMu.Unlock()
++
++	dir := procGenDir()
++	cur := filepath.Join(dir, procGenManifestName)
++	for _, manifestPath := range []string{cur, cur + ".prev"} {
++		m, ok := readProcGenManifest(manifestPath)
++		if !ok {
++			continue
++		}
++		if err := verifyProcGen(dir, m); err != nil {
++			s.dbg("进程规则版本校验失败（%s）: %v", filepath.Base(manifestPath), err)
++			continue
++		}
++		rules, err := readProcGenRules(filepath.Join(dir, m.Rules))
++		if err != nil {
++			s.dbg("读取进程规则版本失败: %v", err)
++			continue
++		}
++		return &procGenPaths{
++			Gen:    m.Gen,
++			Proxy:  filepath.Join(dir, m.Proxy),
++			Direct: filepath.Join(dir, m.Direct),
++			Rules:  filepath.Join(dir, m.Rules),
++		}, rules, true
++	}
++	return nil, nil, false
++}
++
++func readProcGenManifest(path string) (procGenManifest, bool) {
++	var m procGenManifest
++	state, err := readConfigJSON(path, &m)
++	if state != configOK || err != nil {
++		return m, false
++	}
++	// 未来版本写下的 generation 不能按当前结构解释。
++	if m.Version > procGenVersion || m.Gen == 0 ||
++		m.Proxy == "" || m.Direct == "" || m.Rules == "" {
++		return m, false
++	}
++	// manifest 是本地文件，但仍要拒绝路径穿越，避免被手工改坏后读到目录外。
++	for _, name := range []string{m.Proxy, m.Direct, m.Rules} {
++		if filepath.Base(name) != name || strings.ContainsAny(name, `/\`) || name == "." {
++			return m, false
++		}
++	}
++	return m, true
++}
++
++func verifyProcGen(dir string, m procGenManifest) error {
++	for _, name := range []string{m.Proxy, m.Direct, m.Rules} {
++		b, err := os.ReadFile(filepath.Join(dir, name))
++		if err != nil {
++			return fmt.Errorf("缺少文件 %s: %w", name, err)
++		}
++		want := m.Hashes[name]
++		if want == "" {
++			return fmt.Errorf("manifest 缺少 %s 的哈希", name)
++		}
++		sum := sha256.Sum256(b)
++		if hex.EncodeToString(sum[:]) != want {
++			return fmt.Errorf("文件 %s 哈希不符", name)
++		}
++	}
++	return nil
++}
++
++func readProcGenRules(path string) (map[string]string, error) {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
++	var m map[string]string
++	if err := json.Unmarshal(b, &m); err != nil {
++		return nil, err
++	}
++	return m, nil
++}
++
++// setProcGenPaths 缓存当前发布路径，供 options() 生成内核配置使用。
++func (s *CoreService) setProcGenPaths(p *procGenPaths) {
++	s.mu.Lock()
++	if p == nil {
++		s.procProxyPath = procProxyYAML
++		s.procDirectPath = procDirectYAML
++	} else {
++		// mihomo 以数据目录为工作目录；配置里统一用正斜杠，跨平台稳定。
++		s.procProxyPath = "./" + procGenDirName + "/" + filepath.Base(p.Proxy)
++		s.procDirectPath = "./" + procGenDirName + "/" + filepath.Base(p.Direct)
++	}
++	s.mu.Unlock()
++}
++
++// cleanupProcGensLocked 删除不再被 current / prev 引用的旧 generation 文件。
++func (s *CoreService) cleanupProcGensLocked(current procGenManifest) {
++	dir := procGenDir()
++	keep := map[string]bool{
++		current.Proxy: true, current.Direct: true, current.Rules: true,
++		procGenManifestName:           true,
++		procGenManifestName + ".prev": true,
++	}
++	if prev, ok := readProcGenManifest(filepath.Join(dir, procGenManifestName+".prev")); ok {
++		keep[prev.Proxy] = true
++		keep[prev.Direct] = true
++		keep[prev.Rules] = true
++	}
++
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return
++	}
++	for _, e := range entries {
++		if e.IsDir() || keep[e.Name()] {
++			continue
++		}
++		if !strings.HasPrefix(e.Name(), "proxy-") &&
++			!strings.HasPrefix(e.Name(), "direct-") &&
++			!strings.HasPrefix(e.Name(), "rules-") {
++			continue
++		}
++		_ = os.Remove(filepath.Join(dir, e.Name()))
++	}
++}
++
++func copyFile(src, dst string) error {
++	b, err := os.ReadFile(src)
++	if err != nil {
++		return err
++	}
++	return writeFileAtomic(dst, b, 0o600)
++}
++
++// legacyProcFiles 返回旧版平铺文件路径，用于降级兼容与回退。
++func legacyProcFiles() (rules, proxy, direct string) {
++	dir := dataDir()
++	return filepath.Join(dir, procRulesJSON), filepath.Join(dir, procProxyYAML), filepath.Join(dir, procDirectYAML)
++}
++
++// sortGenFiles 仅供测试/诊断输出使用。
++func sortGenFiles(names []string) []string {
++	sort.Strings(names)
++	return names
++}
+diff --git a/realkernel_procgen_test.go b/realkernel_procgen_test.go
+new file mode 100644
+index 0000000..676e2a9
+--- /dev/null
++++ b/realkernel_procgen_test.go
+@@ -0,0 +1,127 @@
++//go:build realkernel
++
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"routepilot/internal/kernel"
++)
++
++func c4FreePort(t *testing.T) int {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := ln.Addr().(*net.TCPAddr).Port
++	_ = ln.Close()
++	return port
++}
++
++// 用真实 mihomo 验证 generation 目录里的 rule-provider 能被正确加载。
++// 执行条件：仓库内存在 assets/mihomo.exe；显式开启 realkernel 标签。
++//
++//	go test -tags realkernel -run TestRealKernelLoadsProcGenProvider -v .
++func TestRealKernelLoadsProcGenProvider(t *testing.T) {
++	exePath := filepath.Join("assets", "mihomo.exe")
++	if _, err := os.Stat(exePath); err != nil {
++		t.Skipf("未找到内核二进制: %v", err)
++	}
++	exeData, err := os.ReadFile(exePath)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	old := dataDirOverride
++	dataDirOverride = t.TempDir()
++	t.Cleanup(func() { dataDirOverride = old })
++
++	svc := NewCoreService()
++	rules := map[string]string{"name:curl.exe": "direct"}
++	if err := svc.publishProcRules(rules); err != nil {
++		t.Fatalf("发布规则失败: %v", err)
++	}
++	opt := svc.options()
++	if !strings.HasPrefix(opt.ProcessDirectPath, "./procgen/") {
++		t.Fatalf("provider 路径不是 procgen: %s", opt.ProcessDirectPath)
++	}
++
++	mixedPort := c4FreePort(t)
++	apiPort := c4FreePort(t)
++	conf := fmt.Sprintf(`mixed-port: %d
++external-controller: 127.0.0.1:%d
++secret: test-secret
++mode: rule
++log-level: warning
++rule-providers:
++  pp-direct:
++    type: file
++    behavior: classical
++    path: %s
++rules:
++  - RULE-SET,pp-direct,DIRECT
++  - MATCH,DIRECT
++`, mixedPort, apiPort, opt.ProcessDirectPath)
++	confPath := filepath.Join(dataDir(), "config.yaml")
++	if err := os.WriteFile(confPath, []byte(conf), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	mgr := kernel.NewManager(dataDir())
++	if _, err := mgr.EnsureBinary(exeData); err != nil {
++		t.Fatalf("释放内核失败: %v", err)
++	}
++	defer func() { _ = mgr.Close() }()
++
++	addr := fmt.Sprintf("127.0.0.1:%d", apiPort)
++	mgr.SetStartupValidation(addr, func(ctx context.Context) error {
++		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/version", nil)
++		if err != nil {
++			return err
++		}
++		req.Header.Set("Authorization", "Bearer test-secret")
++		resp, err := http.DefaultClient.Do(req)
++		if err != nil {
++			return err
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode != http.StatusOK {
++			return fmt.Errorf("status %d", resp.StatusCode)
++		}
++		return nil
++	}, 20*time.Second)
++
++	if err := mgr.Start(confPath); err != nil {
++		t.Fatalf("内核未能加载 procgen provider: %v", err)
++	}
++
++	// /providers/rules 应能看到 pp-direct，说明文件被真正读取。
++	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/providers/rules", nil)
++	req.Header.Set("Authorization", "Bearer test-secret")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer resp.Body.Close()
++	body, _ := io.ReadAll(resp.Body)
++	var payload struct {
++		Providers map[string]json.RawMessage `json:"providers"`
++	}
++	if err := json.Unmarshal(body, &payload); err != nil {
++		t.Fatalf("providers 响应无法解析: %v", err)
++	}
++	if _, ok := payload.Providers["pp-direct"]; !ok {
++		t.Fatalf("内核没有加载 pp-direct provider: %s", body)
++	}
++}
+diff --git a/service.go b/service.go
+index 319d865..a74879c 100644
+--- a/service.go
++++ b/service.go
+@@ -183,7 +183,7 @@ type CoreService struct {
+ 	shuttingDown bool
+ 
+ 	// proxyMu 串行化所有系统代理事务：用户手动开关、启动后的端口校正、
+-	// Stop/Shutdown 的还原、看门狗熔断恢复。
++	// Stop/Shutdown 的还原、看门狗熔断恢复、TUN 切换中的代理部分。
+ 	//
+ 	// 锁顺序（必须遵守，否则会死锁）：
+ 	//
+@@ -193,6 +193,29 @@ type CoreService struct {
+ 	// 持有 s.mu 期间禁止做注册表 I/O——那可能耗时数十毫秒并阻塞 Status 轮询。
+ 	proxyMu sync.Mutex
+ 
++	// tunChanging/tunTarget 表示一次 TUN 切换事务正在进行以及目标状态。
++	// 注册表操作、内核重启、失败回滚都可能耗时，期间必须阻止并发的
++	// SetSystemProxy(true)/reconcileProxy 重新打开系统代理，否则会出现
++	// TUN 与系统代理同时生效的"双接管"。
++	// 真正生效的 tunOn 只在重启成功后才提交。
++	tunChanging bool
++	tunTarget   bool
++
++	// subsMu 串行化订阅事务的提交阶段：刷新、切换、删除、清空、自动更新
++	// 都要经过它。网络下载必须在持锁之前完成，锁内只做落盘与内存提交，
++	// 保证不会出现"刷新 A 的结果覆盖刚切换到的 B"这类半提交状态。
++	// 锁顺序：subsMu → s.mu；不得在持有 subsMu 时调用 lifeMu 操作，
++	// 因此内核重启放在释放 subsMu 之后。
++	subsMu sync.Mutex
++
++	// procGenMu 串行化进程规则 generation 的发布与清理，避免两个并发
++	// publish 互相删除对方刚写好的文件。
++	procGenMu sync.Mutex
++	// procProxyPath/procDirectPath 是当前已发布 provider 文件在 mihomo
++	// 配置里的相对路径。默认回退到旧版平铺文件。
++	procProxyPath  string
++	procDirectPath string
++
+ 	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
+ 	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
+ 	gen       uint64
+@@ -259,6 +282,10 @@ func NewCoreService() *CoreService {
+ 		homeLon:   113.75, // 东莞
+ 		homeLat:   23.02,
+ 		homeLabel: "本机",
++		// 默认使用旧版平铺文件；存在已发布的 generation 时由
++		// loadProcRules/publishProcRules 更新为 procgen 路径。
++		procProxyPath:  procProxyYAML,
++		procDirectPath: procDirectYAML,
+ 	}
+ 	s.procTracker = procid.NewTracker(procid.WindowsSource(), 5*time.Second)
+ 	s.procTracker.SetFileIDFunc(procid.FileIdentity)
+@@ -638,7 +665,12 @@ func (s *CoreService) options() configgen.Options {
+ 	// TUN 以当前期望态为准。restoreTUN 只表示"上次退出时开着"，
+ 	// 用于启动阶段的一次性恢复，不能拿来生成配置——否则会话内开关
+ 	// TUN 改不动配置，界面显示和实际行为会脱节。
+-	wantTUN := s.tunOn && s.admin()
++	// TUN 切换事务进行中时，生成配置必须使用事务目标态，而不是尚未提交的 tunOn。
++	wantTUN := s.tunOn
++	if s.tunChanging {
++		wantTUN = s.tunTarget
++	}
++	wantTUN = wantTUN && s.admin()
+ 
+ 	mainGroup := configgen.MainProxyGroup(s.subConfig)
+ 	procPlan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
+@@ -653,6 +685,8 @@ func (s *CoreService) options() configgen.Options {
+ 		Mode:               mode,
+ 		Tun:                wantTUN,
+ 		ProcessRules:       true,
++		ProcessProxyPath:   s.procProxyPath,
++		ProcessDirectPath:  s.procDirectPath,
+ 		ProcessCustomRules: procPlan.Rules,
+ 		ProcessGroups:      combined.Groups,
+ 		SiteRules:          sitePlan.Rules,
+@@ -1462,6 +1496,10 @@ func (s *CoreService) captureProxySnapshot(addr string) proxyBackup {
+ // errProxyStale 表示本次代理事务属于已经失效的内核代际，必须放弃。
+ var errProxyStale = errors.New("启动代际已失效，放弃系统代理操作")
+ 
++// errTUNRestoreFailed 标记"切 TUN 前恢复系统代理失败"。这类失败必须保留
++// 恢复事务写下的 Pending 备份，不能像普通回滚那样把内存备份还原成旧值。
++var errTUNRestoreFailed = errors.New("切换 TUN 前恢复系统代理失败")
++
+ // withProxyTx 是所有系统代理事务的唯一入口：先取 proxyMu，再校验代际，
+ // 最后执行注册表 I/O。生命周期操作（Stop/Restart/Shutdown）在 proxyMu
+ // 之外先失效代际，因此：
+@@ -1511,8 +1549,14 @@ func (s *CoreService) setSystemProxyLocked(on bool, genOK func() bool) error {
+ 		// 界面里的开关会禁用，但托盘菜单里的没禁，所以这里也必须拦一道。
+ 		s.mu.RLock()
+ 		tun := s.tunOn
++		tunChanging := s.tunChanging
+ 		bk := s.backup
+ 		s.mu.RUnlock()
++		if tunChanging {
++			// TUN 正在切换：此刻注册表可能已被关闭，但 tunOn 尚未提交。
++			// 必须拒绝，否则改造完成后会出现 TUN 与系统代理同时接管。
++			return fmt.Errorf("TUN 正在切换，请稍后重试")
++		}
+ 		if tun {
+ 			return fmt.Errorf("TUN 已开启，正在接管全部流量，请先关闭 TUN")
+ 		}
+@@ -1936,6 +1980,13 @@ func (s *CoreService) reconcileProxyForGeneration(gen uint64, ctx context.Contex
+ 
+ // reconcileProxyLocked 的调用方必须已持有 proxyMu。
+ func (s *CoreService) reconcileProxyLocked() {
++	// TUN 正在切换时，注册表与 tunOn 处于中间态，任何"校正"都可能造成双接管。
++	s.mu.RLock()
++	tunChanging := s.tunChanging
++	s.mu.RUnlock()
++	if tunChanging {
++		return
++	}
+ 	// TUN 已接管全部流量时，系统代理必须保持关闭。
+ 	if s.TUNState() {
+ 		return
+@@ -2037,115 +2088,158 @@ func (s *CoreService) SetTUN(on bool) error {
+ }
+ 
+ // setTUN 把内核重启抽成参数，便于故障注入测试验证回滚路径。
++//
++// 状态转换（只有实际操作成功后才提交内存状态）：
++//
++//	关闭 → 开启：恢复并关闭系统代理/WinHTTP → 重启内核(配置含 TUN) → tunOn=true
++//	开启 → 关闭：重启内核(配置无 TUN) → tunOn=false → 按需重新接管系统代理
++//
++// 整个过程中 tunChanging=true，并发的 SetSystemProxy(true) 与 reconcileProxy
++// 都会被拒绝/跳过，避免出现"TUN 打开但系统代理也被重新打开"的双接管。
++// 注册表部分在 proxyMu 内完成；内核重启不能持有 proxyMu（afterStart 需要它）。
+ func (s *CoreService) setTUN(on bool, restart func() error) error {
+ 	if on && !s.admin() {
+ 		return fmt.Errorf("开启 TUN 需要管理员权限")
+ 	}
+ 
+-	// 先记住原状态。内核重启失败时要整体回滚——
+-	// 不能出现"界面上写着开启、实际没启用"这种脱节。
+-	s.mu.RLock()
++	s.mu.Lock()
++	if s.tunChanging {
++		s.mu.Unlock()
++		return fmt.Errorf("TUN 正在切换，请稍后重试")
++	}
++	s.tunChanging = true
++	s.tunTarget = on
+ 	prevTUN := s.tunOn
+ 	prevProxyOn := s.proxyOn
+ 	prevBackup := s.backup
+ 	prevTunPrevProxy := s.tunPrevProxyOn
+-	s.mu.RUnlock()
++	s.mu.Unlock()
+ 
+-	// 记录关闭系统代理前的真实注册表状态。TUN 开启失败时用它回滚，
+-	// 避免把用户/外部软件原本的代理设置弄丢。
+-	previousRegistry := s.captureProxySnapshot("")
++	// clearChanging 的职责已内联到各成功/失败分支：每个分支都按实际操作结果
++	// 决定提交什么状态，避免"提前提交"或"回滚过头"。
+ 
++	// 记录关闭前的真实注册表状态，失败时用于回滚。
++	var previousRegistry proxyBackup
+ 	if on {
+-		// TUN 已经接管全部出站流量，此时如果系统代理还开着，
+-		// 浏览器会先连本地代理端口、再由 TUN 转发一次，等于代理两遍。
+-		// 先完整还原我们接管前的配置，再把系统代理关闭。
+-		if prevProxyOn || prevBackup.Saved {
+-			if err := s.restoreSystemProxy(); err != nil {
+-				// 恢复失败时不要继续切 TUN：否则用户既没了代理也没了原配置。
+-				s.mu.Lock()
++		prepErr := s.withProxyTx(0, nil, func() error {
++			previousRegistry = s.captureProxySnapshot("")
++
++			// TUN 已经接管全部出站流量，此时系统代理必须完整还原并关闭，
++			// 否则浏览器会先连本地代理端口、再由 TUN 转发一次。
++			if prevProxyOn || prevBackup.Saved {
++				if err := s.restoreSystemProxyLocked(); err != nil {
++					return fmt.Errorf("%w: %v", errTUNRestoreFailed, err)
++				}
++			}
++			if err := s.proxyOps().Disable(); err != nil {
++				_ = s.applyProxySnapshot(previousRegistry)
++				return fmt.Errorf("关闭系统代理失败，已回滚: %w", err)
++			}
++			// WinHTTP 也是系统代理类接管，TUN 生效前必须还原，避免双代理。
++			if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
++				_ = s.applyProxySnapshot(previousRegistry)
++				return fmt.Errorf("切换 TUN 前还原 WinHTTP 失败: %w", err)
++			}
++			return nil
++		})
++		if prepErr != nil {
++			s.mu.Lock()
++			s.tunChanging = false
++			if errors.Is(prepErr, errTUNRestoreFailed) {
++				// 恢复事务可能已经把 Pending 备份落盘；保留它，交给下次启动重试。
++				// 此时不能再声称系统代理仍由本程序接管。
++				s.proxyOn = false
++			} else {
++				// 注册表已回滚到切换前，内存状态也回到切换前。
+ 				s.proxyOn = prevProxyOn
+ 				s.backup = prevBackup
+-				s.mu.Unlock()
+-				return fmt.Errorf("切换 TUN 前恢复系统代理失败: %w", err)
++				s.tunPrevProxyOn = prevTunPrevProxy
+ 			}
+-		}
+-		if err := s.proxyOps().Disable(); err != nil {
+-			_ = s.applyProxySnapshot(previousRegistry)
+-			s.mu.Lock()
+-			s.proxyOn = prevProxyOn
+-			s.backup = prevBackup
+ 			s.mu.Unlock()
+-			return fmt.Errorf("关闭系统代理失败，已回滚: %w", err)
+-		}
+-		// WinHTTP 也是系统代理类接管，TUN 生效前必须还原，避免双代理。
+-		if err := s.restoreWinHTTPIfPending(); err != nil {
+-			_ = s.applyProxySnapshot(previousRegistry)
+-			s.mu.Lock()
+-			s.proxyOn = prevProxyOn
+-			s.backup = prevBackup
+-			s.mu.Unlock()
+-			return fmt.Errorf("切换 TUN 前还原 WinHTTP 失败: %w", err)
++			s.saveAppState()
++			return prepErr
+ 		}
+-
+-		s.mu.Lock()
+-		s.tunOn = true
+-		s.proxyOn = false
+-		s.backup = proxyBackup{}
+-		// 只有"本来由我们接管"的系统代理才在关闭 TUN 后自动恢复。
+-		s.tunPrevProxyOn = prevProxyOn
+-		s.mu.Unlock()
+-	} else {
+-		s.mu.Lock()
+-		s.tunOn = false
+-		s.mu.Unlock()
+ 	}
+ 
+ 	if s.kernelRunning() {
+ 		if err := restart(); err != nil {
+-			// 重启可能已经停掉旧内核。回滚时先确认内核是否还在跑：
+-			// 在跑就按原意图恢复 TUN；已经停了 TUN 实际就是关闭状态，
+-			// 不能把 tunOn 回滚成 true 造成 UI 与实际脱节。
+ 			kernelAlive := s.kernelRunning()
+ 			s.mu.Lock()
++			s.tunChanging = false
++			// 只有确认旧内核还活着，才能声称 TUN 仍处于原状态；
++			// 内核已经停了就如实记为关闭，不能欺骗 UI。
+ 			s.tunOn = prevTUN && kernelAlive
++			s.tunPrevProxyOn = prevTunPrevProxy
+ 			s.proxyOn = false
+ 			s.backup = proxyBackup{}
+-			s.tunPrevProxyOn = prevTunPrevProxy
++			// 把"应该恢复系统代理"的意图留给下次启动：
++			//   - 关 TUN 失败：TUN 开启时临时关掉的代理还没恢复；
++			//   - 开 TUN 失败且内核已死：无法当场重新接管。
++			if !on && prevTunPrevProxy {
++				s.restoreProxy = true
++			} else if on && !kernelAlive {
++				s.restoreProxy = prevProxyOn
++			}
+ 			s.mu.Unlock()
+ 			s.saveAppState()
+ 
+-			if prevProxyOn {
+-				if kernelAlive {
+-					// 旧内核还在，可以重新接管；让 SetSystemProxy 重新采集
+-					// 当前（已还原的）注册表作为新的还原点。
++			if on {
++				// 开启失败：把注册表恢复到切换前，能接管就重新接管系统代理。
++				if prevProxyOn && kernelAlive {
+ 					if e := s.SetSystemProxy(true); e != nil {
+ 						s.dbg("TUN rollback re-enable proxy failed: %v", e)
+ 						_ = s.applyProxySnapshot(prevBackup)
+ 					}
++				} else if kernelAlive {
++					_ = s.applyProxySnapshot(previousRegistry)
+ 				} else {
++					// 内核已停：绝不能留下指向死端口的系统代理。
+ 					_ = s.applyProxySnapshot(prevBackup)
+ 				}
+-			} else {
+-				_ = s.applyProxySnapshot(previousRegistry)
+ 			}
++			// 关闭 TUN 失败：保持原配置可用，不宣称系统代理已恢复。
+ 			return fmt.Errorf("切换失败，已回滚: %w", err)
+ 		}
+ 	}
+ 
+-	// 关闭 TUN 成功后，如果系统代理原本是我们在接管，就重新打开。
+-	if !on && s.tunPrevProxyOn {
++	if on {
++		// 重启成功：现在才提交"TUN 已生效"。
+ 		s.mu.Lock()
+-		s.tunPrevProxyOn = false
++		s.tunChanging = false
++		s.tunOn = true
++		s.proxyOn = false
++		s.backup = proxyBackup{}
++		// 只有"本来由我们接管"的系统代理才在关闭 TUN 后自动恢复。
++		s.tunPrevProxyOn = prevProxyOn
+ 		s.mu.Unlock()
++		s.saveAppState()
++		return nil
++	}
++
++	// 关闭 TUN 成功：提交 tunOn=false，再按需恢复系统代理接管。
++	s.mu.Lock()
++	s.tunChanging = false
++	s.tunOn = false
++	wantProxy := s.tunPrevProxyOn
++	s.tunPrevProxyOn = false
++	s.mu.Unlock()
++	s.saveAppState()
++
++	if wantProxy {
+ 		if s.kernelRunning() {
+ 			if err := s.SetSystemProxy(true); err != nil {
+ 				s.saveAppState()
+ 				return fmt.Errorf("TUN 已关闭，但恢复系统代理失败: %w", err)
+ 			}
++		} else {
++			// 内核没在跑就无法当场接管；把意图写入启动恢复流程，
++			// 不能像以前那样直接丢掉。
++			s.mu.Lock()
++			s.restoreProxy = true
++			s.mu.Unlock()
++			s.saveAppState()
+ 		}
+ 	}
+-
+-	s.saveAppState()
+ 	return nil
+ }
+ 
+@@ -3418,6 +3512,9 @@ type appState struct {
+ 	HomeLon   *float64 `json:"homeLon,omitempty"`
+ 	HomeLat   *float64 `json:"homeLat,omitempty"`
+ 	HomeLabel string   `json:"homeLabel,omitempty"`
++
++	// Version 用于识别未来版本写下的配置。旧文件没有该字段，按 0 处理。
++	Version int `json:"version,omitempty"`
+ }
+ 
+ type subMeta struct {
+@@ -3439,6 +3536,8 @@ type subMeta struct {
+ type subsStore struct {
+ 	Items  []subMeta `json:"items"`
+ 	Active int       `json:"active"`
++	// Version 同 appState：用于识别未来版本，旧文件按 0 处理。
++	Version int `json:"version,omitempty"`
+ }
+ 
+ // subFileName 为每个订阅的原始配置起个稳定文件名。
+@@ -3469,16 +3568,23 @@ func (s *CoreService) writeSubscriptionFiles(url string, res *subscription.Resul
+ }
+ 
+ func (s *CoreService) loadSubs() {
+-	dir := dataDir()
+-	b, err := os.ReadFile(filepath.Join(dir, subsFile))
+-	if err != nil {
++	path := filepath.Join(dataDir(), subsFile)
++	var st subsStore
++	state, err := readConfigJSON(path, &st)
++	switch state {
++	case configMissing:
+ 		// 没有多订阅文件：看有没有旧的单订阅文件，有就迁移成列表的第 0 个。
+ 		s.migrateSingleSub()
+ 		return
++	case configOK:
++	default:
++		// 损坏/空文件必须保留原文件并提示，不能当作空订阅继续，
++		// 否则下一次 saveSubs 会把用户全部订阅覆盖掉。
++		s.reportConfigProblem(path, state, err)
++		return
+ 	}
+-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+-	var st subsStore
+-	if err := json.Unmarshal(b, &st); err != nil {
++	if configVersionUnsupported(st.Version) {
++		s.reportConfigProblem(path, configUnsupported, nil)
+ 		return
+ 	}
+ 	if len(st.Items) == 0 {
+@@ -3497,13 +3603,17 @@ func (s *CoreService) loadSubs() {
+ // 让升级后不用重新填一遍地址。
+ func (s *CoreService) migrateSingleSub() {
+ 	dir := dataDir()
+-	mb, err := os.ReadFile(filepath.Join(dir, subMetaFile))
+-	if err != nil {
++	path := filepath.Join(dir, subMetaFile)
++	var m subMeta
++	state, err := readConfigJSON(path, &m)
++	if state == configMissing {
+ 		return
+ 	}
+-	mb = bytes.TrimPrefix(mb, []byte{0xEF, 0xBB, 0xBF})
+-	var m subMeta
+-	if err := json.Unmarshal(mb, &m); err != nil || m.URL == "" {
++	if state != configOK {
++		s.reportConfigProblem(path, state, err)
++		return
++	}
++	if m.URL == "" {
+ 		return
+ 	}
+ 	// 把当前那份原始配置搬到 per-subscription 文件。
+@@ -3519,7 +3629,7 @@ func (s *CoreService) migrateSingleSub() {
+ 
+ func (s *CoreService) saveSubs() {
+ 	s.mu.RLock()
+-	st := subsStore{Items: s.subs, Active: s.activeIdx}
++	st := subsStore{Items: s.subs, Active: s.activeIdx, Version: currentConfigVersion}
+ 	s.mu.RUnlock()
+ 	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
+ 		if err := writeFileAtomic(filepath.Join(dataDir(), subsFile), mb, 0o600); err != nil {
+@@ -3553,9 +3663,12 @@ func (s *CoreService) ListSubscriptions() map[string]any {
+ 
+ // SwitchSubscription 切到另一个已保存的订阅。
+ func (s *CoreService) SwitchSubscription(idx int) error {
++	s.subsMu.Lock()
++
+ 	s.mu.RLock()
+ 	if idx < 0 || idx >= len(s.subs) {
+ 		s.mu.RUnlock()
++		s.subsMu.Unlock()
+ 		return fmt.Errorf("订阅序号越界: %d", idx)
+ 	}
+ 	meta := s.subs[idx]
+@@ -3563,14 +3676,17 @@ func (s *CoreService) SwitchSubscription(idx int) error {
+ 
+ 	b, err := os.ReadFile(filepath.Join(dataDir(), subFileName(meta.URL)))
+ 	if err != nil {
++		s.subsMu.Unlock()
+ 		return fmt.Errorf("找不到该订阅的本地配置，请点刷新重新拉取: %w", err)
+ 	}
+ 	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+ 	res, err := subscription.Parse(b, meta.URL, meta.Insecure)
+ 	if err != nil {
++		s.subsMu.Unlock()
+ 		return fmt.Errorf("订阅配置损坏: %w", err)
+ 	}
+ 	if err := s.writeSubscriptionFiles(meta.URL, res); err != nil {
++		s.subsMu.Unlock()
+ 		return err
+ 	}
+ 
+@@ -3586,6 +3702,8 @@ func (s *CoreService) SwitchSubscription(idx int) error {
+ 	s.mu.Unlock()
+ 
+ 	s.saveSubs()
++	s.subsMu.Unlock()
++
+ 	_ = s.writeProcRulesYAML()
+ 	if s.mgr != nil && s.mgr.IsRunning() {
+ 		return s.RestartKernel()
+@@ -3668,6 +3786,7 @@ func (s *CoreService) RemoveSubscriptionByURL(url string) error {
+ // removeSubscription 是删除的统一实现。expectURL 非空时在同一个锁内按 URL
+ // 重新定位下标，彻底避开"校验完到删除之间列表变了"的竞态。
+ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
++	s.subsMu.Lock()
+ 	s.mu.Lock()
+ 	if expectURL != "" {
+ 		idx = -1
+@@ -3679,12 +3798,14 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
+ 		}
+ 		if idx < 0 {
+ 			s.mu.Unlock()
++			s.subsMu.Unlock()
+ 			return fmt.Errorf("找不到该订阅（可能已被删除）")
+ 		}
+ 	}
+ 	if idx < 0 || idx >= len(s.subs) {
+ 		n := len(s.subs)
+ 		s.mu.Unlock()
++		s.subsMu.Unlock()
+ 		return fmt.Errorf("订阅序号越界: %d（当前共 %d 个）", idx, n)
+ 	}
+ 	removed := s.subs[idx]
+@@ -3715,11 +3836,14 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
+ 
+ 	// 删掉的不是激活订阅，当前配置不受影响，不用重启。
+ 	if !wasActive {
++		s.subsMu.Unlock()
+ 		return nil
+ 	}
+ 
+ 	// 删的是当前订阅：切到剩余的第一个。
++	// SwitchSubscription 会自己取 subsMu，必须先释放。
+ 	if remaining > 0 {
++		s.subsMu.Unlock()
+ 		return s.SwitchSubscription(0)
+ 	}
+ 	_ = os.Remove(filepath.Join(dataDir(), subConfigFile))
+@@ -3732,6 +3856,7 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
+ 	s.subRaw = nil
+ 	s.subInfo = SubInfo{}
+ 	s.mu.Unlock()
++	s.subsMu.Unlock()
+ 	if s.mgr != nil && s.mgr.IsRunning() {
+ 		return s.RestartKernel()
+ 	}
+@@ -3856,6 +3981,18 @@ func (s *CoreService) loadSavedSubscription() {
+ 
+ // Subscribe 拉取订阅、落盘，并重启内核让新节点生效。
+ func (s *CoreService) Subscribe(url string) error {
++	return s.subscribe(url, "")
++}
++
++// errSubscriptionChanged 表示等待网络期间用户切换了订阅，本次结果必须放弃，
++// 不能把用户刚切到的订阅又覆盖回去。
++var errSubscriptionChanged = errors.New("订阅已在等待期间切换，本次结果已放弃")
++
++// fetchSubscription 是网络拉取的注入点，测试用它制造"下载尚未返回"的窗口。
++var fetchSubscription = subscription.Fetch
++
++// subscribe 内部实现。expectActive 非空时，要求提交那一刻激活订阅仍是它。
++func (s *CoreService) subscribe(url, expectActive string) error {
+ 	url = strings.TrimSpace(url)
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+@@ -3872,7 +4009,8 @@ func (s *CoreService) Subscribe(url string) error {
+ 	}
+ 	s.mu.RUnlock()
+ 
+-	res, err := subscription.Fetch(ctx, url, allowInsecure)
++	// 网络下载不持有 subsMu：刷新失败时其他订阅操作不能被卡住。
++	res, err := fetchSubscription(ctx, url, allowInsecure)
+ 	if err != nil {
+ 		s.mu.Lock()
+ 		s.subInfo.Error = err.Error()
+@@ -3880,24 +4018,44 @@ func (s *CoreService) Subscribe(url string) error {
+ 		return err
+ 	}
+ 
+-	return s.applySubscription(url, res)
++	return s.applySubscriptionExpect(url, res, expectActive)
+ }
+ 
+ // applySubscription 把已拉取/解析好的订阅落盘并设为激活。
+ // 单独抽出来供自动更新复用：避免自动更新时再拉一次同样的内容。
+ func (s *CoreService) applySubscription(url string, res *subscription.Result) error {
++	return s.applySubscriptionExpect(url, res, "")
++}
++
++// applySubscriptionExpect 的 expectActive 用于刷新/自动更新：
++// 提交前若发现激活订阅已经变了，放弃本次激活，只保留已下载内容的元信息更新。
++//
++// 落盘与内存提交都在 subsMu 内完成，因此"刷新 A"与"切换 B"不会交错；
++// 内核重启在释放 subsMu 之后执行，避免长时间持锁。
++func (s *CoreService) applySubscriptionExpect(url string, res *subscription.Result, expectActive string) error {
++	s.subsMu.Lock()
++
++	if expectActive != "" && s.currentSubURL() != expectActive {
++		s.subsMu.Unlock()
++		s.dbg("订阅 %s 的刷新结果已过期（激活订阅已切换），放弃激活", url)
++		return errSubscriptionChanged
++	}
++
+ 	dir := dataDir()
+ 	if err := s.writeSubscriptionFiles(url, res); err != nil {
++		s.subsMu.Unlock()
+ 		return err
+ 	}
+ 	// 同时维护一份"当前订阅"，兼容旧路径与迁移。
+ 	if err := writeFileAtomic(filepath.Join(dir, subConfigFile), res.Raw, 0o600); err != nil {
++		s.subsMu.Unlock()
+ 		return fmt.Errorf("保存当前订阅失败: %w", err)
+ 	}
+ 
+ 	meta := subMetaFromResult(url, res)
+ 	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
+ 		if err := writeFileAtomic(filepath.Join(dir, subMetaFile), mb, 0o600); err != nil {
++			s.subsMu.Unlock()
+ 			return fmt.Errorf("保存订阅元信息失败: %w", err)
+ 		}
+ 	}
+@@ -3912,6 +4070,9 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
+ 		}
+ 	}
+ 	if idx >= 0 {
++		// 用户在等待网络期间可能改了"忽略证书校验"，以内存中的最新意图为准，
++		// 不能被本次下载开始时的旧值覆盖。
++		meta.Insecure = s.subs[idx].Insecure
+ 		s.subs[idx] = meta
+ 	} else {
+ 		s.subs = append(s.subs, meta)
+@@ -3926,6 +4087,7 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
+ 	s.mu.Unlock()
+ 
+ 	s.saveSubs()
++	s.subsMu.Unlock()
+ 
+ 	// 订阅里的组名可能变了，进程规则的出口要跟着重写。
+ 	_ = s.writeProcRulesYAML()
+@@ -3937,6 +4099,13 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
+ 	return nil
+ }
+ 
++// currentSubURL 读当前激活订阅地址。
++func (s *CoreService) currentSubURL() string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.subURL
++}
++
+ // Subscription 返回当前订阅的元信息。
+ func (s *CoreService) Subscription() SubInfo {
+ 	s.mu.RLock()
+@@ -3953,12 +4122,14 @@ func (s *CoreService) RefreshSubscription() error {
+ 	if url == "" {
+ 		return fmt.Errorf("还没有添加订阅")
+ 	}
+-	return s.Subscribe(url)
++	// 等待网络期间用户可能切走订阅：提交时要求激活订阅仍是它。
++	return s.subscribe(url, url)
+ }
+ 
+ // ClearSubscription 移除订阅，回到内置的直连配置。
+ func (s *CoreService) ClearSubscription() error {
+ 	dir := dataDir()
++	s.subsMu.Lock()
+ 	s.mu.RLock()
+ 	url := s.subURL
+ 	s.mu.RUnlock()
+@@ -3973,6 +4144,7 @@ func (s *CoreService) ClearSubscription() error {
+ 	s.subConfig = nil
+ 	s.subInfo = SubInfo{}
+ 	s.mu.Unlock()
++	s.subsMu.Unlock()
+ 
+ 	if s.mgr != nil && s.mgr.IsRunning() {
+ 		return s.RestartKernel()
+@@ -4269,25 +4441,35 @@ func normalizeProcRules(in map[string]string) (map[string]string, bool) {
+ 	return out, changed
+ }
+ 
+-// persistProcRules 把当前规则表落盘。调用方负责处理写失败。
++// persistProcRules 把当前规则表作为新版本发布。调用方负责处理写失败。
+ func (s *CoreService) persistProcRules() error {
+-	mb, err := json.MarshalIndent(s.ProcessRules(), "", "  ")
+-	if err != nil {
+-		return err
+-	}
+-	return writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
++	return s.publishProcRules(s.ProcessRules())
+ }
+ 
+ func (s *CoreService) loadProcRules() {
+-	b, err := os.ReadFile(filepath.Join(dataDir(), procRulesJSON))
+-	if err != nil {
++	// 优先加载已发布且哈希校验通过的 generation；这一代三个文件必定同源。
++	if paths, rules, ok := s.resolvePublishedProcRules(); ok {
++		s.setProcGenPaths(paths)
++		s.applyLoadedProcRules(rules)
+ 		return
+ 	}
+-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
++
++	// 没有可用 generation：回退旧版平铺文件（兼容升级前的数据）。
++	s.setProcGenPaths(nil)
++	path := filepath.Join(dataDir(), procRulesJSON)
+ 	var m map[string]string
+-	if err := json.Unmarshal(b, &m); err != nil {
++	state, err := readConfigJSON(path, &m)
++	if state == configMissing {
++		return
++	}
++	if state != configOK {
++		s.reportConfigProblem(path, state, err)
+ 		return
+ 	}
++	s.applyLoadedProcRules(m)
++}
++
++func (s *CoreService) applyLoadedProcRules(m map[string]string) {
+ 	normalized, changed := normalizeProcRules(m)
+ 
+ 	s.mu.Lock()
+@@ -4332,14 +4514,14 @@ func normalizeSiteRuleList(in []SiteRule) []SiteRule {
+ }
+ 
+ func (s *CoreService) loadSiteRules() {
+-	b, err := os.ReadFile(filepath.Join(dataDir(), siteRulesJSON))
+-	if err != nil {
++	path := filepath.Join(dataDir(), siteRulesJSON)
++	var stored []SiteRule
++	state, err := readConfigJSON(path, &stored)
++	if state == configMissing {
+ 		return
+ 	}
+-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+-	var stored []SiteRule
+-	if err := json.Unmarshal(b, &stored); err != nil {
+-		s.dbg("read site rules failed: %v", err)
++	if state != configOK {
++		s.reportConfigProblem(path, state, err)
+ 		return
+ 	}
+ 	s.mu.Lock()
+@@ -4358,13 +4540,14 @@ func (s *CoreService) persistSiteRules(rules []SiteRule) error {
+ // loadIgnored 读取"用户已经选择不再提示"的进程列表。
+ // 这个列表是必要的：否则每次开机重启应用，老进程又会被当成新的问一遍。
+ func (s *CoreService) loadIgnored() {
+-	b, err := os.ReadFile(filepath.Join(dataDir(), procIgnoredJSON))
+-	if err != nil {
++	path := filepath.Join(dataDir(), procIgnoredJSON)
++	var m []string
++	state, err := readConfigJSON(path, &m)
++	if state == configMissing {
+ 		return
+ 	}
+-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+-	var m []string
+-	if err := json.Unmarshal(b, &m); err != nil {
++	if state != configOK {
++		s.reportConfigProblem(path, state, err)
+ 		return
+ 	}
+ 	s.mu.Lock()
+@@ -4491,22 +4674,18 @@ func (s *CoreService) writeProcRulesYAML() error {
+ 		snapshot[k] = v
+ 	}
+ 	s.mu.RUnlock()
+-	return s.writeProcRuleSnapshotFiles(snapshot)
++	return s.publishProcRules(snapshot)
+ }
+ 
+-// persistProcRuleSnapshot 把一份候选规则表完整落盘（JSON + 两个 provider）。
+-// 三个文件分别原子写入；全部成功后才由调用方替换内存状态。
++// persistProcRuleSnapshot 把一份候选规则表作为新版本发布（JSON + 两个 provider）。
++// 三个文件先写到同一 generation 目录并校验，最后才原子发布 manifest；
++// 中途失败时 current.json 不变，旧版本继续可用。
+ func (s *CoreService) persistProcRuleSnapshot(rules map[string]string) error {
+-	mb, err := json.MarshalIndent(rules, "", "  ")
+-	if err != nil {
+-		return err
+-	}
+-	if err := writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644); err != nil {
+-		return err
+-	}
+-	return s.writeProcRuleSnapshotFiles(rules)
++	return s.publishProcRules(rules)
+ }
+ 
++// writeProcRuleSnapshotFiles 写旧版平铺 provider 文件。
++// 只作为降级兼容，当前版本通过 procgen 读取。
+ func (s *CoreService) writeProcRuleSnapshotFiles(rules map[string]string) error {
+ 	proxyYAML, directYAML := renderProcRulesPayload(rules)
+ 
+@@ -4520,16 +4699,29 @@ func (s *CoreService) writeProcRuleSnapshotFiles(rules map[string]string) error
+ // ---------- 运行状态持久化 ----------
+ 
+ func (s *CoreService) loadAppState() {
+-	b, err := os.ReadFile(filepath.Join(dataDir(), appStateFile))
+-	if err != nil {
++	path := filepath.Join(dataDir(), appStateFile)
++	var st appState
++	state, err := readConfigJSON(path, &st)
++	// 配置损坏时不能静默按空配置继续：TUN/系统代理/WinHTTP 的恢复线索
++	// 都在这份文件里，必须保留原文件并明确告诉用户。
++	if state == configMissing {
+ 		s.mu.Lock()
+ 		s.mode = "rule"
+ 		s.mu.Unlock()
+ 		return
+ 	}
+-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+-	var st appState
+-	if err := json.Unmarshal(b, &st); err != nil {
++	if state != configOK {
++		s.reportConfigProblem(path, state, err)
++		s.mu.Lock()
++		s.mode = "rule"
++		s.mu.Unlock()
++		return
++	}
++	if configVersionUnsupported(st.Version) {
++		s.reportConfigProblem(path, configUnsupported, nil)
++		s.mu.Lock()
++		s.mode = "rule"
++		s.mu.Unlock()
+ 		return
+ 	}
+ 	s.mu.Lock()
+@@ -4611,6 +4803,7 @@ func (s *CoreService) saveAppState() {
+ 		HomeLon:        &lon,
+ 		HomeLat:        &lat,
+ 		HomeLabel:      s.homeLabel,
++		Version:        currentConfigVersion,
+ 	}
+ 	s.mu.RUnlock()
+ 	if st.Mode == "" {
+@@ -4700,7 +4893,7 @@ func (s *CoreService) maybeAutoRefresh() {
+ 		}
+ 
+ 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+-		res, err := subscription.Fetch(ctx, m.URL, m.Insecure)
++		res, err := fetchSubscription(ctx, m.URL, m.Insecure)
+ 		cancel()
+ 		if err != nil {
+ 			s.dbg("auto refresh skipped (%s): %v", m.URL, err)
+@@ -4721,8 +4914,10 @@ func (s *CoreService) maybeAutoRefresh() {
+ 			s.updateActiveSubMeta(m.URL, res)
+ 			continue
+ 		}
+-		if err := s.applySubscription(m.URL, res); err != nil {
+-			s.dbg("auto refresh apply failed: %v", err)
++		if err := s.applySubscriptionExpect(m.URL, res, m.URL); err != nil {
++			if !errors.Is(err, errSubscriptionChanged) {
++				s.dbg("auto refresh apply failed: %v", err)
++			}
+ 			continue
+ 		}
+ 		// 让前端知道这次是自动更新，不是用户手动刷新。
+@@ -4735,6 +4930,7 @@ func (s *CoreService) maybeAutoRefresh() {
+ // updateActiveSubMeta 内容没变时只刷新配额与时间戳，不重启内核。
+ func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result) {
+ 	meta := subMetaFromResult(url, res)
++	s.subsMu.Lock()
+ 	s.mu.Lock()
+ 	for i := range s.subs {
+ 		if s.subs[i].URL == url {
+@@ -4755,11 +4951,14 @@ func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result)
+ 
+ 	s.saveSubs()
+ 	s.persistSubMeta()
++	s.subsMu.Unlock()
+ }
+ 
+ // applyInactiveSubscription 更新非激活订阅的原文与元信息，不动内核。
+ func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Result) {
++	s.subsMu.Lock()
+ 	if err := s.writeSubscriptionFiles(url, res); err != nil {
++		s.subsMu.Unlock()
+ 		s.dbg("auto refresh save failed (%s): %v", url, err)
+ 		return
+ 	}
+@@ -4775,20 +4974,21 @@ func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Re
+ 	}
+ 	if idx < 0 {
+ 		s.mu.Unlock()
++		s.subsMu.Unlock()
+ 		return
+ 	}
+ 	s.subs[idx] = meta
+ 	becameActive := s.subURL == url
+ 	s.mu.Unlock()
++	s.saveSubs()
++	s.subsMu.Unlock()
+ 
+ 	if becameActive {
+ 		// 等待网络期间用户切到了这个订阅，需要走激活路径重启内核。
+ 		if err := s.applySubscription(url, res); err != nil {
+ 			s.dbg("auto refresh activate failed: %v", err)
+ 		}
+-		return
+ 	}
+-	s.saveSubs()
+ }
+ 
+ // ---------- 网站分流 ----------

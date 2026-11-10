@@ -53,4 +53,50 @@ jobs:
           fi
 
       - name: Go test
-        run: go test ./...
+        run: go test -count=1 ./...
+
+      # repro 标签下的复现/集成测试单独跑，确保故障场景不会回归
+      - name: Go test (repro)
+        run: go test -count=1 -tags repro ./...
+
+      # Windows amd64 编译：确认可执行文件真的能产出，而不是只过单测
+      - name: Windows amd64 build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -o bin/RoutePilot.exe .
+
+  race:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: '1'
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Placeholder assets
+        run: python scripts/fetch-assets.py --placeholders
+
+      # -race 需要 CGO 编译器；Windows runner 默认没有 gcc。
+      - name: Install MinGW
+        run: choco install mingw -y --no-progress
+
+      - name: Go test -race
+        run: go test -race -count=1 ./...

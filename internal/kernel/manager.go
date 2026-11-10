@@ -414,6 +414,24 @@ func (m *Manager) startLocked(configPath string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
 	}
+	// 仅比较 m.run 还不够：waitProcess 先 close(exited) 再抢 m.mu，
+	// 这中间存在窗口——进程已经退出，但 m.run 仍指向 r。
+	// 此时若直接提交 Running，会向调用方谎报"启动成功"。
+	// exited 已关闭说明 cmd.Wait 返回、r.exitErr 已写入（happens-before），
+	// 必须在锁内显式检查，不能靠等待或 sleep。
+	select {
+	case <-r.exited:
+		// 先摘掉 run，避免随后 waitProcess 拿到锁时把状态改回 Stopped，
+		// 或让 Stop/Start 误以为这个已退出的进程仍然受管。
+		if m.run == r {
+			m.run = nil
+		}
+		m.state = StateFailed
+		m.lastErr = exitReason(r.exitErr)
+		m.mu.Unlock()
+		return fmt.Errorf("%w：%s", ErrProcessExited, exitReason(r.exitErr))
+	default:
+	}
 	m.state = StateRunning
 	m.lastErr = ""
 	m.mu.Unlock()

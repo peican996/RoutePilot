@@ -26,6 +26,11 @@ var (
 	ErrBlockedAddress   = errors.New("订阅地址指向受限网络地址")
 	ErrTooManyRedirects = errors.New("订阅重定向次数过多")
 	ErrResponseTooLarge = errors.New("订阅响应体超过大小限制")
+	// ErrCrossHostRedirect 表示订阅试图跳转到不同站点。默认拒绝：
+	// 订阅 URL 通常带 token，跨站跳转等于把凭据路径交给第三方。
+	ErrCrossHostRedirect = errors.New("订阅跨主机重定向已被拒绝")
+	// ErrInsecureRedirect 表示 https 被降级到 http。
+	ErrInsecureRedirect = errors.New("订阅重定向不允许从 https 降级到 http")
 )
 
 // fetchDeps 把网络依赖抽出来，测试可以注入解析结果与底层拨号，
@@ -221,18 +226,46 @@ func newGuardedClient(insecure bool, deps fetchDeps) *http.Client {
 	return &http.Client{
 		Timeout:   deps.timeout,
 		Transport: tr,
+		// 重定向由 doWithDeps 手动跟随：每一次跳转都重建请求头，
+		// 从根上避免 http.Client 自动把带 token 的地址写进 Referer。
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedirects {
-				return fmt.Errorf("%w（超过 %d 次）", ErrTooManyRedirects, maxRedirects)
-			}
-			// 每一次重定向都重新做完整 URL 校验；域名/IP 还会在拨号时
-			// 重新解析并校验，双重防护。
-			if _, err := validateSubscriptionURL(req.URL.String()); err != nil {
-				return fmt.Errorf("重定向目标被拒绝: %w", err)
-			}
-			return nil
+			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// redirectAllowed 决定是否跟随一次重定向，全部校验都返回可诊断的错误。
+//
+// 策略：
+//   - 默认只允许同站跳转（同主机，或一方是另一方的子域）；
+//   - 跨站默认拒绝，防止订阅 token 随跳转落到第三方；
+//   - 禁止 https → http 降级；
+//   - 禁止重定向目标携带 userinfo（会被 Go 自动转成 Authorization）。
+func redirectAllowed(prev, next *url.URL) error {
+	if next.User != nil {
+		return fmt.Errorf("%w: 重定向目标携带 userinfo", ErrBlockedAddress)
+	}
+	if prev.Scheme == "https" && next.Scheme != "https" {
+		return fmt.Errorf("%w: %s → %s", ErrInsecureRedirect, prev.Scheme, next.Scheme)
+	}
+	if !sameSiteHost(prev.Hostname(), next.Hostname()) {
+		return fmt.Errorf("%w: %s → %s", ErrCrossHostRedirect, prev.Hostname(), next.Hostname())
+	}
+	return nil
+}
+
+// sameSiteHost 判断两个主机是否属于同一站点：相等，或存在父子域关系。
+// 用标签边界比较，避免 evil-example.com 被当成 example.com 的子域。
+func sameSiteHost(a, b string) bool {
+	a = strings.ToLower(strings.TrimSuffix(a, "."))
+	b = strings.ToLower(strings.TrimSuffix(b, "."))
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	return strings.HasSuffix(a, "."+b) || strings.HasSuffix(b, "."+a)
 }
 
 func isNumericHost(host string) bool {

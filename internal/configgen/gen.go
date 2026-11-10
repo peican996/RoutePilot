@@ -25,6 +25,11 @@ type Options struct {
 	// 规则内容由上层动态写文件，改完通过 API 热刷新，不重载整个配置。
 	ProcessRules bool
 
+	// ProcessProxyPath / ProcessDirectPath 是进程规则 provider 的文件路径。
+	// 上层用 generation 目录发布时传入版本化路径；为空时回退旧版平铺文件。
+	ProcessProxyPath  string
+	ProcessDirectPath string
+
 	// ProcessCustomRules 是"进程 → 指定节点/策略组"的直接规则，例如
 	// PROCESS-NAME,chrome.exe,nx-pp-xxxx。改这部分需要重载配置，
 	// 但不需要重启内核进程。
@@ -259,16 +264,24 @@ func Build(o Options) map[string]any {
 	// 所以按策略拆成两个 provider，而不是把出口写进规则里。
 	var prepend []any
 	if o.ProcessRules {
+		directPath := o.ProcessDirectPath
+		if directPath == "" {
+			directPath = "./process-direct.yaml"
+		}
+		proxyPath := o.ProcessProxyPath
+		if proxyPath == "" {
+			proxyPath = "./process-proxy.yaml"
+		}
 		providers := map[string]any{
 			"pp-direct": map[string]any{
-				"type": "file", "behavior": "classical", "path": "./process-direct.yaml",
+				"type": "file", "behavior": "classical", "path": directPath,
 			},
 		}
 		prepend = append(prepend, "RULE-SET,pp-direct,DIRECT")
 
 		if group := MainProxyGroup(cfg); group != "" {
 			providers["pp-proxy"] = map[string]any{
-				"type": "file", "behavior": "classical", "path": "./process-proxy.yaml",
+				"type": "file", "behavior": "classical", "path": proxyPath,
 			}
 			prepend = append(prepend, fmt.Sprintf("RULE-SET,pp-proxy,%s", group))
 		}

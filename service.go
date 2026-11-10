@@ -183,7 +183,7 @@ type CoreService struct {
 	shuttingDown bool
 
 	// proxyMu 串行化所有系统代理事务：用户手动开关、启动后的端口校正、
-	// Stop/Shutdown 的还原、看门狗熔断恢复。
+	// Stop/Shutdown 的还原、看门狗熔断恢复、TUN 切换中的代理部分。
 	//
 	// 锁顺序（必须遵守，否则会死锁）：
 	//
@@ -192,6 +192,29 @@ type CoreService struct {
 	// 反例：afterStart 在代理事务里绝不能再取 lifeMu；它只持有 proxyMu。
 	// 持有 s.mu 期间禁止做注册表 I/O——那可能耗时数十毫秒并阻塞 Status 轮询。
 	proxyMu sync.Mutex
+
+	// tunChanging/tunTarget 表示一次 TUN 切换事务正在进行以及目标状态。
+	// 注册表操作、内核重启、失败回滚都可能耗时，期间必须阻止并发的
+	// SetSystemProxy(true)/reconcileProxy 重新打开系统代理，否则会出现
+	// TUN 与系统代理同时生效的"双接管"。
+	// 真正生效的 tunOn 只在重启成功后才提交。
+	tunChanging bool
+	tunTarget   bool
+
+	// subsMu 串行化订阅事务的提交阶段：刷新、切换、删除、清空、自动更新
+	// 都要经过它。网络下载必须在持锁之前完成，锁内只做落盘与内存提交，
+	// 保证不会出现"刷新 A 的结果覆盖刚切换到的 B"这类半提交状态。
+	// 锁顺序：subsMu → s.mu；不得在持有 subsMu 时调用 lifeMu 操作，
+	// 因此内核重启放在释放 subsMu 之后。
+	subsMu sync.Mutex
+
+	// procGenMu 串行化进程规则 generation 的发布与清理，避免两个并发
+	// publish 互相删除对方刚写好的文件。
+	procGenMu sync.Mutex
+	// procProxyPath/procDirectPath 是当前已发布 provider 文件在 mihomo
+	// 配置里的相对路径。默认回退到旧版平铺文件。
+	procProxyPath  string
+	procDirectPath string
 
 	// 内核启动代际：每次成功启动生成新 token；Stop/Restart/Shutdown
 	// 使旧 token 失效，防止晚到的 afterStart 修改新实例或已停止的状态。
@@ -259,6 +282,10 @@ func NewCoreService() *CoreService {
 		homeLon:   113.75, // 东莞
 		homeLat:   23.02,
 		homeLabel: "本机",
+		// 默认使用旧版平铺文件；存在已发布的 generation 时由
+		// loadProcRules/publishProcRules 更新为 procgen 路径。
+		procProxyPath:  procProxyYAML,
+		procDirectPath: procDirectYAML,
 	}
 	s.procTracker = procid.NewTracker(procid.WindowsSource(), 5*time.Second)
 	s.procTracker.SetFileIDFunc(procid.FileIdentity)
@@ -638,7 +665,12 @@ func (s *CoreService) options() configgen.Options {
 	// TUN 以当前期望态为准。restoreTUN 只表示"上次退出时开着"，
 	// 用于启动阶段的一次性恢复，不能拿来生成配置——否则会话内开关
 	// TUN 改不动配置，界面显示和实际行为会脱节。
-	wantTUN := s.tunOn && s.admin()
+	// TUN 切换事务进行中时，生成配置必须使用事务目标态，而不是尚未提交的 tunOn。
+	wantTUN := s.tunOn
+	if s.tunChanging {
+		wantTUN = s.tunTarget
+	}
+	wantTUN = wantTUN && s.admin()
 
 	mainGroup := configgen.MainProxyGroup(s.subConfig)
 	procPlan := buildProcessTargetPlan(s.procRules, s.subTargets, s.subProviders)
@@ -653,6 +685,8 @@ func (s *CoreService) options() configgen.Options {
 		Mode:               mode,
 		Tun:                wantTUN,
 		ProcessRules:       true,
+		ProcessProxyPath:   s.procProxyPath,
+		ProcessDirectPath:  s.procDirectPath,
 		ProcessCustomRules: procPlan.Rules,
 		ProcessGroups:      combined.Groups,
 		SiteRules:          sitePlan.Rules,
@@ -1462,6 +1496,10 @@ func (s *CoreService) captureProxySnapshot(addr string) proxyBackup {
 // errProxyStale 表示本次代理事务属于已经失效的内核代际，必须放弃。
 var errProxyStale = errors.New("启动代际已失效，放弃系统代理操作")
 
+// errTUNRestoreFailed 标记"切 TUN 前恢复系统代理失败"。这类失败必须保留
+// 恢复事务写下的 Pending 备份，不能像普通回滚那样把内存备份还原成旧值。
+var errTUNRestoreFailed = errors.New("切换 TUN 前恢复系统代理失败")
+
 // withProxyTx 是所有系统代理事务的唯一入口：先取 proxyMu，再校验代际，
 // 最后执行注册表 I/O。生命周期操作（Stop/Restart/Shutdown）在 proxyMu
 // 之外先失效代际，因此：
@@ -1511,8 +1549,14 @@ func (s *CoreService) setSystemProxyLocked(on bool, genOK func() bool) error {
 		// 界面里的开关会禁用，但托盘菜单里的没禁，所以这里也必须拦一道。
 		s.mu.RLock()
 		tun := s.tunOn
+		tunChanging := s.tunChanging
 		bk := s.backup
 		s.mu.RUnlock()
+		if tunChanging {
+			// TUN 正在切换：此刻注册表可能已被关闭，但 tunOn 尚未提交。
+			// 必须拒绝，否则改造完成后会出现 TUN 与系统代理同时接管。
+			return fmt.Errorf("TUN 正在切换，请稍后重试")
+		}
 		if tun {
 			return fmt.Errorf("TUN 已开启，正在接管全部流量，请先关闭 TUN")
 		}
@@ -1936,6 +1980,13 @@ func (s *CoreService) reconcileProxyForGeneration(gen uint64, ctx context.Contex
 
 // reconcileProxyLocked 的调用方必须已持有 proxyMu。
 func (s *CoreService) reconcileProxyLocked() {
+	// TUN 正在切换时，注册表与 tunOn 处于中间态，任何"校正"都可能造成双接管。
+	s.mu.RLock()
+	tunChanging := s.tunChanging
+	s.mu.RUnlock()
+	if tunChanging {
+		return
+	}
 	// TUN 已接管全部流量时，系统代理必须保持关闭。
 	if s.TUNState() {
 		return
@@ -2037,115 +2088,158 @@ func (s *CoreService) SetTUN(on bool) error {
 }
 
 // setTUN 把内核重启抽成参数，便于故障注入测试验证回滚路径。
+//
+// 状态转换（只有实际操作成功后才提交内存状态）：
+//
+//	关闭 → 开启：恢复并关闭系统代理/WinHTTP → 重启内核(配置含 TUN) → tunOn=true
+//	开启 → 关闭：重启内核(配置无 TUN) → tunOn=false → 按需重新接管系统代理
+//
+// 整个过程中 tunChanging=true，并发的 SetSystemProxy(true) 与 reconcileProxy
+// 都会被拒绝/跳过，避免出现"TUN 打开但系统代理也被重新打开"的双接管。
+// 注册表部分在 proxyMu 内完成；内核重启不能持有 proxyMu（afterStart 需要它）。
 func (s *CoreService) setTUN(on bool, restart func() error) error {
 	if on && !s.admin() {
 		return fmt.Errorf("开启 TUN 需要管理员权限")
 	}
 
-	// 先记住原状态。内核重启失败时要整体回滚——
-	// 不能出现"界面上写着开启、实际没启用"这种脱节。
-	s.mu.RLock()
+	s.mu.Lock()
+	if s.tunChanging {
+		s.mu.Unlock()
+		return fmt.Errorf("TUN 正在切换，请稍后重试")
+	}
+	s.tunChanging = true
+	s.tunTarget = on
 	prevTUN := s.tunOn
 	prevProxyOn := s.proxyOn
 	prevBackup := s.backup
 	prevTunPrevProxy := s.tunPrevProxyOn
-	s.mu.RUnlock()
+	s.mu.Unlock()
 
-	// 记录关闭系统代理前的真实注册表状态。TUN 开启失败时用它回滚，
-	// 避免把用户/外部软件原本的代理设置弄丢。
-	previousRegistry := s.captureProxySnapshot("")
+	// clearChanging 的职责已内联到各成功/失败分支：每个分支都按实际操作结果
+	// 决定提交什么状态，避免"提前提交"或"回滚过头"。
 
+	// 记录关闭前的真实注册表状态，失败时用于回滚。
+	var previousRegistry proxyBackup
 	if on {
-		// TUN 已经接管全部出站流量，此时如果系统代理还开着，
-		// 浏览器会先连本地代理端口、再由 TUN 转发一次，等于代理两遍。
-		// 先完整还原我们接管前的配置，再把系统代理关闭。
-		if prevProxyOn || prevBackup.Saved {
-			if err := s.restoreSystemProxy(); err != nil {
-				// 恢复失败时不要继续切 TUN：否则用户既没了代理也没了原配置。
-				s.mu.Lock()
+		prepErr := s.withProxyTx(0, nil, func() error {
+			previousRegistry = s.captureProxySnapshot("")
+
+			// TUN 已经接管全部出站流量，此时系统代理必须完整还原并关闭，
+			// 否则浏览器会先连本地代理端口、再由 TUN 转发一次。
+			if prevProxyOn || prevBackup.Saved {
+				if err := s.restoreSystemProxyLocked(); err != nil {
+					return fmt.Errorf("%w: %v", errTUNRestoreFailed, err)
+				}
+			}
+			if err := s.proxyOps().Disable(); err != nil {
+				_ = s.applyProxySnapshot(previousRegistry)
+				return fmt.Errorf("关闭系统代理失败，已回滚: %w", err)
+			}
+			// WinHTTP 也是系统代理类接管，TUN 生效前必须还原，避免双代理。
+			if err := s.restoreWinHTTPIfPendingLocked(); err != nil {
+				_ = s.applyProxySnapshot(previousRegistry)
+				return fmt.Errorf("切换 TUN 前还原 WinHTTP 失败: %w", err)
+			}
+			return nil
+		})
+		if prepErr != nil {
+			s.mu.Lock()
+			s.tunChanging = false
+			if errors.Is(prepErr, errTUNRestoreFailed) {
+				// 恢复事务可能已经把 Pending 备份落盘；保留它，交给下次启动重试。
+				// 此时不能再声称系统代理仍由本程序接管。
+				s.proxyOn = false
+			} else {
+				// 注册表已回滚到切换前，内存状态也回到切换前。
 				s.proxyOn = prevProxyOn
 				s.backup = prevBackup
-				s.mu.Unlock()
-				return fmt.Errorf("切换 TUN 前恢复系统代理失败: %w", err)
+				s.tunPrevProxyOn = prevTunPrevProxy
 			}
-		}
-		if err := s.proxyOps().Disable(); err != nil {
-			_ = s.applyProxySnapshot(previousRegistry)
-			s.mu.Lock()
-			s.proxyOn = prevProxyOn
-			s.backup = prevBackup
 			s.mu.Unlock()
-			return fmt.Errorf("关闭系统代理失败，已回滚: %w", err)
+			s.saveAppState()
+			return prepErr
 		}
-		// WinHTTP 也是系统代理类接管，TUN 生效前必须还原，避免双代理。
-		if err := s.restoreWinHTTPIfPending(); err != nil {
-			_ = s.applyProxySnapshot(previousRegistry)
-			s.mu.Lock()
-			s.proxyOn = prevProxyOn
-			s.backup = prevBackup
-			s.mu.Unlock()
-			return fmt.Errorf("切换 TUN 前还原 WinHTTP 失败: %w", err)
-		}
+	}
 
+	if s.kernelRunning() {
+		if err := restart(); err != nil {
+			kernelAlive := s.kernelRunning()
+			s.mu.Lock()
+			s.tunChanging = false
+			// 只有确认旧内核还活着，才能声称 TUN 仍处于原状态；
+			// 内核已经停了就如实记为关闭，不能欺骗 UI。
+			s.tunOn = prevTUN && kernelAlive
+			s.tunPrevProxyOn = prevTunPrevProxy
+			s.proxyOn = false
+			s.backup = proxyBackup{}
+			// 把"应该恢复系统代理"的意图留给下次启动：
+			//   - 关 TUN 失败：TUN 开启时临时关掉的代理还没恢复；
+			//   - 开 TUN 失败且内核已死：无法当场重新接管。
+			if !on && prevTunPrevProxy {
+				s.restoreProxy = true
+			} else if on && !kernelAlive {
+				s.restoreProxy = prevProxyOn
+			}
+			s.mu.Unlock()
+			s.saveAppState()
+
+			if on {
+				// 开启失败：把注册表恢复到切换前，能接管就重新接管系统代理。
+				if prevProxyOn && kernelAlive {
+					if e := s.SetSystemProxy(true); e != nil {
+						s.dbg("TUN rollback re-enable proxy failed: %v", e)
+						_ = s.applyProxySnapshot(prevBackup)
+					}
+				} else if kernelAlive {
+					_ = s.applyProxySnapshot(previousRegistry)
+				} else {
+					// 内核已停：绝不能留下指向死端口的系统代理。
+					_ = s.applyProxySnapshot(prevBackup)
+				}
+			}
+			// 关闭 TUN 失败：保持原配置可用，不宣称系统代理已恢复。
+			return fmt.Errorf("切换失败，已回滚: %w", err)
+		}
+	}
+
+	if on {
+		// 重启成功：现在才提交"TUN 已生效"。
 		s.mu.Lock()
+		s.tunChanging = false
 		s.tunOn = true
 		s.proxyOn = false
 		s.backup = proxyBackup{}
 		// 只有"本来由我们接管"的系统代理才在关闭 TUN 后自动恢复。
 		s.tunPrevProxyOn = prevProxyOn
 		s.mu.Unlock()
-	} else {
-		s.mu.Lock()
-		s.tunOn = false
-		s.mu.Unlock()
+		s.saveAppState()
+		return nil
 	}
 
-	if s.kernelRunning() {
-		if err := restart(); err != nil {
-			// 重启可能已经停掉旧内核。回滚时先确认内核是否还在跑：
-			// 在跑就按原意图恢复 TUN；已经停了 TUN 实际就是关闭状态，
-			// 不能把 tunOn 回滚成 true 造成 UI 与实际脱节。
-			kernelAlive := s.kernelRunning()
-			s.mu.Lock()
-			s.tunOn = prevTUN && kernelAlive
-			s.proxyOn = false
-			s.backup = proxyBackup{}
-			s.tunPrevProxyOn = prevTunPrevProxy
-			s.mu.Unlock()
-			s.saveAppState()
+	// 关闭 TUN 成功：提交 tunOn=false，再按需恢复系统代理接管。
+	s.mu.Lock()
+	s.tunChanging = false
+	s.tunOn = false
+	wantProxy := s.tunPrevProxyOn
+	s.tunPrevProxyOn = false
+	s.mu.Unlock()
+	s.saveAppState()
 
-			if prevProxyOn {
-				if kernelAlive {
-					// 旧内核还在，可以重新接管；让 SetSystemProxy 重新采集
-					// 当前（已还原的）注册表作为新的还原点。
-					if e := s.SetSystemProxy(true); e != nil {
-						s.dbg("TUN rollback re-enable proxy failed: %v", e)
-						_ = s.applyProxySnapshot(prevBackup)
-					}
-				} else {
-					_ = s.applyProxySnapshot(prevBackup)
-				}
-			} else {
-				_ = s.applyProxySnapshot(previousRegistry)
-			}
-			return fmt.Errorf("切换失败，已回滚: %w", err)
-		}
-	}
-
-	// 关闭 TUN 成功后，如果系统代理原本是我们在接管，就重新打开。
-	if !on && s.tunPrevProxyOn {
-		s.mu.Lock()
-		s.tunPrevProxyOn = false
-		s.mu.Unlock()
+	if wantProxy {
 		if s.kernelRunning() {
 			if err := s.SetSystemProxy(true); err != nil {
 				s.saveAppState()
 				return fmt.Errorf("TUN 已关闭，但恢复系统代理失败: %w", err)
 			}
+		} else {
+			// 内核没在跑就无法当场接管；把意图写入启动恢复流程，
+			// 不能像以前那样直接丢掉。
+			s.mu.Lock()
+			s.restoreProxy = true
+			s.mu.Unlock()
+			s.saveAppState()
 		}
 	}
-
-	s.saveAppState()
 	return nil
 }
 
@@ -3418,6 +3512,9 @@ type appState struct {
 	HomeLon   *float64 `json:"homeLon,omitempty"`
 	HomeLat   *float64 `json:"homeLat,omitempty"`
 	HomeLabel string   `json:"homeLabel,omitempty"`
+
+	// Version 用于识别未来版本写下的配置。旧文件没有该字段，按 0 处理。
+	Version int `json:"version,omitempty"`
 }
 
 type subMeta struct {
@@ -3439,6 +3536,8 @@ type subMeta struct {
 type subsStore struct {
 	Items  []subMeta `json:"items"`
 	Active int       `json:"active"`
+	// Version 同 appState：用于识别未来版本，旧文件按 0 处理。
+	Version int `json:"version,omitempty"`
 }
 
 // subFileName 为每个订阅的原始配置起个稳定文件名。
@@ -3469,16 +3568,23 @@ func (s *CoreService) writeSubscriptionFiles(url string, res *subscription.Resul
 }
 
 func (s *CoreService) loadSubs() {
-	dir := dataDir()
-	b, err := os.ReadFile(filepath.Join(dir, subsFile))
-	if err != nil {
+	path := filepath.Join(dataDir(), subsFile)
+	var st subsStore
+	state, err := readConfigJSON(path, &st)
+	switch state {
+	case configMissing:
 		// 没有多订阅文件：看有没有旧的单订阅文件，有就迁移成列表的第 0 个。
 		s.migrateSingleSub()
 		return
+	case configOK:
+	default:
+		// 损坏/空文件必须保留原文件并提示，不能当作空订阅继续，
+		// 否则下一次 saveSubs 会把用户全部订阅覆盖掉。
+		s.reportConfigProblem(path, state, err)
+		return
 	}
-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-	var st subsStore
-	if err := json.Unmarshal(b, &st); err != nil {
+	if configVersionUnsupported(st.Version) {
+		s.reportConfigProblem(path, configUnsupported, nil)
 		return
 	}
 	if len(st.Items) == 0 {
@@ -3497,13 +3603,17 @@ func (s *CoreService) loadSubs() {
 // 让升级后不用重新填一遍地址。
 func (s *CoreService) migrateSingleSub() {
 	dir := dataDir()
-	mb, err := os.ReadFile(filepath.Join(dir, subMetaFile))
-	if err != nil {
+	path := filepath.Join(dir, subMetaFile)
+	var m subMeta
+	state, err := readConfigJSON(path, &m)
+	if state == configMissing {
 		return
 	}
-	mb = bytes.TrimPrefix(mb, []byte{0xEF, 0xBB, 0xBF})
-	var m subMeta
-	if err := json.Unmarshal(mb, &m); err != nil || m.URL == "" {
+	if state != configOK {
+		s.reportConfigProblem(path, state, err)
+		return
+	}
+	if m.URL == "" {
 		return
 	}
 	// 把当前那份原始配置搬到 per-subscription 文件。
@@ -3519,7 +3629,7 @@ func (s *CoreService) migrateSingleSub() {
 
 func (s *CoreService) saveSubs() {
 	s.mu.RLock()
-	st := subsStore{Items: s.subs, Active: s.activeIdx}
+	st := subsStore{Items: s.subs, Active: s.activeIdx, Version: currentConfigVersion}
 	s.mu.RUnlock()
 	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
 		if err := writeFileAtomic(filepath.Join(dataDir(), subsFile), mb, 0o600); err != nil {
@@ -3553,9 +3663,12 @@ func (s *CoreService) ListSubscriptions() map[string]any {
 
 // SwitchSubscription 切到另一个已保存的订阅。
 func (s *CoreService) SwitchSubscription(idx int) error {
+	s.subsMu.Lock()
+
 	s.mu.RLock()
 	if idx < 0 || idx >= len(s.subs) {
 		s.mu.RUnlock()
+		s.subsMu.Unlock()
 		return fmt.Errorf("订阅序号越界: %d", idx)
 	}
 	meta := s.subs[idx]
@@ -3563,14 +3676,17 @@ func (s *CoreService) SwitchSubscription(idx int) error {
 
 	b, err := os.ReadFile(filepath.Join(dataDir(), subFileName(meta.URL)))
 	if err != nil {
+		s.subsMu.Unlock()
 		return fmt.Errorf("找不到该订阅的本地配置，请点刷新重新拉取: %w", err)
 	}
 	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
 	res, err := subscription.Parse(b, meta.URL, meta.Insecure)
 	if err != nil {
+		s.subsMu.Unlock()
 		return fmt.Errorf("订阅配置损坏: %w", err)
 	}
 	if err := s.writeSubscriptionFiles(meta.URL, res); err != nil {
+		s.subsMu.Unlock()
 		return err
 	}
 
@@ -3586,6 +3702,8 @@ func (s *CoreService) SwitchSubscription(idx int) error {
 	s.mu.Unlock()
 
 	s.saveSubs()
+	s.subsMu.Unlock()
+
 	_ = s.writeProcRulesYAML()
 	if s.mgr != nil && s.mgr.IsRunning() {
 		return s.RestartKernel()
@@ -3668,6 +3786,7 @@ func (s *CoreService) RemoveSubscriptionByURL(url string) error {
 // removeSubscription 是删除的统一实现。expectURL 非空时在同一个锁内按 URL
 // 重新定位下标，彻底避开"校验完到删除之间列表变了"的竞态。
 func (s *CoreService) removeSubscription(idx int, expectURL string) error {
+	s.subsMu.Lock()
 	s.mu.Lock()
 	if expectURL != "" {
 		idx = -1
@@ -3679,12 +3798,14 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
 		}
 		if idx < 0 {
 			s.mu.Unlock()
+			s.subsMu.Unlock()
 			return fmt.Errorf("找不到该订阅（可能已被删除）")
 		}
 	}
 	if idx < 0 || idx >= len(s.subs) {
 		n := len(s.subs)
 		s.mu.Unlock()
+		s.subsMu.Unlock()
 		return fmt.Errorf("订阅序号越界: %d（当前共 %d 个）", idx, n)
 	}
 	removed := s.subs[idx]
@@ -3715,11 +3836,14 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
 
 	// 删掉的不是激活订阅，当前配置不受影响，不用重启。
 	if !wasActive {
+		s.subsMu.Unlock()
 		return nil
 	}
 
 	// 删的是当前订阅：切到剩余的第一个。
+	// SwitchSubscription 会自己取 subsMu，必须先释放。
 	if remaining > 0 {
+		s.subsMu.Unlock()
 		return s.SwitchSubscription(0)
 	}
 	_ = os.Remove(filepath.Join(dataDir(), subConfigFile))
@@ -3732,6 +3856,7 @@ func (s *CoreService) removeSubscription(idx int, expectURL string) error {
 	s.subRaw = nil
 	s.subInfo = SubInfo{}
 	s.mu.Unlock()
+	s.subsMu.Unlock()
 	if s.mgr != nil && s.mgr.IsRunning() {
 		return s.RestartKernel()
 	}
@@ -3856,6 +3981,18 @@ func (s *CoreService) loadSavedSubscription() {
 
 // Subscribe 拉取订阅、落盘，并重启内核让新节点生效。
 func (s *CoreService) Subscribe(url string) error {
+	return s.subscribe(url, "")
+}
+
+// errSubscriptionChanged 表示等待网络期间用户切换了订阅，本次结果必须放弃，
+// 不能把用户刚切到的订阅又覆盖回去。
+var errSubscriptionChanged = errors.New("订阅已在等待期间切换，本次结果已放弃")
+
+// fetchSubscription 是网络拉取的注入点，测试用它制造"下载尚未返回"的窗口。
+var fetchSubscription = subscription.Fetch
+
+// subscribe 内部实现。expectActive 非空时，要求提交那一刻激活订阅仍是它。
+func (s *CoreService) subscribe(url, expectActive string) error {
 	url = strings.TrimSpace(url)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -3872,7 +4009,8 @@ func (s *CoreService) Subscribe(url string) error {
 	}
 	s.mu.RUnlock()
 
-	res, err := subscription.Fetch(ctx, url, allowInsecure)
+	// 网络下载不持有 subsMu：刷新失败时其他订阅操作不能被卡住。
+	res, err := fetchSubscription(ctx, url, allowInsecure)
 	if err != nil {
 		s.mu.Lock()
 		s.subInfo.Error = err.Error()
@@ -3880,24 +4018,44 @@ func (s *CoreService) Subscribe(url string) error {
 		return err
 	}
 
-	return s.applySubscription(url, res)
+	return s.applySubscriptionExpect(url, res, expectActive)
 }
 
 // applySubscription 把已拉取/解析好的订阅落盘并设为激活。
 // 单独抽出来供自动更新复用：避免自动更新时再拉一次同样的内容。
 func (s *CoreService) applySubscription(url string, res *subscription.Result) error {
+	return s.applySubscriptionExpect(url, res, "")
+}
+
+// applySubscriptionExpect 的 expectActive 用于刷新/自动更新：
+// 提交前若发现激活订阅已经变了，放弃本次激活，只保留已下载内容的元信息更新。
+//
+// 落盘与内存提交都在 subsMu 内完成，因此"刷新 A"与"切换 B"不会交错；
+// 内核重启在释放 subsMu 之后执行，避免长时间持锁。
+func (s *CoreService) applySubscriptionExpect(url string, res *subscription.Result, expectActive string) error {
+	s.subsMu.Lock()
+
+	if expectActive != "" && s.currentSubURL() != expectActive {
+		s.subsMu.Unlock()
+		s.dbg("订阅 %s 的刷新结果已过期（激活订阅已切换），放弃激活", url)
+		return errSubscriptionChanged
+	}
+
 	dir := dataDir()
 	if err := s.writeSubscriptionFiles(url, res); err != nil {
+		s.subsMu.Unlock()
 		return err
 	}
 	// 同时维护一份"当前订阅"，兼容旧路径与迁移。
 	if err := writeFileAtomic(filepath.Join(dir, subConfigFile), res.Raw, 0o600); err != nil {
+		s.subsMu.Unlock()
 		return fmt.Errorf("保存当前订阅失败: %w", err)
 	}
 
 	meta := subMetaFromResult(url, res)
 	if mb, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		if err := writeFileAtomic(filepath.Join(dir, subMetaFile), mb, 0o600); err != nil {
+			s.subsMu.Unlock()
 			return fmt.Errorf("保存订阅元信息失败: %w", err)
 		}
 	}
@@ -3912,6 +4070,9 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
 		}
 	}
 	if idx >= 0 {
+		// 用户在等待网络期间可能改了"忽略证书校验"，以内存中的最新意图为准，
+		// 不能被本次下载开始时的旧值覆盖。
+		meta.Insecure = s.subs[idx].Insecure
 		s.subs[idx] = meta
 	} else {
 		s.subs = append(s.subs, meta)
@@ -3926,6 +4087,7 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
 	s.mu.Unlock()
 
 	s.saveSubs()
+	s.subsMu.Unlock()
 
 	// 订阅里的组名可能变了，进程规则的出口要跟着重写。
 	_ = s.writeProcRulesYAML()
@@ -3935,6 +4097,13 @@ func (s *CoreService) applySubscription(url string, res *subscription.Result) er
 		return s.RestartKernel()
 	}
 	return nil
+}
+
+// currentSubURL 读当前激活订阅地址。
+func (s *CoreService) currentSubURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.subURL
 }
 
 // Subscription 返回当前订阅的元信息。
@@ -3953,12 +4122,14 @@ func (s *CoreService) RefreshSubscription() error {
 	if url == "" {
 		return fmt.Errorf("还没有添加订阅")
 	}
-	return s.Subscribe(url)
+	// 等待网络期间用户可能切走订阅：提交时要求激活订阅仍是它。
+	return s.subscribe(url, url)
 }
 
 // ClearSubscription 移除订阅，回到内置的直连配置。
 func (s *CoreService) ClearSubscription() error {
 	dir := dataDir()
+	s.subsMu.Lock()
 	s.mu.RLock()
 	url := s.subURL
 	s.mu.RUnlock()
@@ -3973,6 +4144,7 @@ func (s *CoreService) ClearSubscription() error {
 	s.subConfig = nil
 	s.subInfo = SubInfo{}
 	s.mu.Unlock()
+	s.subsMu.Unlock()
 
 	if s.mgr != nil && s.mgr.IsRunning() {
 		return s.RestartKernel()
@@ -4269,25 +4441,35 @@ func normalizeProcRules(in map[string]string) (map[string]string, bool) {
 	return out, changed
 }
 
-// persistProcRules 把当前规则表落盘。调用方负责处理写失败。
+// persistProcRules 把当前规则表作为新版本发布。调用方负责处理写失败。
 func (s *CoreService) persistProcRules() error {
-	mb, err := json.MarshalIndent(s.ProcessRules(), "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644)
+	return s.publishProcRules(s.ProcessRules())
 }
 
 func (s *CoreService) loadProcRules() {
-	b, err := os.ReadFile(filepath.Join(dataDir(), procRulesJSON))
-	if err != nil {
+	// 优先加载已发布且哈希校验通过的 generation；这一代三个文件必定同源。
+	if paths, rules, ok := s.resolvePublishedProcRules(); ok {
+		s.setProcGenPaths(paths)
+		s.applyLoadedProcRules(rules)
 		return
 	}
-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+
+	// 没有可用 generation：回退旧版平铺文件（兼容升级前的数据）。
+	s.setProcGenPaths(nil)
+	path := filepath.Join(dataDir(), procRulesJSON)
 	var m map[string]string
-	if err := json.Unmarshal(b, &m); err != nil {
+	state, err := readConfigJSON(path, &m)
+	if state == configMissing {
 		return
 	}
+	if state != configOK {
+		s.reportConfigProblem(path, state, err)
+		return
+	}
+	s.applyLoadedProcRules(m)
+}
+
+func (s *CoreService) applyLoadedProcRules(m map[string]string) {
 	normalized, changed := normalizeProcRules(m)
 
 	s.mu.Lock()
@@ -4332,14 +4514,14 @@ func normalizeSiteRuleList(in []SiteRule) []SiteRule {
 }
 
 func (s *CoreService) loadSiteRules() {
-	b, err := os.ReadFile(filepath.Join(dataDir(), siteRulesJSON))
-	if err != nil {
+	path := filepath.Join(dataDir(), siteRulesJSON)
+	var stored []SiteRule
+	state, err := readConfigJSON(path, &stored)
+	if state == configMissing {
 		return
 	}
-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-	var stored []SiteRule
-	if err := json.Unmarshal(b, &stored); err != nil {
-		s.dbg("read site rules failed: %v", err)
+	if state != configOK {
+		s.reportConfigProblem(path, state, err)
 		return
 	}
 	s.mu.Lock()
@@ -4358,13 +4540,14 @@ func (s *CoreService) persistSiteRules(rules []SiteRule) error {
 // loadIgnored 读取"用户已经选择不再提示"的进程列表。
 // 这个列表是必要的：否则每次开机重启应用，老进程又会被当成新的问一遍。
 func (s *CoreService) loadIgnored() {
-	b, err := os.ReadFile(filepath.Join(dataDir(), procIgnoredJSON))
-	if err != nil {
+	path := filepath.Join(dataDir(), procIgnoredJSON)
+	var m []string
+	state, err := readConfigJSON(path, &m)
+	if state == configMissing {
 		return
 	}
-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-	var m []string
-	if err := json.Unmarshal(b, &m); err != nil {
+	if state != configOK {
+		s.reportConfigProblem(path, state, err)
 		return
 	}
 	s.mu.Lock()
@@ -4491,22 +4674,18 @@ func (s *CoreService) writeProcRulesYAML() error {
 		snapshot[k] = v
 	}
 	s.mu.RUnlock()
-	return s.writeProcRuleSnapshotFiles(snapshot)
+	return s.publishProcRules(snapshot)
 }
 
-// persistProcRuleSnapshot 把一份候选规则表完整落盘（JSON + 两个 provider）。
-// 三个文件分别原子写入；全部成功后才由调用方替换内存状态。
+// persistProcRuleSnapshot 把一份候选规则表作为新版本发布（JSON + 两个 provider）。
+// 三个文件先写到同一 generation 目录并校验，最后才原子发布 manifest；
+// 中途失败时 current.json 不变，旧版本继续可用。
 func (s *CoreService) persistProcRuleSnapshot(rules map[string]string) error {
-	mb, err := json.MarshalIndent(rules, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := writeFileAtomic(filepath.Join(dataDir(), procRulesJSON), mb, 0o644); err != nil {
-		return err
-	}
-	return s.writeProcRuleSnapshotFiles(rules)
+	return s.publishProcRules(rules)
 }
 
+// writeProcRuleSnapshotFiles 写旧版平铺 provider 文件。
+// 只作为降级兼容，当前版本通过 procgen 读取。
 func (s *CoreService) writeProcRuleSnapshotFiles(rules map[string]string) error {
 	proxyYAML, directYAML := renderProcRulesPayload(rules)
 
@@ -4520,16 +4699,29 @@ func (s *CoreService) writeProcRuleSnapshotFiles(rules map[string]string) error 
 // ---------- 运行状态持久化 ----------
 
 func (s *CoreService) loadAppState() {
-	b, err := os.ReadFile(filepath.Join(dataDir(), appStateFile))
-	if err != nil {
+	path := filepath.Join(dataDir(), appStateFile)
+	var st appState
+	state, err := readConfigJSON(path, &st)
+	// 配置损坏时不能静默按空配置继续：TUN/系统代理/WinHTTP 的恢复线索
+	// 都在这份文件里，必须保留原文件并明确告诉用户。
+	if state == configMissing {
 		s.mu.Lock()
 		s.mode = "rule"
 		s.mu.Unlock()
 		return
 	}
-	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
-	var st appState
-	if err := json.Unmarshal(b, &st); err != nil {
+	if state != configOK {
+		s.reportConfigProblem(path, state, err)
+		s.mu.Lock()
+		s.mode = "rule"
+		s.mu.Unlock()
+		return
+	}
+	if configVersionUnsupported(st.Version) {
+		s.reportConfigProblem(path, configUnsupported, nil)
+		s.mu.Lock()
+		s.mode = "rule"
+		s.mu.Unlock()
 		return
 	}
 	s.mu.Lock()
@@ -4611,6 +4803,7 @@ func (s *CoreService) saveAppState() {
 		HomeLon:        &lon,
 		HomeLat:        &lat,
 		HomeLabel:      s.homeLabel,
+		Version:        currentConfigVersion,
 	}
 	s.mu.RUnlock()
 	if st.Mode == "" {
@@ -4700,7 +4893,7 @@ func (s *CoreService) maybeAutoRefresh() {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		res, err := subscription.Fetch(ctx, m.URL, m.Insecure)
+		res, err := fetchSubscription(ctx, m.URL, m.Insecure)
 		cancel()
 		if err != nil {
 			s.dbg("auto refresh skipped (%s): %v", m.URL, err)
@@ -4721,8 +4914,10 @@ func (s *CoreService) maybeAutoRefresh() {
 			s.updateActiveSubMeta(m.URL, res)
 			continue
 		}
-		if err := s.applySubscription(m.URL, res); err != nil {
-			s.dbg("auto refresh apply failed: %v", err)
+		if err := s.applySubscriptionExpect(m.URL, res, m.URL); err != nil {
+			if !errors.Is(err, errSubscriptionChanged) {
+				s.dbg("auto refresh apply failed: %v", err)
+			}
 			continue
 		}
 		// 让前端知道这次是自动更新，不是用户手动刷新。
@@ -4735,6 +4930,7 @@ func (s *CoreService) maybeAutoRefresh() {
 // updateActiveSubMeta 内容没变时只刷新配额与时间戳，不重启内核。
 func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result) {
 	meta := subMetaFromResult(url, res)
+	s.subsMu.Lock()
 	s.mu.Lock()
 	for i := range s.subs {
 		if s.subs[i].URL == url {
@@ -4755,11 +4951,14 @@ func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result) 
 
 	s.saveSubs()
 	s.persistSubMeta()
+	s.subsMu.Unlock()
 }
 
 // applyInactiveSubscription 更新非激活订阅的原文与元信息，不动内核。
 func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Result) {
+	s.subsMu.Lock()
 	if err := s.writeSubscriptionFiles(url, res); err != nil {
+		s.subsMu.Unlock()
 		s.dbg("auto refresh save failed (%s): %v", url, err)
 		return
 	}
@@ -4775,20 +4974,21 @@ func (s *CoreService) applyInactiveSubscription(url string, res *subscription.Re
 	}
 	if idx < 0 {
 		s.mu.Unlock()
+		s.subsMu.Unlock()
 		return
 	}
 	s.subs[idx] = meta
 	becameActive := s.subURL == url
 	s.mu.Unlock()
+	s.saveSubs()
+	s.subsMu.Unlock()
 
 	if becameActive {
 		// 等待网络期间用户切到了这个订阅，需要走激活路径重启内核。
 		if err := s.applySubscription(url, res); err != nil {
 			s.dbg("auto refresh activate failed: %v", err)
 		}
-		return
 	}
-	s.saveSubs()
 }
 
 // ---------- 网站分流 ----------

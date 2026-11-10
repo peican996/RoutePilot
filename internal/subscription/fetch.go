@@ -61,39 +61,92 @@ func do(ctx context.Context, u string, insecure bool) ([]byte, http.Header, erro
 }
 
 func doWithDeps(ctx context.Context, u string, insecure bool, deps fetchDeps) ([]byte, http.Header, error) {
-	if _, err := validateSubscriptionURL(u); err != nil {
+	current, err := validateSubscriptionURL(u)
+	if err != nil {
 		return nil, nil, err
 	}
+	if deps.timeout <= 0 {
+		deps.timeout = defaultFetchDeps().timeout
+	}
+	// 总时长覆盖多次重定向，避免每跳各自重置超时。
+	ctx, cancel := context.WithTimeout(ctx, deps.timeout)
+	defer cancel()
 
 	c := newGuardedClient(insecure, deps)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, nil, err
+	for hop := 0; ; hop++ {
+		// 每一跳都重建请求：全新 Header 里没有任何 Referer/Authorization/Cookie，
+		// 原始订阅 URL（含 token）不会以任何形式带给重定向目标。
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("User-Agent", clashUA)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Del("Referer")
+		req.Header.Del("Authorization")
+		req.Header.Del("Cookie")
+
+		resp, err := c.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if isRedirectStatus(resp.StatusCode) {
+			loc := resp.Header.Get("Location")
+			// 丢弃并关闭中间响应体，避免连接无法复用。
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+			_ = resp.Body.Close()
+			if loc == "" {
+				return nil, nil, fmt.Errorf("订阅返回 HTTP %d 但没有 Location", resp.StatusCode)
+			}
+			if hop >= maxRedirects {
+				return nil, nil, fmt.Errorf("%w（超过 %d 次）", ErrTooManyRedirects, maxRedirects)
+			}
+			next, err := current.Parse(loc)
+			if err != nil {
+				return nil, nil, fmt.Errorf("重定向地址无法解析: %w", err)
+			}
+			// 每一跳都重新做完整 URL 校验；域名/IP 还会在拨号时重新解析，
+			// 形成"URL 校验 + 拨号校验"的双重 SSRF 防护。
+			if _, err := validateSubscriptionURL(next.String()); err != nil {
+				return nil, nil, fmt.Errorf("重定向目标被拒绝: %w", err)
+			}
+			if err := redirectAllowed(current, next); err != nil {
+				return nil, nil, err
+			}
+			current = next
+			continue
+		}
+
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
+		}
+		if resp.ContentLength > maxSubscriptionBytes {
+			return nil, nil, fmt.Errorf("%w：声明长度 %d 字节", ErrResponseTooLarge, resp.ContentLength)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
+		if err != nil {
+			return nil, nil, err
+		}
+		if int64(len(body)) > maxSubscriptionBytes {
+			return nil, nil, fmt.Errorf("%w：超过 %d 字节", ErrResponseTooLarge, maxSubscriptionBytes)
+		}
+		if len(body) == 0 {
+			return nil, nil, fmt.Errorf("订阅返回空内容")
+		}
+		return body, resp.Header.Clone(), nil
 	}
-	req.Header.Set("User-Agent", clashUA)
-	req.Header.Set("Accept", "*/*")
-	resp, err := c.Do(req)
-	if err != nil {
-		return nil, nil, err
+}
+
+func isRedirectStatus(code int) bool {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("订阅返回 HTTP %d", resp.StatusCode)
-	}
-	if resp.ContentLength > maxSubscriptionBytes {
-		return nil, nil, fmt.Errorf("%w：声明长度 %d 字节", ErrResponseTooLarge, resp.ContentLength)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
-	if err != nil {
-		return nil, nil, err
-	}
-	if int64(len(body)) > maxSubscriptionBytes {
-		return nil, nil, fmt.Errorf("%w：超过 %d 字节", ErrResponseTooLarge, maxSubscriptionBytes)
-	}
-	if len(body) == 0 {
-		return nil, nil, fmt.Errorf("订阅返回空内容")
-	}
-	return body, resp.Header.Clone(), nil
 }
 
 // download 拉取订阅内容。

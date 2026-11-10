@@ -169,7 +169,8 @@ func TestSSRFBlocksRedirectToPrivateDNS(t *testing.T) {
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
-			http.Redirect(w, r, fmt.Sprintf("http://evil.test:%d/final", localPort(t, srv)), http.StatusFound)
+			// 用同站点子域，确保先通过重定向策略，真正考验 DNS 解析校验。
+			http.Redirect(w, r, fmt.Sprintf("http://evil.public.test:%d/final", localPort(t, srv)), http.StatusFound)
 			return
 		}
 		_, _ = w.Write([]byte("bad"))
@@ -178,7 +179,7 @@ func TestSSRFBlocksRedirectToPrivateDNS(t *testing.T) {
 
 	port := localPort(t, srv)
 	deps := testDeps(t, srv, map[string][]net.IP{
-		"evil.test": {net.ParseIP("192.168.0.9")},
+		"evil.public.test": {net.ParseIP("192.168.0.9")},
 	})
 	_, _, err := doWithDeps(context.Background(),
 		fmt.Sprintf("http://public.test:%d/start", port), false, deps)
