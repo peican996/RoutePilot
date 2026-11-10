@@ -186,6 +186,8 @@ func (t *Tracker) refreshLocked(force bool) error {
 	infos, err := t.src.List()
 	if err != nil {
 		// 保留上一份快照，避免一次查询失败让所有进程身份突然降级。
+		// 但必须显式记录：调用方据此知道这次解析可能基于陈旧快照。
+		t.log("进程快照刷新失败，沿用上一份快照: %v", err)
 		return err
 	}
 

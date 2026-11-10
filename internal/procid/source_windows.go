@@ -5,6 +5,7 @@ package procid
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -108,8 +109,16 @@ func queryProcess(pid uint32, fallbackName string) ProcInfo {
 	buf := make([]uint16, 32768)
 	size := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err == nil {
-		info.Path = windows.UTF16ToString(buf[:size])
-		if base := filepath.Base(info.Path); base != "" {
+		full := windows.UTF16ToString(buf[:size])
+		if base := filepath.Base(full); base != "" {
+			// 快照里的 ExeFile 与随后按 PID 查到的镜像是同一个进程才可信。
+			// 若两者不一致，说明枚举与 OpenProcess 之间该 PID 被复用，
+			// 拼出来的 Name/Path 属于两个进程，必须丢弃路径，只保留名称，
+			// 让上层明确降级，而不是生成错误的 PROCESS-PATH 规则。
+			if fallbackName != "" && !strings.EqualFold(base, fallbackName) {
+				return info
+			}
+			info.Path = full
 			info.Name = base
 		}
 	}

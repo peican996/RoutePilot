@@ -17,9 +17,9 @@ const testSubYAML = "proxies:\n" +
 // setupTwoSubs 构造两个已保存订阅（A 为激活），用于验证事务串行化。
 func setupTwoSubs(t *testing.T) (*CoreService, string, string) {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	svc := NewCoreService()
 	urlA := "https://a.example/sub?token=AAA"

@@ -15,9 +15,9 @@ import (
 // T10（订阅/进程规则）：文件被截断时加载静默返回空，随后一次保存
 // 会用空数据覆盖损坏文件，原内容不可恢复。
 func TestReproT10SubsTruncatedIsOverwritten(t *testing.T) {
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	path := filepath.Join(dataDir(), subsFile)
 	original := `{"items":[{"url":"https://example.com/sub?token=SECRET","name":"机场"}],"active":0}`
@@ -46,9 +46,9 @@ func TestReproT10SubsTruncatedIsOverwritten(t *testing.T) {
 // T11：订阅写入与切换并发。subscription.yaml 是共用文件，
 // 两个不同订阅同时写入会交错，产生无法解析的混合内容。
 func TestReproT11ConcurrentSubscriptionWrite(t *testing.T) {
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	svc := NewCoreService()
 

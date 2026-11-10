@@ -13,9 +13,9 @@ var errTestInjected = errors.New("injected failure")
 
 func procGenTestService(t *testing.T) *CoreService {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 	return NewCoreService()
 }
 
@@ -228,8 +228,8 @@ func TestProcGenRejectsPathTraversalManifest(t *testing.T) {
 
 func procGenTestServiceAt(t *testing.T, dir string) *CoreService {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = dir
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(dir)
+	t.Cleanup(func() { setDataDirOverride(old) })
 	return NewCoreService()
 }

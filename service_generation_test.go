@@ -112,9 +112,9 @@ func TestStaleAfterStartCannotReadNewInstance(t *testing.T) {
 
 // Shutdown 必须等待已进入执行阶段的任务结束，并拒绝新任务。
 func TestShutdownWaitsForAfterTasksAndClosesGate(t *testing.T) {
-	oldDir := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = oldDir })
+	oldDir := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(oldDir) })
 
 	svc := NewCoreService()
 	gen, ctx := svc.beginKernelGeneration()

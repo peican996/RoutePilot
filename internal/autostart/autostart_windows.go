@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"strings"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows/registry"
@@ -28,9 +29,61 @@ const (
 // 否则注册表里会留一条指向新路径但叫旧名字的僵尸启动项。
 var legacyAppNames = []string{"NexusLink", "ProxDeck"}
 
+// taskState 是计划任务查询的三态结果。
+// 查询失败（权限不足、schtasks 异常）绝不能等同于"不存在"：
+// 否则任务真实存在时会再写一份 Run 项，导致登录时双实例启动。
+type taskState int
+
+const (
+	taskUnknown taskState = iota
+	taskNotFound
+	taskPresent
+)
+
+// 以下三个是测试注入点。生产环境分别指向真实实现；
+// 测试用它们模拟"计划任务查询权限不足"等故障，且不触碰真实注册表。
+var (
+	queryTask      = queryTaskState
+	writeRunValue  = setRunValue
+	deleteRunValue = removeRunValue
+)
+
+// classifyTaskQuery 把 schtasks 的查询结果归类为三态。
+// 非零退出既可能是"任务不存在"，也可能是权限不足，必须看输出区分。
+func classifyTaskQuery(out []byte, err error) (taskState, error) {
+	if err == nil {
+		return taskPresent, nil
+	}
+	msg := strings.ToLower(string(out))
+	switch {
+	case strings.Contains(msg, "cannot find"),
+		strings.Contains(msg, "找不到"),
+		strings.Contains(msg, "does not exist"),
+		strings.Contains(msg, "not exist"):
+		return taskNotFound, nil
+	default:
+		return taskUnknown, fmt.Errorf("查询计划任务 %s 失败: %v（%s）", taskName, err, strings.TrimSpace(string(out)))
+	}
+}
+
+// queryTaskState 查询管理员自启计划任务的状态。
+func queryTaskState() (taskState, error) {
+	cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+	out, err := cmd.CombinedOutput()
+	return classifyTaskQuery(out, err)
+}
+
 // Enabled 检查是否已经配置了开机启动（普通 Run 项或管理员计划任务）。
 func Enabled() bool {
-	return taskExists() || runValueExists()
+	if runValueExists() {
+		return true
+	}
+	st, err := queryTask()
+	if err != nil {
+		// 无法确认时按"可能已启用"处理，避免界面谎报关闭。
+		return true
+	}
+	return st == taskPresent
 }
 
 // Set 配置开机启动。
@@ -39,9 +92,18 @@ func Enabled() bool {
 // elevated=true 时创建 HighestAvailable 的计划任务，开机静默以管理员运行；
 // 创建失败会回退到 Run 项并返回错误，至少保留普通自启。
 func Set(enable bool, elevated bool) error {
+	st, qerr := queryTask()
+	if qerr != nil {
+		// 状态未知时不做任何会新增启动项的操作，宁可报错也不能造成双实例。
+		if !enable {
+			deleteRunValue()
+		}
+		return qerr
+	}
+
 	if !enable {
-		removeRunValue()
-		if taskExists() {
+		deleteRunValue()
+		if st == taskPresent {
 			if err := deleteTask(); err != nil {
 				return fmt.Errorf("关闭管理员自启失败（需要管理员权限）: %w", err)
 			}
@@ -50,18 +112,18 @@ func Set(enable bool, elevated bool) error {
 	}
 
 	if elevated {
-		if taskExists() {
-			removeRunValue()
+		if st == taskPresent {
+			deleteRunValue()
 			return nil
 		}
 		if err := createTask(); err != nil {
-			fallback := setRunValue()
+			fallback := writeRunValue()
 			if fallback != nil {
 				return fmt.Errorf("创建管理员自启失败，普通自启也失败: %v / %w", err, fallback)
 			}
 			return fmt.Errorf("创建管理员自启失败，已回退为普通自启: %w", err)
 		}
-		removeRunValue()
+		deleteRunValue()
 		return nil
 	}
 
@@ -69,23 +131,27 @@ func Set(enable bool, elevated bool) error {
 	// 计划任务，两者并存会导致登录时双实例、每次开机弹"已经在运行"。
 	// 计划任务只有管理员能删，这里如实报错引导用户走提权路径，
 	// 绝不能静默再写一份 Run 项让坏状态固化。
-	if taskExists() {
+	if st == taskPresent {
 		return fmt.Errorf("检测到管理员自启的计划任务：请以管理员身份运行本程序后再切换自启方式，否则会双实例启动")
 	}
-	return setRunValue()
+	return writeRunValue()
 }
 
 // UpgradeIfElevated 在管理员进程里把已有的 Run 自启升级为计划任务。
 // 只应在确认当前进程已提权时调用；失败时保留原 Run 项。
 func UpgradeIfElevated() error {
-	if !taskExists() && runValueExists() {
+	st, err := queryTask()
+	if err != nil {
+		return err
+	}
+	if st == taskNotFound && runValueExists() {
 		if err := createTask(); err != nil {
 			return err
 		}
 	}
 	// 无论任务是刚建的还是早已存在，都要收敛掉 Run 项：
 	// 两者并存会双实例启动，这个错误状态不能自我延续。
-	removeRunValue()
+	deleteRunValue()
 	return nil
 }
 
@@ -137,11 +203,6 @@ func removeRunValue() {
 	for _, legacy := range legacyAppNames {
 		_ = k.DeleteValue(legacy)
 	}
-}
-
-func taskExists() bool {
-	cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
-	return cmd.Run() == nil
 }
 
 func createTask() error {

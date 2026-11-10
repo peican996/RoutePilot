@@ -157,10 +157,16 @@ func CheckUpdate(currentVersion string, timeout time.Duration) (*LatestInfo, err
 
 	cur := strings.TrimPrefix(strings.TrimSpace(currentVersion), "v")
 	lat := strings.TrimPrefix(rel.TagName, "v")
-	// 读不到当前版本时不能断定"有新版本"；版本比较必须看大小，
-	// 不能用"不相等"判定——本地比 latest 新（如装了预发布版）时
-	// 会永远提示可升级，实际点了是降级。
-	hasUpdate := cur != "" && lat != "" && versionNewer(cur, lat)
+	// 读不到当前版本时不能断定"有新版本"；版本比较按 SemVer 2.0.0 的
+	// 优先级规则判断大小，不能用"字符串不相等"——本地比 latest 新
+	// （如装了预发布版）时会永远提示可升级，点下去实际是降级。
+	hasUpdate := false
+	if cur != "" && lat != "" {
+		if cmp, ok := compareSemver(lat, cur); ok {
+			hasUpdate = cmp > 0
+		}
+		// 无法解析时保守处理：不提示升级，避免把新版本误判为旧版本后降级。
+	}
 	return &LatestInfo{
 		Current:   currentVersion,
 		Latest:    rel.TagName,
@@ -172,50 +178,139 @@ func CheckUpdate(currentVersion string, timeout time.Duration) (*LatestInfo, err
 	}, nil
 }
 
-// versionNewer 判断 latest 是否严格大于 cur（两者均已去掉 v 前缀）。
-// 按点分段做数字比较，缺段按 0 处理；数字全部相同时，正式版比
-// 预发布版（带 -alpha / -rc 等后缀）新，同为预发布或同为正式版则视为无更新。
-func versionNewer(cur, latest string) bool {
-	parse := func(v string) ([]int, bool) {
-		prerelease := false
-		if i := strings.IndexAny(v, "-+"); i >= 0 {
-			prerelease = true
-			v = v[:i]
-		}
-		var nums []int
-		for _, seg := range strings.Split(v, ".") {
-			n, err := strconv.Atoi(seg)
-			if err != nil {
-				return nil, prerelease
-			}
-			nums = append(nums, n)
-		}
-		return nums, prerelease
+// semver 是解析后的版本号：core 为核心数字段，pre 为预发布标识符。
+type semver struct {
+	core []int
+	pre  []string
+}
+
+// parseSemver 解析 SemVer 2.0.0 版本号（允许省略前导 v/V）。
+// build metadata（+xxx）按规范忽略。核心段必须全部为数字。
+func parseSemver(v string) (semver, bool) {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	v = strings.TrimPrefix(v, "V")
+	if v == "" {
+		return semver{}, false
 	}
-	c, cPre := parse(cur)
-	l, lPre := parse(latest)
-	if c == nil || l == nil {
-		// 任一侧解析失败时退回保守比较，避免提示降级。
-		return !lPre && cPre
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
 	}
-	n := len(c)
-	if len(l) > n {
-		n = len(l)
+	var pre []string
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		preStr := v[i+1:]
+		v = v[:i]
+		if preStr == "" {
+			return semver{}, false
+		}
+		pre = strings.Split(preStr, ".")
+	}
+	parts := strings.Split(v, ".")
+	core := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			return semver{}, false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return semver{}, false
+		}
+		core = append(core, n)
+	}
+	return semver{core: core, pre: pre}, true
+}
+
+func numericIdent(s string) (int, bool) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// compareSemver 按 SemVer 2.0.0 的优先级规则比较 a 与 b，返回 -1/0/1。
+// 规则要点：核心段按数字比较；有预发布标识符的版本低于同核心的正式版；
+// 预发布标识符中数字按数值比较、数字低于字母、字母按 ASCII 比较；
+// 前缀全部相同时字段更少者优先级更低。build metadata 不参与比较。
+func compareSemver(a, b string) (int, bool) {
+	pa, okA := parseSemver(a)
+	pb, okB := parseSemver(b)
+	if !okA || !okB {
+		return 0, false
+	}
+
+	n := len(pa.core)
+	if len(pb.core) > n {
+		n = len(pb.core)
 	}
 	for i := 0; i < n; i++ {
-		var cv, lv int
-		if i < len(c) {
-			cv = c[i]
+		var x, y int
+		if i < len(pa.core) {
+			x = pa.core[i]
 		}
-		if i < len(l) {
-			lv = l[i]
+		if i < len(pb.core) {
+			y = pb.core[i]
 		}
-		if lv != cv {
-			return lv > cv
+		if x != y {
+			if x < y {
+				return -1, true
+			}
+			return 1, true
 		}
 	}
-	// 数字完全相同：仅当本地是预发布、latest 是正式版时才算有更新。
-	return cPre && !lPre
+
+	// 正式版优先于预发布版。
+	switch {
+	case len(pa.pre) == 0 && len(pb.pre) == 0:
+		return 0, true
+	case len(pa.pre) == 0:
+		return 1, true
+	case len(pb.pre) == 0:
+		return -1, true
+	}
+
+	m := len(pa.pre)
+	if len(pb.pre) < m {
+		m = len(pb.pre)
+	}
+	for i := 0; i < m; i++ {
+		ai, aNum := numericIdent(pa.pre[i])
+		bi, bNum := numericIdent(pb.pre[i])
+		switch {
+		case aNum && bNum:
+			if ai != bi {
+				if ai < bi {
+					return -1, true
+				}
+				return 1, true
+			}
+		case aNum:
+			// 数字标识符优先级低于字母标识符。
+			return -1, true
+		case bNum:
+			return 1, true
+		default:
+			if pa.pre[i] != pb.pre[i] {
+				if pa.pre[i] < pb.pre[i] {
+					return -1, true
+				}
+				return 1, true
+			}
+		}
+	}
+	if len(pa.pre) != len(pb.pre) {
+		if len(pa.pre) < len(pb.pre) {
+			return -1, true
+		}
+		return 1, true
+	}
+	return 0, true
+}
+
+// versionNewer 判断 latest 是否严格大于 cur。
+func versionNewer(cur, latest string) bool {
+	cmp, ok := compareSemver(latest, cur)
+	return ok && cmp > 0
 }
 
 // IsCustomCore 磁盘上的内核是否被手动升级过。

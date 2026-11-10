@@ -43,9 +43,9 @@ func TestRealKernelLoadsProcGenProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	svc := NewCoreService()
 	rules := map[string]string{"name:curl.exe": "direct"}

@@ -15,9 +15,9 @@ import (
 // 重启恢复测试需要在同一目录上先后创建两个实例。
 func r1Service(t *testing.T, fake *fakeRegistry, dir string) *CoreService {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = dir
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(dir)
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	svc := NewCoreService()
 	svc.sys = fake.ops()

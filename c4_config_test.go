@@ -208,8 +208,8 @@ func TestSaveAfterCorruptDoesNotDestroyBackup(t *testing.T) {
 
 func configTestService(t *testing.T) *CoreService {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 	return NewCoreService()
 }

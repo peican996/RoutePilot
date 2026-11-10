@@ -115,9 +115,9 @@ func (f *fakeRegistry) ops() systemProxyOps {
 
 func newC1Service(t *testing.T, fake *fakeRegistry) *CoreService {
 	t.Helper()
-	old := dataDirOverride
-	dataDirOverride = t.TempDir()
-	t.Cleanup(func() { dataDirOverride = old })
+	old := getDataDirOverride()
+	setDataDirOverride(t.TempDir())
+	t.Cleanup(func() { setDataDirOverride(old) })
 
 	svc := NewCoreService()
 	svc.sys = fake.ops()
