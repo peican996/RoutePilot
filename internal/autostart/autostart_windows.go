@@ -65,19 +65,26 @@ func Set(enable bool, elevated bool) error {
 		return nil
 	}
 
-	// 非管理员：保持原有免 UAC 的 Run 自启。
+	// 非管理员：保持原有免 UAC 的 Run 自启。但如果此前提权时建过
+	// 计划任务，两者并存会导致登录时双实例、每次开机弹"已经在运行"。
+	// 计划任务只有管理员能删，这里如实报错引导用户走提权路径，
+	// 绝不能静默再写一份 Run 项让坏状态固化。
+	if taskExists() {
+		return fmt.Errorf("检测到管理员自启的计划任务：请以管理员身份运行本程序后再切换自启方式，否则会双实例启动")
+	}
 	return setRunValue()
 }
 
 // UpgradeIfElevated 在管理员进程里把已有的 Run 自启升级为计划任务。
 // 只应在确认当前进程已提权时调用；失败时保留原 Run 项。
 func UpgradeIfElevated() error {
-	if taskExists() || !runValueExists() {
-		return nil
+	if !taskExists() && runValueExists() {
+		if err := createTask(); err != nil {
+			return err
+		}
 	}
-	if err := createTask(); err != nil {
-		return err
-	}
+	// 无论任务是刚建的还是早已存在，都要收敛掉 Run 项：
+	// 两者并存会双实例启动，这个错误状态不能自我延续。
 	removeRunValue()
 	return nil
 }

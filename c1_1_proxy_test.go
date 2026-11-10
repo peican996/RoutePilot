@@ -71,7 +71,8 @@ func TestReconcileClosedProxySuccessClearsBackup(t *testing.T) {
 // 下次启动继续校验/恢复，不能误认为事务完成。
 func TestRestoreSuccessRemoveFailureKeepsBackup(t *testing.T) {
 	fake := &fakeRegistry{
-		server:   "ours:17890",
+		// 注册表当前指向本程序的接管地址（还原事务的归属判定会核对）。
+		server:   "127.0.0.1:17890",
 		enabled:  true,
 		override: "ours",
 	}

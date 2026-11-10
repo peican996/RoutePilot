@@ -68,6 +68,10 @@ type Tracker struct {
 	fetchedAt time.Time
 	byPID     map[uint32]ProcInfo
 	byName    map[string][]uint32
+	// verify 在采纳快照路径前实时校验进程实例是否仍是快照里的那个
+	// （生产环境用 OpenProcess+GetProcessTimes 核对创建时间），
+	// 消除 TTL 窗口内同名进程退出/被新实例替换导致的错误归属。
+	verify func(ProcInfo) bool
 }
 
 // NewTracker 创建缓存。ttl <= 0 时默认 5 秒。
@@ -88,6 +92,14 @@ func NewTracker(src Source, ttl time.Duration) *Tracker {
 func (t *Tracker) SetFileIDFunc(fn func(path string) string) {
 	t.mu.Lock()
 	t.file = fn
+	t.mu.Unlock()
+}
+
+// SetVerifyFunc 注入进程实例校验函数（生产环境实时核对 PID 的创建时间）。
+// 注入后 LookupName 在采纳唯一匹配的路径前会先确认快照没有过期失真。
+func (t *Tracker) SetVerifyFunc(fn func(ProcInfo) bool) {
+	t.mu.Lock()
+	t.verify = fn
 	t.mu.Unlock()
 }
 
@@ -118,6 +130,24 @@ func (t *Tracker) LookupName(name string) LookupResult {
 		info, ok := t.byPID[pids[0]]
 		if !ok {
 			return LookupResult{State: LookupMissing}
+		}
+		// 快照最长有 TTL 的陈旧期：同名进程若恰好在此期间退出、被
+		// 不同路径的新实例替换，直接采用快照路径会把连接挂到错误路径，
+		// 用户据此一键建规则就会持久化错误的 PROCESS-PATH。
+		// 先实时校验该 PID 仍是快照里的进程实例，不一致就强制刷新
+		// 一次重查；仍不一致按"无法唯一定位"降级为名称匹配。
+		if t.verify != nil && !t.verify(info) {
+			if err := t.refreshLocked(true); err == nil {
+				if again, ok2 := t.byName[key]; ok2 && len(again) == 1 {
+					if info2, ok3 := t.byPID[again[0]]; ok3 {
+						info = info2
+					}
+				}
+			}
+			if t.verify != nil && !t.verify(info) {
+				t.log("名称 %q 的快照实例已失效，降级为名称匹配", name)
+				return LookupResult{State: LookupAmbiguous, Candidates: len(pids), Info: info}
+			}
 		}
 		if info.FileID == "" && t.file != nil && info.Path != "" {
 			info.FileID = t.file(info.Path)

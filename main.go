@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"syscall"
@@ -85,11 +86,14 @@ func init() {
 }
 
 // acquireInstanceMutex 尝试创建命名互斥体。
-// 返回 false 表示已有实例在跑，或创建失败。
-func acquireInstanceMutex() bool {
+// 返回（是否取得锁， 创建失败）。
+// 创建失败（h==0，如 Local\ 名字被同会话的其它内核对象占用）与
+// "已有实例在运行"（ERROR_ALREADY_EXISTS）必须区分上报，
+// 否则用户只会看到误导性的"已经在运行"且无从自救。
+func acquireInstanceMutex() (bool, bool) {
 	namePtr, err := windows.UTF16PtrFromString(instanceMutexName)
 	if err != nil {
-		return false
+		return false, true
 	}
 
 	runtime.LockOSThread()
@@ -97,24 +101,26 @@ func acquireInstanceMutex() bool {
 	runtime.UnlockOSThread()
 
 	if h == 0 {
-		return false
+		return false, true
 	}
 	if lastErr == windows.ERROR_ALREADY_EXISTS {
 		_ = windows.CloseHandle(windows.Handle(h))
-		return false
+		return false, false
 	}
 	instanceMutex = windows.Handle(h)
-	return true
+	return true, false
 }
 
-func acquireSingleInstance() bool {
+// acquireSingleInstance 返回（是否取得单实例锁, 创建互斥体失败）。
+func acquireSingleInstance() (bool, bool) {
 	// 提权重启时旧进程还没退干净，给几秒宽限。
 	for i := 0; i < 30; i++ {
-		if acquireInstanceMutex() {
+		ok, createFailed := acquireInstanceMutex()
+		if ok {
 			break
 		}
 		if i == 29 {
-			return false
+			return false, createFailed
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
@@ -124,7 +130,7 @@ func acquireSingleInstance() bool {
 	if ln, err := net.Listen("tcp", instanceLockPort); err == nil {
 		instanceLn = ln
 	}
-	return true
+	return true, false
 }
 
 // showAlreadyRunning 启动失败时给个可见提示，而不是静默退出。
@@ -138,10 +144,28 @@ func showAlreadyRunning() {
 	)
 }
 
+// showStartFailure 互斥体创建失败时的提示：如实说明原因，
+// 不再误导用户以为"已经有实例在跑"。
+func showStartFailure() {
+	text, _ := windows.UTF16PtrFromString("RoutePilot 无法创建单实例锁（互斥体创建失败）。\n\n请重启系统后重试；若反复出现，请检查是否有同会话程序占用了 \"" + instanceMutexName + "\"。")
+	title, _ := windows.UTF16PtrFromString("RoutePilot")
+	procMessageBox.Call(0,
+		uintptr(unsafe.Pointer(text)),
+		uintptr(unsafe.Pointer(title)),
+		uintptr(0x10), // MB_ICONERROR
+	)
+}
+
 func main() {
-	if !acquireSingleInstance() {
-		log.Println("RoutePilot 已经在运行了")
-		showAlreadyRunning()
+	ok, createFailed := acquireSingleInstance()
+	if !ok {
+		if createFailed {
+			log.Println("无法创建单实例锁（互斥体创建失败）")
+			showStartFailure()
+		} else {
+			log.Println("RoutePilot 已经在运行了")
+			showAlreadyRunning()
+		}
 		return
 	}
 
@@ -197,8 +221,10 @@ func main() {
 		URL:              "/",
 	})
 
-	// 恢复上次的窗口位置
+	// 恢复上次的窗口位置。坐标先钳制到当前可见的虚拟屏幕内，
+	// 否则外接屏拔掉后窗口会恢复到屏幕外，用户再也找不回来。
 	if x, y, w, h := svc.WindowBounds(); w > 0 && h > 0 {
+		x, y = clampToVirtualScreen(x, y, w, h)
 		mainWindow.SetPosition(x, y)
 		mainWindow.SetSize(w, h)
 	}
@@ -235,10 +261,49 @@ func main() {
 	setupTray(app, svc, mainWindow)
 
 	if err := app.Run(); err != nil {
-		log.Fatal(err)
+		// 不能直接 log.Fatal：Boot 可能已按上次状态恢复了系统代理接管，
+		// 直接 os.Exit 会在注册表里留下指向死端口的代理，用户全系统断网。
+		log.Println("应用运行失败:", err)
+		svc.Shutdown()
+		os.Exit(1)
 	}
 
 	svc.Shutdown()
+}
+
+// clampToVirtualScreen 把窗口坐标钳制到当前虚拟屏幕范围内。
+// 恢复上次的窗口位置时不做校验，外接屏拔掉/分辨率变化后窗口会
+// 落在屏幕外，托盘"显示窗口"怎么点都找不回来。
+// 规则：窗口至少保留 120px 宽、80px 高的可见部分在虚拟屏幕内。
+func clampToVirtualScreen(x, y, w, h int) (int, int) {
+	gsm := syscall.NewLazyDLL("user32.dll").NewProc("GetSystemMetrics")
+	vx, _, _ := gsm.Call(76) // SM_XVIRTUALSCREEN
+	vy, _, _ := gsm.Call(77) // SM_YVIRTUALSCREEN
+	vw, _, _ := gsm.Call(78) // SM_CXVIRTUALSCREEN
+	vh, _, _ := gsm.Call(79) // SM_CYVIRTUALSCREEN
+	if vw == 0 || vh == 0 {
+		return x, y
+	}
+	visX, visY := 120, 80
+	if w < visX {
+		visX = w
+	}
+	if h < visY {
+		visY = h
+	}
+	if maxX := int(vx) + int(vw) - visX; x > maxX {
+		x = maxX
+	}
+	if minX := int(vx) - w + visX; x < minX {
+		x = minX
+	}
+	if maxY := int(vy) + int(vh) - visY; y > maxY {
+		y = maxY
+	}
+	if minY := int(vy) - h + visY; y < minY {
+		y = minY
+	}
+	return x, y
 }
 
 // noCacheHTML 给 HTML 响应加 no-cache。
@@ -349,20 +414,34 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 	// ---- 快速节点切换 ----
 	menu.AddSeparator()
 	nodeMenu := menu.AddSubmenu("切换节点")
-	// 启动时构建节点列表（取延迟最低的 8 个）
-	names, active := svc.QuickNodes(8)
-	if len(names) == 0 {
-		nodeMenu.Add("暂无节点（先在主窗口测速）")
-	} else {
-		for _, n := range names {
-			item := nodeMenu.AddRadio(n, n == active)
-			name := n
-			item.OnClick(func(ctx *application.Context) {
-				if err := svc.QuickSelectNode(name); err != nil {
-					log.Println("托盘切换节点失败:", err)
-				}
-			})
+	// 托盘节点菜单不能只在启动时构建一次：订阅更新、测速结果变化、
+	// 主窗口切点后，列表/选中态会全部过期，死节点点了只会静默失败。
+	// 这里集中重建逻辑，切换成功立即刷新，后台每 60 秒按签名变化重建。
+	var rebuildNodeMenu func(names []string, active string)
+	rebuildNodeMenu = func(names []string, active string) {
+		nodeMenu.Clear()
+		if len(names) == 0 {
+			nodeMenu.Add("暂无节点（先在主窗口测速）")
+		} else {
+			for _, n := range names {
+				n := n
+				item := nodeMenu.AddRadio(n, n == active)
+				item.OnClick(func(ctx *application.Context) {
+					if err := svc.QuickSelectNode(n); err != nil {
+						log.Println("托盘切换节点失败:", err)
+					}
+					// 切换后立即刷新选中态，不等下一轮后台刷新。
+					if names, active := svc.QuickNodes(8); len(names) > 0 {
+						rebuildNodeMenu(names, active)
+					}
+				})
+			}
 		}
+		nodeMenu.Update()
+	}
+	{
+		names, active := svc.QuickNodes(8)
+		rebuildNodeMenu(names, active)
 	}
 
 	menu.AddSeparator()
@@ -382,6 +461,8 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 	// 托盘图标状态：绿=运行中，黄=告警，红=错误/停止
 	go func() {
 		lastState := ""
+		loops := 0
+		lastNodeSig := ""
 		for {
 			time.Sleep(10 * time.Second)
 			if svc.Quitting() {
@@ -405,6 +486,17 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 				tray.SetIcon(icon)
 				tray.SetTooltip("RoutePilot — " + label)
 				lastState = label
+			}
+
+			// 每 60 秒对一次节点签名：订阅更新/主窗口切点导致列表或
+			// 选中态变化时才重建子菜单，避免无谓的菜单抖动。
+			loops++
+			if loops%6 == 0 && st.State == "running" {
+				names, active := svc.QuickNodes(8)
+				if sig := strings.Join(names, "|") + "#" + active; sig != lastNodeSig {
+					lastNodeSig = sig
+					rebuildNodeMenu(names, active)
+				}
 			}
 		}
 	}()

@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -156,8 +157,10 @@ func CheckUpdate(currentVersion string, timeout time.Duration) (*LatestInfo, err
 
 	cur := strings.TrimPrefix(strings.TrimSpace(currentVersion), "v")
 	lat := strings.TrimPrefix(rel.TagName, "v")
-	// 读不到当前版本时不能断定"有新版本"，否则永远提示可升级
-	hasUpdate := cur != "" && lat != "" && lat != cur
+	// 读不到当前版本时不能断定"有新版本"；版本比较必须看大小，
+	// 不能用"不相等"判定——本地比 latest 新（如装了预发布版）时
+	// 会永远提示可升级，实际点了是降级。
+	hasUpdate := cur != "" && lat != "" && versionNewer(cur, lat)
 	return &LatestInfo{
 		Current:   currentVersion,
 		Latest:    rel.TagName,
@@ -167,6 +170,52 @@ func CheckUpdate(currentVersion string, timeout time.Duration) (*LatestInfo, err
 		Size:      asset.size,
 		Digest:    asset.digest,
 	}, nil
+}
+
+// versionNewer 判断 latest 是否严格大于 cur（两者均已去掉 v 前缀）。
+// 按点分段做数字比较，缺段按 0 处理；数字全部相同时，正式版比
+// 预发布版（带 -alpha / -rc 等后缀）新，同为预发布或同为正式版则视为无更新。
+func versionNewer(cur, latest string) bool {
+	parse := func(v string) ([]int, bool) {
+		prerelease := false
+		if i := strings.IndexAny(v, "-+"); i >= 0 {
+			prerelease = true
+			v = v[:i]
+		}
+		var nums []int
+		for _, seg := range strings.Split(v, ".") {
+			n, err := strconv.Atoi(seg)
+			if err != nil {
+				return nil, prerelease
+			}
+			nums = append(nums, n)
+		}
+		return nums, prerelease
+	}
+	c, cPre := parse(cur)
+	l, lPre := parse(latest)
+	if c == nil || l == nil {
+		// 任一侧解析失败时退回保守比较，避免提示降级。
+		return !lPre && cPre
+	}
+	n := len(c)
+	if len(l) > n {
+		n = len(l)
+	}
+	for i := 0; i < n; i++ {
+		var cv, lv int
+		if i < len(c) {
+			cv = c[i]
+		}
+		if i < len(l) {
+			lv = l[i]
+		}
+		if lv != cv {
+			return lv > cv
+		}
+	}
+	// 数字完全相同：仅当本地是预发布、latest 是正式版时才算有更新。
+	return cPre && !lPre
 }
 
 // IsCustomCore 磁盘上的内核是否被手动升级过。
@@ -632,7 +681,13 @@ func (m *Manager) EnsureBinary(embedded []byte) (string, error) {
 // cleanupUpgradeTemps 清理上次升级中断留下的临时文件。
 // 正式内核与 .bak 备份不会被动。
 func cleanupUpgradeTemps(binDir string) {
-	for _, pattern := range []string{".mihomo-download-*", ".mihomo-embed-*"} {
+	// 除了下载/解压的临时包，copyFileAtomic（.bak 备份）、
+	// atomicWriteBytes（内核本体替换、.core_custom 标记）也会在 binDir
+	// 留下 .tmp-* 孤儿，进程崩溃时来不及走 defer 清理，必须一并纳入。
+	for _, pattern := range []string{
+		".mihomo-download-*", ".mihomo-embed-*",
+		".mihomo.exe.bak.tmp-*", ".mihomo.exe.tmp-*", "..core_custom.tmp-*",
+	} {
 		matches, _ := filepath.Glob(filepath.Join(binDir, pattern))
 		for _, p := range matches {
 			_ = os.Remove(p)

@@ -382,6 +382,12 @@ func MainProxyGroup(cfg map[string]any) string {
 		if name == "" || builtinGroups[name] || strings.HasPrefix(name, ProcessGroupPrefix) {
 			continue
 		}
+		// 组名会被拼进逗号分隔的内核规则（RULE-SET,pp-proxy,<组名> / MATCH,<组名>）。
+		// 订阅内容不可信：组名里带逗号/换行等字符会破坏规则语法，让内核
+		// 拒绝加载整个配置。这类组名直接跳过，回退到下一个合法的 selector。
+		if strings.ContainsAny(name, ",\n\r\t\x00") {
+			continue
+		}
 		proxies, _ := m["proxies"].([]any)
 		members := len(proxies)
 		// base64 订阅走 proxy-provider，组里只有 use 没有 proxies；

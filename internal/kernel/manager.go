@@ -3,6 +3,7 @@ package kernel
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -183,13 +184,21 @@ type logWriter struct {
 	file    *os.File
 	mu      sync.Mutex
 	pending []byte
+	written int64
 }
 
 func (w *logWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.file != nil {
-		_, _ = w.file.Write(p)
+		if n, err := w.file.Write(p); err == nil {
+			w.written += int64(n)
+		}
+		// openKernelLog 只在内核启动时滚动一次；内核长期不重启时
+		// 必须在写入路径上按累计字节触发滚动，否则 kernel.log 无限增长。
+		if w.written > 4<<20 {
+			w.rotateLocked()
+		}
 	}
 	w.pending = append(w.pending, p...)
 	for {
@@ -201,6 +210,25 @@ func (w *logWriter) Write(p []byte) (int, error) {
 		w.pending = w.pending[i+1:]
 	}
 	return len(p), nil
+}
+
+// rotateLocked 滚动当前日志：关闭、挪成 .1、重新打开。调用方必须持有 w.mu。
+func (w *logWriter) rotateLocked() {
+	if w.file == nil {
+		return
+	}
+	path := w.file.Name()
+	_ = w.file.Close()
+	_ = os.Remove(path + ".1")
+	_ = os.Rename(path, path+".1")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		// 打不开就停写磁盘，内存日志不受影响。
+		w.file = nil
+		return
+	}
+	w.file = f
+	w.written = 0
 }
 
 // Status 是内核状态的对外快照，直接序列化给前端。
@@ -296,12 +324,17 @@ func (m *Manager) ExePath() string {
 func (m *Manager) EnsureAux(files map[string][]byte) {
 	dirs := []string{m.dataDir, filepath.Join(m.dataDir, "bin")}
 	for name, data := range files {
+		sum := sha256.Sum256(data)
 		for _, d := range dirs {
 			p := filepath.Join(d, name)
-			if st, err := os.Stat(p); err == nil && st.Size() == int64(len(data)) {
+			// 与 EnsureBinary 一致按哈希比对：等尺寸的损坏/错版文件
+			// 必须重写，否则 TUN 场景会莫名起不来且无从排查。
+			if b, err := os.ReadFile(p); err == nil && sha256.Sum256(b) == sum {
 				continue
 			}
-			_ = os.WriteFile(p, data, 0o644)
+			if err := os.WriteFile(p, data, 0o644); err != nil {
+				m.Logs.Add(fmt.Sprintf("释放附属文件 %s 失败: %v", name, err))
+			}
 		}
 	}
 }

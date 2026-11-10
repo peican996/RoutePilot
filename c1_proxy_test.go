@@ -22,8 +22,13 @@ type fakeRegistry struct {
 	failSetPAC      bool
 	failClearPAC    bool
 
-	// readbackServer 非空时 Current 返回该值，用于模拟"写入成功但注册表未生效"。
+	// readbackServer 非空时 Current 在**已有写入发生**后返回该值，
+	// 用于模拟"写入成功但注册表未生效"。还原事务的归属判定会在
+	// 写入之前先读一次注册表，把"写入后才生效的错值"提前到写入前
+	// 返回，会被误判成外部已接管。
 	readbackServer string
+	// written 表示已经发生过注册表写入。
+	written bool
 	// enableHook 在 Enable 真正写值之前调用，供并发测试插入确定性 barrier。
 	enableHook func()
 	// disableHook 在 Disable 成功之后调用，供测试等待事务真正落地。
@@ -37,7 +42,7 @@ type fakeRegistry struct {
 func (f *fakeRegistry) ops() systemProxyOps {
 	return systemProxyOps{
 		Current: func() (string, bool) {
-			if f.readbackServer != "" {
+			if f.readbackServer != "" && f.written {
 				return f.readbackServer, f.enabled
 			}
 			return f.server, f.enabled
@@ -52,6 +57,7 @@ func (f *fakeRegistry) ops() systemProxyOps {
 			}
 			f.server = addr
 			f.enabled = true
+			f.written = true
 			// 真实 sysproxy.Enable 会写入固定的本地绕过列表，这里同步模拟。
 			f.override = "ours"
 			return nil
@@ -62,6 +68,7 @@ func (f *fakeRegistry) ops() systemProxyOps {
 				return errors.New("injected disable failure")
 			}
 			f.enabled = false
+			f.written = true
 			if f.disableHook != nil {
 				f.disableHook()
 			}

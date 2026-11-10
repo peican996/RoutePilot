@@ -53,13 +53,18 @@ func preserveCorruptFile(path string) (string, error) {
 	backup := fmt.Sprintf("%s.corrupt-%s", path, time.Now().Format("20060102-150405"))
 	if err := os.Rename(path, backup); err == nil {
 		return backup, nil
-	} else if data, rerr := os.ReadFile(path); rerr == nil {
+	}
+	// 改名失败，退化为复制并保留原文件。复制成功也算备份成功。
+	data, readErr := os.ReadFile(path)
+	if readErr == nil {
 		if werr := os.WriteFile(backup, data, 0o600); werr != nil {
 			return "", fmt.Errorf("备份损坏文件失败: %w", werr)
 		}
-		return backup, err
+		return backup, nil
 	}
-	return "", fmt.Errorf("无法保留损坏文件")
+	// rename 与 read 双双失败：两级错误都要保留，
+	// 否则用户只看到一句没有原因的"无法保留"，损坏无从排查。
+	return "", fmt.Errorf("无法保留损坏文件: %w（改名失败，读取也失败: %v）", readErr, filepath.Base(path))
 }
 
 // reportConfigProblem 统一记录配置异常：写 debug.log 并在界面启动错误里提示。

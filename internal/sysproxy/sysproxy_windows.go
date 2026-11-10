@@ -43,7 +43,9 @@ func Enable(addr string) error {
 		return fmt.Errorf("写入 ProxyServer 失败: %w", err)
 	}
 	// 本地地址一律绕过，否则访问 127.0.0.1 的服务（含内核自己的 API）会被二次代理。
-	bypass := "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;192.168.*;*.local"
+	// 172.16.0.0/12 覆盖 172.16–172.31 共 16 个 /16（Docker/WSL/企业内网常用），
+	// 必须逐段列出，缺一段那段内网流量就会被送进代理隧道。
+	bypass := "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;*.local"
 	if err := k.SetStringValue("ProxyOverride", bypass); err != nil {
 		return fmt.Errorf("写入 ProxyOverride 失败: %w", err)
 	}
@@ -167,20 +169,25 @@ func SetAutoConfigURL(s string) error {
 	return nil
 }
 
-// ClearAutoConfigURL 移除 PAC 地址。原本不存在时也视为成功。
+// ClearAutoConfigURL 移除 PAC 地址。原本不存在时也视为成功；
+// 其它删除失败必须如实上报——PAC 优先级高于手动 ProxyServer，
+// 报成功会让调用方误以为 PAC 已清除，实际浏览器仍按旧 PAC 走。
 func ClearAutoConfigURL() error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("打开注册表失败: %w", err)
 	}
 	defer k.Close()
-	_ = k.DeleteValue("AutoConfigURL")
+	if err := k.DeleteValue("AutoConfigURL"); err != nil && !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+		return fmt.Errorf("删除 AutoConfigURL 失败: %w", err)
+	}
 	notify()
 	return nil
 }
 
-// WinHTTPBypass 是 WinHTTP 的本地绕过列表。
-const WinHTTPBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;192.168.*;*.local"
+// WinHTTPBypass 是 WinHTTP 的本地绕过列表。与 Enable 的 bypass 保持一致，
+// 172.16–172.31 全部 16 个 /16 都要列出。
+const WinHTTPBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;*.local"
 
 // WinHTTPRaw 读取系统当前的 WinHTTP 代理二进制设置。
 // 返回值 nil 表示从未设置过（即直连），还原时删除该值即可。
@@ -193,8 +200,13 @@ func WinHTTPRaw() ([]byte, error) {
 
 	b, _, err := k.GetBinaryValue("WinHttpSettings")
 	if err != nil {
-		// 值不存在等价于直连，不算错误。
-		return nil, nil
+		// 只有"值确实不存在"才等价于直连；其它读取错误（权限、临时故障）
+		// 必须如实上报，否则调用方会拿 nil 当备份，还原时把用户真实的
+		// WinHTTP 设置永久删掉。
+		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取 WinHttpSettings 失败: %w", err)
 	}
 	return b, nil
 }

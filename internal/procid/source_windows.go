@@ -14,6 +14,29 @@ import (
 // WindowsSource 返回基于 Toolhelp32 快照的进程来源。
 func WindowsSource() Source { return SourceFunc(listWindowsProcesses) }
 
+// ProcessMatches 校验快照记录的进程实例当前是否仍存在且创建时间一致。
+// 供 Tracker 在采纳快照路径前做实时确认，消除快照 TTL 内同名进程被
+// 新实例替换时把连接挂到错误路径的竞态。
+func ProcessMatches(info ProcInfo) bool {
+	if info.PID == 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, info.PID)
+	if err != nil {
+		// 进程已退出（或权限不足无法确认）：一律视为失效。
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var created, exited, kernel, user windows.Filetime
+	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {
+		return false
+	}
+	if info.Created.IsZero() {
+		return true
+	}
+	return created.Nanoseconds() == info.Created.UnixNano()
+}
+
 // FileIdentity 返回 exe 的卷序列号 + 文件索引（0 表示读取失败）。
 // 它只用于诊断/升级识别，不参与规则键：规则必须能跨重启稳定匹配。
 func FileIdentity(path string) string {

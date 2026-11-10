@@ -134,6 +134,10 @@ type CoreService struct {
 	// tunPrevProxyOn 记录"因为开 TUN 而被临时关掉的系统代理"。
 	// 关 TUN 成功后据此恢复，避免丢失用户原本的接管状态。
 	tunPrevProxyOn bool
+	// tunPrevRegistry 记录开 TUN 前注册表里用户自己的代理设置（如外部的
+	// Clash Verge / v2rayN）。开 TUN 会临时关闭它；关 TUN 后必须原样还
+	// 回去，否则用户的外部代理会被静默丢掉、且退出后表现为"莫名断网"。
+	tunPrevRegistry proxyBackup
 
 	// WinHTTP 是机器级代理设置，只有管理员能改。备份与"待还原"状态
 	// 落 app-state，避免这次以普通权限退出后把服务流量指向死端口。
@@ -207,6 +211,11 @@ type CoreService struct {
 	// 锁顺序：subsMu → s.mu；不得在持有 subsMu 时调用 lifeMu 操作，
 	// 因此内核重启放在释放 subsMu 之后。
 	subsMu sync.Mutex
+
+	// rulesMu 串行化进程/网站规则的读-改-写事务：快照 → 落盘 → 内存提交
+	// 必须一气呵成，否则两个并发的修改会基于同一底稿互相覆盖对方的更新。
+	// 锁顺序：rulesMu → s.mu；不与 proxyMu/lifeMu 同持。
+	rulesMu sync.Mutex
 
 	// procGenMu 串行化进程规则 generation 的发布与清理，避免两个并发
 	// publish 互相删除对方刚写好的文件。
@@ -289,6 +298,7 @@ func NewCoreService() *CoreService {
 	}
 	s.procTracker = procid.NewTracker(procid.WindowsSource(), 5*time.Second)
 	s.procTracker.SetFileIDFunc(procid.FileIdentity)
+	s.procTracker.SetVerifyFunc(procid.ProcessMatches)
 	s.procTracker.SetLogger(func(format string, args ...any) { s.dbg(format, args...) })
 	return s
 }
@@ -1627,6 +1637,14 @@ func (s *CoreService) setSystemProxyLocked(on bool, genOK func() bool) error {
 // 必须走代理事务锁并重复校验代际，避免 Stop 之后又被旧任务写回。
 func (s *CoreService) updateSystemProxyPort(gen uint64, ctx context.Context, port int) error {
 	return s.withProxyTx(gen, ctx, func() error {
+		s.mu.RLock()
+		proxyOn := s.proxyOn
+		s.mu.RUnlock()
+		// 并发的关闭事务可能已在这之前完成还原（backup 已清、proxyOn=false）。
+		// 此时绝不能把旧端口重新写进注册表，否则会留下退出时无法清理的幻影接管。
+		if !proxyOn {
+			return nil
+		}
 		addr := fmt.Sprintf("127.0.0.1:%d", port)
 		if err := s.proxyOps().Enable(addr); err != nil {
 			return err
@@ -1746,15 +1764,19 @@ func (s *CoreService) restoreProxyTransactionLocked(bk proxyBackup) error {
 	}
 	ops := s.proxyOps()
 
-	// 上一次恢复失败后，用户/外部软件可能已经重新接管代理。
-	// 此时绝不能把我们的旧快照覆盖回去——先判定当前注册表是否还认识。
-	if bk.Pending {
-		cur, _ := ops.Current()
-		if !proxyStillOurs(bk, cur) {
-			s.dbg("恢复待完成期间系统代理已被外部修改为 %q，放弃还原", cur)
-			s.relinquishProxyLocked(bk)
-			return nil
-		}
+	// 上一次恢复失败后重试，或普通关闭路径，都可能遇到接管期间
+	// 用户/外部软件已经重新设置了代理。此时绝不能把我们的旧快照
+	// 覆盖回去——先判定当前注册表是否仍属于本程序的接管/恢复过程，
+	// 不属于就放弃还原，不能覆盖用户的新设置。
+	// 本程序当前端口的地址也算"我们"：端口迁移后内存里的 Addr
+	// 可能短暂落后于注册表（reconcile 校正先落盘后提交内存）。
+	s.mu.RLock()
+	want := fmt.Sprintf("127.0.0.1:%d", s.mixedPort)
+	s.mu.RUnlock()
+	if cur, _ := ops.Current(); !proxyStillOurs(bk, cur) && !strings.EqualFold(cur, want) {
+		s.dbg("系统代理已被外部修改为 %q，放弃还原", cur)
+		s.relinquishProxyLocked(bk)
+		return nil
 	}
 
 	// 1) 先把"恢复中"落盘。这样即使恢复过程中崩溃，下次启动也只会
@@ -2051,6 +2073,11 @@ func (s *CoreService) reconcileProxyLocked() {
 	if err := s.persistProxyState(st); err != nil {
 		s.dbg("update proxy state failed: %v", err)
 	}
+	// 内存备份的 Addr 也要同步成新端口，否则后续还原事务的
+	// 归属判定会拿陈旧端口去比对注册表，误判为外部接管。
+	s.mu.Lock()
+	s.backup = st
+	s.mu.Unlock()
 }
 
 // retryPendingRestoreLocked 执行一次还原事务并同步内存意图。调用方必须已持有 proxyMu。
@@ -2211,6 +2238,9 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 		s.backup = proxyBackup{}
 		// 只有"本来由我们接管"的系统代理才在关闭 TUN 后自动恢复。
 		s.tunPrevProxyOn = prevProxyOn
+		// 记录切换前的注册表快照：里面可能是用户自己的外部代理（Clash
+		// Verge / v2rayN 等），关 TUN 时要原样还回去，不能只恢复本程序的接管。
+		s.tunPrevRegistry = previousRegistry
 		s.mu.Unlock()
 		s.saveAppState()
 		return nil
@@ -2222,6 +2252,8 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 	s.tunOn = false
 	wantProxy := s.tunPrevProxyOn
 	s.tunPrevProxyOn = false
+	prevRegistry := s.tunPrevRegistry
+	s.tunPrevRegistry = proxyBackup{}
 	s.mu.Unlock()
 	s.saveAppState()
 
@@ -2238,6 +2270,17 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 			s.restoreProxy = true
 			s.mu.Unlock()
 			s.saveAppState()
+		}
+	}
+
+	// 本程序的接管已按需恢复。剩下的情况里，如果 TUN 之前临时关掉的是
+	// 用户自己的外部代理（快照里启用着且地址非空），现在原样还回去；
+	// 恢复失败只记日志，不影响"TUN 已关闭"的事实。
+	if !wantProxy && prevRegistry.Saved && prevRegistry.Enabled && prevRegistry.Server != "" {
+		if err := s.withProxyTx(0, nil, func() error {
+			return s.applyProxySnapshot(prevRegistry)
+		}); err != nil {
+			s.dbg("TUN 关闭后恢复用户原系统代理失败: %v", err)
 		}
 	}
 	return nil
@@ -2299,13 +2342,18 @@ type ConfigBundle struct {
 // ExportConfig 导出配置为 JSON 字符串，供前端保存成文件。
 func (s *CoreService) ExportConfig() (string, error) {
 	s.mu.RLock()
+	// Marshal 在锁外进行，subs 切片与 procRules map 都必须先拷贝：
+	// 共享引用会与并发写构成数据竞争（map 并发读写会直接 panic）。
 	bundle := ConfigBundle{
 		Version:      1,
 		ExportedAt:   time.Now().Unix(),
-		Subs:         s.subs,
-		ProcRules:    s.procRules,
+		Subs:         append([]subMeta(nil), s.subs...),
+		ProcRules:    make(map[string]string, len(s.procRules)),
 		SmartRouting: s.smartRouting,
 		SiteRules:    append([]SiteRule(nil), s.siteRules...),
+	}
+	for k, v := range s.procRules {
+		bundle.ProcRules[k] = v
 	}
 	for k, v := range s.ignored {
 		if v {
@@ -2914,10 +2962,14 @@ func (s *CoreService) QuickSelectNode(name string) error {
 // 版本号从内核的外部控制 API 读，读不到就返回空（前端显示"未知"）。
 func (s *CoreService) CheckCoreUpdate() (*kernel.LatestInfo, error) {
 	cur := ""
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if v, err := s.api.Version(ctx); err == nil {
-		cur = v.Version
+	// Boot 早期失败时 s.api 可能尚未初始化，此处必须判空，
+	// 否则设置页一点"检查更新"就会空指针崩溃。
+	if s.api != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if v, err := s.api.Version(ctx); err == nil {
+			cur = v.Version
+		}
+		cancel()
 	}
 	// 国内访问 GitHub 可能很慢，给 25 秒
 	return kernel.CheckUpdate(cur, 25*time.Second)
@@ -3500,6 +3552,10 @@ type appState struct {
 	// 关 TUN 后据此恢复，避免切换模式导致系统代理状态丢失。
 	TunPrevProxyOn bool `json:"tunPrevProxyOn,omitempty"`
 
+	// TunPrevRegistry 是开 TUN 前用户自己的系统代理设置（含外部代理软件）。
+	// TUN 期间持久保存，关 TUN 后原样恢复，避免外部代理设置被静默丢失。
+	TunPrevRegistry *proxyBackup `json:"tunPrevRegistry,omitempty"`
+
 	// WinHTTP 接管备份。数据是注册表二进制值（base64 存储），
 	// Pending=true 表示设置仍处于被接管状态，需要在管理员进程里还原。
 	WinHTTPBackup  []byte `json:"winHttpBackup,omitempty"`
@@ -3629,7 +3685,10 @@ func (s *CoreService) migrateSingleSub() {
 
 func (s *CoreService) saveSubs() {
 	s.mu.RLock()
-	st := subsStore{Items: s.subs, Active: s.activeIdx, Version: currentConfigVersion}
+	// 必须在锁内拷贝：直接传 s.subs 会让 Marshal 在锁外遍历共享底层数组，
+	// 与写锁下的原地修改（SetSubInsecure/removeSubscription 等）构成数据竞争。
+	items := append([]subMeta(nil), s.subs...)
+	st := subsStore{Items: items, Active: s.activeIdx, Version: currentConfigVersion}
 	s.mu.RUnlock()
 	if mb, err := json.MarshalIndent(st, "", "  "); err == nil {
 		if err := writeFileAtomic(filepath.Join(dataDir(), subsFile), mb, 0o600); err != nil {
@@ -4736,6 +4795,11 @@ func (s *CoreService) loadAppState() {
 	}
 	s.restoreProxy = st.ProxyOn
 	s.tunPrevProxyOn = st.TunPrevProxyOn
+	if st.TunPrevRegistry != nil {
+		s.tunPrevRegistry = *st.TunPrevRegistry
+	} else {
+		s.tunPrevRegistry = proxyBackup{}
+	}
 	s.winHTTPPending = st.WinHTTPPending
 	s.winHTTPBackup = append([]byte(nil), st.WinHTTPBackup...)
 	s.smartRouting = st.SmartRouting
@@ -4804,6 +4868,10 @@ func (s *CoreService) saveAppState() {
 		HomeLat:        &lat,
 		HomeLabel:      s.homeLabel,
 		Version:        currentConfigVersion,
+	}
+	if s.tunPrevRegistry.Saved {
+		reg := s.tunPrevRegistry
+		st.TunPrevRegistry = &reg
 	}
 	s.mu.RUnlock()
 	if st.Mode == "" {
@@ -4934,6 +5002,10 @@ func (s *CoreService) updateActiveSubMeta(url string, res *subscription.Result) 
 	s.mu.Lock()
 	for i := range s.subs {
 		if s.subs[i].URL == url {
+			// 拉取期间用户可能经 SetSubInsecure 改过证书校验开关，
+			// 必须保留内存里的最新值（与 applySubscriptionExpect 一致），
+			// 不能用拉取开始时的旧值回写覆盖。
+			meta.Insecure = s.subs[i].Insecure
 			s.subs[i] = meta
 			break
 		}
@@ -5052,6 +5124,8 @@ func (s *CoreService) SetSiteRuleWithType(domain, ruleType, policy string) error
 		return err
 	}
 
+	// 规则读-改-写必须整段串行：并发修改不能基于同一底稿互相覆盖。
+	s.rulesMu.Lock()
 	s.mu.RLock()
 	next := append([]SiteRule(nil), s.siteRules...)
 	s.mu.RUnlock()
@@ -5068,11 +5142,13 @@ func (s *CoreService) SetSiteRuleWithType(domain, ruleType, policy string) error
 	}
 
 	if err := s.persistSiteRules(next); err != nil {
+		s.rulesMu.Unlock()
 		return fmt.Errorf("保存网站规则失败: %w", err)
 	}
 	s.mu.Lock()
 	s.siteRules = next
 	s.mu.Unlock()
+	s.rulesMu.Unlock()
 
 	if err := s.applyGeneratedConfig(); err != nil {
 		return err
@@ -5100,6 +5176,8 @@ func (s *CoreService) deleteSiteRule(domain, onlyType string) error {
 	if err != nil {
 		return err
 	}
+	// 规则读-改-写必须整段串行：并发修改不能基于同一底稿互相覆盖。
+	s.rulesMu.Lock()
 	s.mu.RLock()
 	next := make([]SiteRule, 0, len(s.siteRules))
 	var removed []SiteRule
@@ -5114,11 +5192,13 @@ func (s *CoreService) deleteSiteRule(domain, onlyType string) error {
 	s.mu.RUnlock()
 
 	if err := s.persistSiteRules(next); err != nil {
+		s.rulesMu.Unlock()
 		return fmt.Errorf("保存网站规则失败: %w", err)
 	}
 	s.mu.Lock()
 	s.siteRules = next
 	s.mu.Unlock()
+	s.rulesMu.Unlock()
 
 	if err := s.applyGeneratedConfig(); err != nil {
 		return err
@@ -5256,6 +5336,8 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 		}
 	}
 
+	// 规则读-改-写必须整段串行：并发修改不能基于同一底稿互相覆盖。
+	s.rulesMu.Lock()
 	// 查旧值时忽略键的大小写差异；路径身份在 Windows 上不区分大小写。
 	s.mu.RLock()
 	oldKey := ident.Key
@@ -5268,6 +5350,7 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 	}
 	s.mu.RUnlock()
 	if oldKey == ident.Key && oldPolicy == policy {
+		s.rulesMu.Unlock()
 		return 0, nil
 	}
 
@@ -5286,11 +5369,13 @@ func (s *CoreService) SetProcessRule(proc, policy string) (int, error) {
 	}
 
 	if err := s.persistProcRuleSnapshot(next); err != nil {
+		s.rulesMu.Unlock()
 		return 0, fmt.Errorf("保存进程规则失败: %w", err)
 	}
 	s.mu.Lock()
 	s.procRules = next
 	s.mu.Unlock()
+	s.rulesMu.Unlock()
 
 	if s.api == nil || s.mgr == nil || !s.mgr.IsRunning() {
 		return 0, nil

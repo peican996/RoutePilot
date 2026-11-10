@@ -40,7 +40,10 @@ func (j *jobObject) ensureLocked() error {
 		return fmt.Errorf("Job Object 已关闭")
 	}
 	if j.handle != 0 {
-		return j.initErr
+		// 句柄已就绪说明此前某次创建成功了：当时如果还带着更早的失败
+		// 记录，也早已过期，不能让一次暂态失败永久毒化后续所有启动。
+		j.initErr = nil
+		return nil
 	}
 
 	h, err := windows.CreateJobObject(nil, nil)

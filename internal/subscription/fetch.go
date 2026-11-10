@@ -462,6 +462,15 @@ func decodeBase64Body(body []byte) ([]byte, bool) {
 	return nil, false
 }
 
+// nodeSchemes 是认可的节点协议。HTTP 错误页/运营商门户页里的绝对链接
+// （https://... 行）不能被误判成节点，否则会生成假订阅、掩盖真实故障。
+var nodeSchemes = map[string]bool{
+	"ss": true, "ssr": true, "vmess": true, "vless": true,
+	"trojan": true, "hysteria": true, "hysteria2": true, "hy2": true,
+	"tuic": true, "socks": true, "socks5": true, "snell": true,
+	"wireguard": true, "mieru": true, "naive+tls": true, "ssh": true,
+}
+
 // uriLines 从文本里挑出节点 URI 行。
 func uriLines(body []byte) []string {
 	var out []string
@@ -470,7 +479,9 @@ func uriLines(body []byte) []string {
 		if line == "" {
 			continue
 		}
-		if strings.Contains(line, "://") {
+		// 只接受已知节点协议的 scheme，任意含 :// 的行（如 HTML 错误页
+		// 里的普通超链接）一律不算，避免把网页当订阅解析"成功"。
+		if k := strings.Index(line, "://"); k > 0 && nodeSchemes[strings.ToLower(line[:k])] {
 			out = append(out, line)
 		}
 	}
