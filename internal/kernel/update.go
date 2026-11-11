@@ -184,8 +184,15 @@ type semver struct {
 	pre  []string
 }
 
-// parseSemver 解析 SemVer 2.0.0 版本号（允许省略前导 v/V）。
-// build metadata（+xxx）按规范忽略。核心段必须全部为数字。
+// parseSemver 严格解析 SemVer 2.0.0 版本号（允许省略前导 v/V）。
+//
+// 校验规则（全部拒绝即返回 ok=false）：
+//   - 核心版本必须是三段数字 major.minor.patch，不允许前导零、不允许缺段；
+//   - 数字必须落在 int64 范围内；
+//   - 预发布标识符以 . 分隔，不得为空，只允许 [0-9A-Za-z-]；
+//     纯数字标识符不允许前导零；
+//   - build metadata（+xxx）只允许出现一次，标识符不得为空且只允许 [0-9A-Za-z-]；
+//     build metadata 不参与优先级比较，但格式非法仍判为无效版本。
 func parseSemver(v string) (semver, bool) {
 	v = strings.TrimSpace(v)
 	v = strings.TrimPrefix(v, "v")
@@ -193,9 +200,20 @@ func parseSemver(v string) (semver, bool) {
 	if v == "" {
 		return semver{}, false
 	}
+
 	if i := strings.IndexByte(v, '+'); i >= 0 {
+		build := v[i+1:]
 		v = v[:i]
+		if build == "" || strings.ContainsRune(build, '+') {
+			return semver{}, false
+		}
+		for _, id := range strings.Split(build, ".") {
+			if !isSemverIdent(id, true) {
+				return semver{}, false
+			}
+		}
 	}
+
 	var pre []string
 	if i := strings.IndexByte(v, '-'); i >= 0 {
 		preStr := v[i+1:]
@@ -204,25 +222,77 @@ func parseSemver(v string) (semver, bool) {
 			return semver{}, false
 		}
 		pre = strings.Split(preStr, ".")
+		for _, id := range pre {
+			if !isSemverIdent(id, false) {
+				return semver{}, false
+			}
+			// 纯数字标识符还要确认没有前导零且不溢出。
+			if isAllDigits(id) {
+				if len(id) > 1 && id[0] == '0' {
+					return semver{}, false
+				}
+				if _, err := strconv.ParseUint(id, 10, 63); err != nil {
+					return semver{}, false
+				}
+			}
+		}
 	}
+
 	parts := strings.Split(v, ".")
-	core := make([]int, 0, len(parts))
-	for _, p := range parts {
-		if p == "" {
+	if len(parts) != 3 {
+		return semver{}, false
+	}
+	core := make([]int, 3)
+	for i, p := range parts {
+		if !isAllDigits(p) {
 			return semver{}, false
 		}
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
+		if len(p) > 1 && p[0] == '0' {
 			return semver{}, false
 		}
-		core = append(core, n)
+		n, err := strconv.ParseUint(p, 10, 63)
+		if err != nil {
+			return semver{}, false
+		}
+		core[i] = int(n)
 	}
 	return semver{core: core, pre: pre}, true
 }
 
-func numericIdent(s string) (int, bool) {
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 0 {
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isSemverIdent 校验单个标识符：非空且字符集为 [0-9A-Za-z-]。
+// allowLeadingZero=false 时，纯数字标识符不允许前导零（SemVer 规范要求）。
+func isSemverIdent(s string, allowLeadingZero bool) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' {
+			continue
+		}
+		return false
+	}
+	if !allowLeadingZero && len(s) > 1 && s[0] == '0' && isAllDigits(s) {
+		return false
+	}
+	return true
+}
+
+func numericIdent(s string) (uint64, bool) {
+	n, err := strconv.ParseUint(s, 10, 63)
+	if err != nil {
 		return 0, false
 	}
 	return n, true

@@ -82,6 +82,22 @@ func waitState(t *testing.T, m *Manager, want State, timeout time.Duration) {
 	t.Fatalf("等待状态 %s 超时，当前 %s（%s）", want, m.Status().State, m.Status().Error)
 }
 
+// waitPID 等待状态快照里的 PID 就绪。
+// Starting 状态与 PID 赋值之间存在极短窗口，直接取样会读到 0
+// 并与随后才写入的 PID 比较，造成偶发失败。
+func waitPID(t *testing.T, m *Manager, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pid := m.Status().PID; pid > 0 {
+			return pid
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("等待 PID 就绪超时，当前状态 %s（%s）", m.Status().State, m.Status().Error)
+	return 0
+}
+
 func processAlive(pid int) bool {
 	if pid <= 0 {
 		return false
@@ -158,7 +174,7 @@ func TestStartWhileStartingRejected(t *testing.T) {
 	first := make(chan error, 1)
 	go func() { first <- m.Start("dummy.yaml") }()
 	waitState(t, m, StateStarting, time.Second)
-	pid := m.Status().PID
+	pid := waitPID(t, m, time.Second)
 	if m.IsRunning() {
 		t.Fatal("Starting 状态不应被判定为 Running")
 	}

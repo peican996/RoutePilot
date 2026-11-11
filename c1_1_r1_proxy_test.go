@@ -461,7 +461,7 @@ func TestR1WatchdogExhaustedRestoreSerializedWithUser(t *testing.T) {
 	}
 	restored := make(chan struct{})
 	var restoreOnce sync.Once
-	fake.disableHook = func() { restoreOnce.Do(func() { close(restored) }) }
+	fake.setEnabledHook = func() { restoreOnce.Do(func() { close(restored) }) }
 
 	userDone := make(chan error, 1)
 	go func() { userDone <- svc.SetSystemProxy(true) }()

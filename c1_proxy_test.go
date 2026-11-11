@@ -17,6 +17,7 @@ type fakeRegistry struct {
 
 	failEnable      bool
 	failDisable     bool
+	failSetEnabled  bool
 	failSetServer   bool
 	failSetOverride bool
 	failSetPAC      bool
@@ -33,10 +34,14 @@ type fakeRegistry struct {
 	enableHook func()
 	// disableHook 在 Disable 成功之后调用，供测试等待事务真正落地。
 	disableHook func()
+	// setEnabledHook 在 SetEnabled 成功之后调用。系统代理还原走字段级写入，
+	// 不再调用 Disable，需要还原落地的测试用这个钩子。
+	setEnabledHook func()
 
-	enableCalls  int
-	disableCalls int
-	winHTTPCalls int
+	enableCalls     int
+	disableCalls    int
+	setEnabledCalls int
+	winHTTPCalls    int
 }
 
 func (f *fakeRegistry) ops() systemProxyOps {
@@ -71,6 +76,18 @@ func (f *fakeRegistry) ops() systemProxyOps {
 			f.written = true
 			if f.disableHook != nil {
 				f.disableHook()
+			}
+			return nil
+		},
+		SetEnabled: func(enabled bool) error {
+			f.setEnabledCalls++
+			if f.failSetEnabled {
+				return errors.New("injected set-enabled failure")
+			}
+			f.enabled = enabled
+			f.written = true
+			if f.setEnabledHook != nil {
+				f.setEnabledHook()
 			}
 			return nil
 		},

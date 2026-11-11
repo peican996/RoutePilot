@@ -54,12 +54,27 @@ type proxyBackup struct {
 	PendingServer string `json:"pendingServer,omitempty"`
 }
 
+// tunRestoreState 记录一次 TUN 原始代理恢复的字段级进度。
+//
+// 作用：恢复失败重试时，注册表可能同时存在三类值：
+//   - 程序预期写入的目标值（Want.*）
+//   - 程序开始恢复前的值（Begin.*，通常是 TUN 生效后被关闭的状态）
+//   - 用户在两次恢复之间新设置的值
+//
+// 只有前两类允许继续覆盖；出现第三类必须停止并放弃旧快照。
+// Begin/Want 随 Pending 一起原子落盘，进程崩溃后仍可判定。
+type tunRestoreState struct {
+	Begin proxyBackup `json:"begin"`
+	Want  proxyBackup `json:"want"`
+}
+
 // systemProxyOps 把注册表操作抽成可替换的函数集合。
 // 生产环境使用真实 sysproxy 实现；测试用它注入失败，验证事务与回滚。
 type systemProxyOps struct {
 	Current            func() (string, bool)
 	Enable             func(string) error
 	Disable            func() error
+	SetEnabled         func(bool) error
 	SetServer          func(string) error
 	Override           func() string
 	SetOverride        func(string) error
@@ -76,6 +91,7 @@ func defaultSystemProxyOps() systemProxyOps {
 		Current:            sysproxy.Current,
 		Enable:             sysproxy.Enable,
 		Disable:            sysproxy.Disable,
+		SetEnabled:         sysproxy.SetEnabled,
 		SetServer:          sysproxy.SetServer,
 		Override:           sysproxy.Override,
 		SetOverride:        sysproxy.SetOverride,
@@ -165,6 +181,9 @@ type CoreService struct {
 	// tunProxyPending 表示"TUN 已关闭但用户原始代理尚未恢复成功"。
 	// 置位后会落盘，下次启动优先重试，避免网络配置永久停留在半关闭状态。
 	tunProxyPending bool
+	// tunRestoreTxn 是恢复过程中的字段级记录（Begin/Want），
+	// 与 tunProxyPending 一起落盘，用于重试时区分程序写入与用户新设置。
+	tunRestoreTxn *tunRestoreState
 
 	// WinHTTP 是机器级代理设置，只有管理员能改。备份与"待还原"状态
 	// 落 app-state，避免这次以普通权限退出后把服务流量指向死端口。
@@ -1721,13 +1740,9 @@ func (s *CoreService) applyProxySnapshot(bk proxyBackup) error {
 	ops := s.proxyOps()
 	var errs []error
 
-	// 先恢复启用态，再逐字段覆盖。Enable 会顺带写入固定的 ProxyServer 与
-	// 绕过列表，所以必须在它之后写回原始字段，否则用户的自定义配置会被污染。
-	if bk.Enabled {
-		errs = append(errs, ops.Enable(bk.Server))
-	} else {
-		errs = append(errs, ops.Disable())
-	}
+	// 逐字段写回，互不干扰。不要用 Enable(addr)：它会顺带覆盖
+	// ProxyServer 与 ProxyOverride，用在字段级恢复里会把已恢复的
+	// 字段又改回去，也会让"部分恢复"的中间态难以判定。
 	errs = append(errs, ops.SetServer(bk.Server))
 	errs = append(errs, ops.SetOverride(bk.Override))
 	if bk.AutoConfigURL != "" {
@@ -1735,6 +1750,7 @@ func (s *CoreService) applyProxySnapshot(bk proxyBackup) error {
 	} else {
 		errs = append(errs, ops.ClearAutoConfigURL())
 	}
+	errs = append(errs, ops.SetEnabled(bk.Enabled))
 
 	var filtered []error
 	for _, err := range errs {
@@ -2175,6 +2191,11 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 	if on && !s.admin() {
 		return fmt.Errorf("开启 TUN 需要管理员权限")
 	}
+	// TUN 依赖内核本身，内核没跑就开 TUN 只会把系统代理关掉却不接管流量，
+	// 结果是"无代理且无 TUN"。必须在改动任何状态之前直接拒绝。
+	if on && !s.kernelRunning() {
+		return fmt.Errorf("内核未运行，无法开启 TUN，请先启动内核")
+	}
 
 	s.mu.Lock()
 	if s.tunChanging {
@@ -2242,7 +2263,27 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 				return fmt.Errorf("切换 TUN 前还原 WinHTTP 失败: %w", err)
 			}
 			// 3) 记录 TUN 生效后注册表的样貌，关 TUN 时据此判断外部改动。
+			//    必须在进入内核重启之前落盘：否则"关闭系统代理 → 内核重启"
+			//    之间崩溃时，下次启动没有判定依据，只能放弃恢复。
 			afterDisable = s.captureProxySnapshot("")
+			s.mu.Lock()
+			s.tunAfterDisable = afterDisable
+			s.mu.Unlock()
+			if err := s.saveAppStateErr(); err != nil {
+				// 落盘失败：把注册表按实际内容回滚，不能停留在"已关闭"状态。
+				if rbErr := s.applyProxySnapshot(previousRegistry); rbErr != nil {
+					s.dbg("TUN 前置 afterDisable 落盘失败且回滚失败: %v", rbErr)
+					return fmt.Errorf("%w: %v", errTUNRollbackFailed, err)
+				}
+				s.mu.Lock()
+				s.tunPrevRegistry = proxyBackup{}
+				s.tunAfterDisable = proxyBackup{}
+				s.tunRestoreTxn = nil
+				s.tunProxyPending = false
+				s.mu.Unlock()
+				s.saveAppState()
+				return fmt.Errorf("%w: %v", errTUNSnapshotSaveFailed, err)
+			}
 			return nil
 		})
 		if prepErr != nil {
@@ -2260,12 +2301,14 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 				s.proxyOn = false
 				s.tunPrevRegistry = proxyBackup{}
 				s.tunAfterDisable = proxyBackup{}
+				s.tunRestoreTxn = nil
 				s.tunProxyPending = false
 			case errors.Is(prepErr, errTUNRollbackFailed):
 				// 注册表未能回到原状：保留快照并标记待恢复，下次启动重试。
 				s.proxyOn = prevProxyOn
 				s.backup = prevBackup
 				s.tunPrevProxyOn = prevTunPrevProxy
+				s.tunRestoreTxn = nil
 				s.tunProxyPending = true
 			default:
 				// 注册表已回滚到切换前，内存状态也回到切换前。
@@ -2274,6 +2317,7 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 				s.tunPrevProxyOn = prevTunPrevProxy
 				s.tunPrevRegistry = proxyBackup{}
 				s.tunAfterDisable = proxyBackup{}
+				s.tunRestoreTxn = nil
 				s.tunProxyPending = false
 			}
 			s.mu.Unlock()
@@ -2337,6 +2381,7 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 				} else {
 					s.tunPrevRegistry = proxyBackup{}
 					s.tunAfterDisable = proxyBackup{}
+					s.tunRestoreTxn = nil
 					s.tunProxyPending = false
 				}
 			} else if s.tunOn {
@@ -2364,6 +2409,7 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 		// 快照在改注册表之前已落盘；这里补齐"TUN 生效后"的样貌。
 		s.tunPrevRegistry = previousRegistry
 		s.tunAfterDisable = afterDisable
+		s.tunRestoreTxn = nil
 		s.tunProxyPending = false
 		s.mu.Unlock()
 		s.saveAppState()
@@ -2383,6 +2429,17 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 
 	if wantProxy {
 		// 原本由本程序接管：恢复接管即可，外部快照不再需要。
+		//
+		// 关键：重新接管时必须沿用 tunPrevRegistry 里的用户原始四字段作为
+		// 新备份。若交给 SetSystemProxy 重新捕获，读到的是 TUN 期间被我们
+		// 关闭后的注册表（Enabled=false），用户之后关闭代理就会被还原成
+		// 关闭状态，原始配置永久丢失。
+		if prevRegistry.Saved {
+			s.mu.Lock()
+			s.backup = prevRegistry
+			s.proxyOn = false
+			s.mu.Unlock()
+		}
 		if s.kernelRunning() {
 			if err := s.SetSystemProxy(true); err != nil {
 				s.mu.Lock()
@@ -2418,15 +2475,17 @@ func (s *CoreService) setTUN(on bool, restart func() error) error {
 	return nil
 }
 
-// clearTunSnapshot 清除 TUN 外部代理快照并落盘。仅在确认无需恢复或恢复成功后调用。
-// 返回错误表示"注册表已恢复但删除依据失败"，调用方必须如实上报，不能谎报成功。
-// 落盘失败时必须把内存里的快照还原回去，否则下次启动就失去了恢复依据。
+// clearTunSnapshot 清除 TUN 外部代理快照与恢复记录并落盘。
+// 仅在确认无需恢复或恢复成功后调用。返回错误表示"注册表已恢复但删除依据失败"，
+// 调用方必须如实上报；落盘失败时把内存状态整体回滚，否则会丢失恢复依据。
 func (s *CoreService) clearTunSnapshot() error {
 	s.mu.Lock()
 	prev, after := s.tunPrevRegistry, s.tunAfterDisable
+	txn := s.tunRestoreTxn
 	pending := s.tunProxyPending
 	s.tunPrevRegistry = proxyBackup{}
 	s.tunAfterDisable = proxyBackup{}
+	s.tunRestoreTxn = nil
 	s.tunProxyPending = false
 	s.mu.Unlock()
 
@@ -2434,12 +2493,18 @@ func (s *CoreService) clearTunSnapshot() error {
 		s.mu.Lock()
 		s.tunPrevRegistry = prev
 		s.tunAfterDisable = after
+		s.tunRestoreTxn = txn
 		s.tunProxyPending = pending
 		s.mu.Unlock()
 		return err
 	}
 	return nil
 }
+
+// errTunNoBasis 表示缺少"当前注册表是否被用户改过"的判定依据
+// （如 afterDisable 未落盘、旧版本遗留的 Pending 没有字段级记录）。
+// 此时绝不能覆盖当前注册表，只能放弃自动还原并提示用户。
+var errTunNoBasis = errors.New("缺少 TUN 代理恢复的判定依据")
 
 // restoreTunExternalProxyLocked 把 TUN 之前的用户系统代理还回去。
 // 调用方必须持有 proxyMu。返回 nil 表示已恢复、无需恢复或已主动放弃。
@@ -2450,49 +2515,90 @@ func (s *CoreService) restoreTunExternalProxyLocked(prev, after proxyBackup) err
 	if !prev.Saved {
 		s.mu.Lock()
 		s.tunProxyPending = false
+		s.tunRestoreTxn = nil
 		s.mu.Unlock()
 		return nil
 	}
 	ops := s.proxyOps()
 
-	// 1) 外部已接管：TUN 运行期间用户/别的软件改了代理，绝不覆盖。
-	//    只在"首次尝试恢复"时判定：pending=true 说明上一次恢复已经写过
-	//    一部分注册表，此时残留的中间态本来就不等于 after，再判外部会把
-	//    自己的半成品误认成用户的新配置，导致永远无法恢复。
 	s.mu.RLock()
-	alreadyPending := s.tunProxyPending
+	pending := s.tunProxyPending
+	txn := s.tunRestoreTxn
 	s.mu.RUnlock()
-	if !alreadyPending && after.Saved {
+
+	if pending {
+		// 恢复已经开始过：注册表里可能同时存在"程序写入的目标值"
+		// 和"用户后来设置的新值"。没有字段级记录就无法区分，绝不覆盖。
+		if txn == nil {
+			_ = s.clearTunSnapshot()
+			return fmt.Errorf("%w: 上次恢复缺少字段级记录，已放弃自动还原以免覆盖用户设置", errTunNoBasis)
+		}
+		if field, cur := tunRestoreUserChanged(ops, *txn); field != "" {
+			s.dbg("TUN 代理重试时检测到用户新设置的 %s=%q，放弃还原", field, cur)
+			_ = s.clearTunSnapshot()
+			return nil
+		}
+	} else {
+		// 首次尝试：必须有 afterDisable 才能判断 TUN 期间是否被外部修改。
+		// 缺失时直接覆盖风险过高，放弃并交给用户确认。
+		if !after.Saved {
+			_ = s.clearTunSnapshot()
+			return fmt.Errorf("%w: afterDisable 缺失，已放弃自动还原以免覆盖当前代理", errTunNoBasis)
+		}
 		cur, enabled := ops.Current()
 		if tunRegistryChangedExternally(after, cur, enabled, ops.Override(), ops.AutoConfigURL()) {
 			s.dbg("TUN 期间系统代理已被外部修改（current=%q enabled=%v），放弃还原旧快照", cur, enabled)
-			if clrErr := s.clearTunSnapshot(); clrErr != nil {
-				s.dbg("放弃 TUN 快照时删除依据失败: %v", clrErr)
-			}
+			_ = s.clearTunSnapshot()
 			return nil
 		}
+		// 开始恢复前注册表就是 after 描述的样貌，把它记为 Begin。
+		txn = &tunRestoreState{Begin: after, Want: prev}
 	}
 
-	// 2) 先落盘 Pending：恢复过程中崩溃，下次启动仍会重试。
+	// 1) 先落盘 Pending + 字段级记录：恢复过程中崩溃，下次仍能判定。
 	s.mu.Lock()
 	s.tunProxyPending = true
+	s.tunRestoreTxn = txn
 	s.mu.Unlock()
 	if err := s.saveAppStateErr(); err != nil {
 		return fmt.Errorf("标记 TUN 原始代理待恢复失败: %w", err)
 	}
-	// 3) 写入 + 回读校验：不能凭"写入没报错"就删除快照。
+	// 2) 写入 + 回读校验：不能凭"写入没报错"就删除快照。
 	if err := s.applyProxySnapshot(prev); err != nil {
 		return fmt.Errorf("写入原始系统代理失败（快照已保留）: %w", err)
 	}
 	if err := s.verifyProxySnapshot(prev); err != nil {
 		return fmt.Errorf("原始系统代理回读校验失败（快照已保留）: %w", err)
 	}
-	// 4) 校验通过才删除快照。删除失败必须如实上报：注册表已恢复，
-	//    但恢复依据还在，下次启动会再校验一次（幂等）。
+	// 3) 校验通过才删除快照与恢复记录。
 	if err := s.clearTunSnapshot(); err != nil {
 		return fmt.Errorf("删除 TUN 系统代理快照失败（恢复已完成，下次将继续校验）: %w", err)
 	}
 	return nil
+}
+
+// tunRestoreUserChanged 逐字段判定当前注册表是否被用户/第三方改写。
+//
+// 每个字段允许两种值：程序目标值（Want）与恢复开始前的值（Begin）。
+// 出现第三种值即视为用户新设置，必须停止恢复。
+// 返回被改写的字段名与当前值；字段名为空表示可以安全继续。
+func tunRestoreUserChanged(ops systemProxyOps, txn tunRestoreState) (string, string) {
+	cur, enabled := ops.Current()
+	if enabled != txn.Want.Enabled && enabled != txn.Begin.Enabled {
+		return "ProxyEnable", fmt.Sprintf("%v", enabled)
+	}
+	if !strings.EqualFold(cur, txn.Want.Server) && !strings.EqualFold(cur, txn.Begin.Server) {
+		return "ProxyServer", cur
+	}
+	override := ops.Override()
+	if override != txn.Want.Override && override != txn.Begin.Override {
+		return "ProxyOverride", override
+	}
+	pac := ops.AutoConfigURL()
+	if pac != txn.Want.AutoConfigURL && pac != txn.Begin.AutoConfigURL {
+		return "AutoConfigURL", pac
+	}
+	return "", ""
 }
 
 // tunRegistryChangedExternally 判断 TUN 生效后注册表是否被外部程序改动。
@@ -3809,6 +3915,8 @@ type appState struct {
 	TunAfterDisable *proxyBackup `json:"tunAfterDisable,omitempty"`
 	// TunProxyPending 表示 TUN 已关闭但原始代理尚未恢复成功，需下次启动重试。
 	TunProxyPending bool `json:"tunProxyPending,omitempty"`
+	// TunRestoreTxn 记录恢复的字段级进度，用于重试时区分程序写入与用户新设置。
+	TunRestoreTxn *tunRestoreState `json:"tunRestoreTxn,omitempty"`
 
 	// WinHTTP 接管备份。数据是注册表二进制值（base64 存储），
 	// Pending=true 表示设置仍处于被接管状态，需要在管理员进程里还原。
@@ -5060,6 +5168,7 @@ func (s *CoreService) loadAppState() {
 		s.tunAfterDisable = proxyBackup{}
 	}
 	s.tunProxyPending = st.TunProxyPending
+	s.tunRestoreTxn = st.TunRestoreTxn
 	s.winHTTPPending = st.WinHTTPPending
 	s.winHTTPBackup = append([]byte(nil), st.WinHTTPBackup...)
 	s.smartRouting = st.SmartRouting
@@ -5149,6 +5258,10 @@ func (s *CoreService) saveAppStateErr() error {
 	if s.tunAfterDisable.Saved {
 		after := s.tunAfterDisable
 		st.TunAfterDisable = &after
+	}
+	if s.tunRestoreTxn != nil {
+		txn := *s.tunRestoreTxn
+		st.TunRestoreTxn = &txn
 	}
 	s.mu.RUnlock()
 	if st.Mode == "" {

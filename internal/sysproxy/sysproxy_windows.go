@@ -71,6 +71,27 @@ func Disable() error {
 	return nil
 }
 
+// SetEnabled 只改 ProxyEnable，不触碰 ProxyServer / ProxyOverride。
+// 系统代理还原需要逐字段写回：Enable 会顺带覆盖地址与绕过列表，
+// 用在字段级恢复里会把已恢复的字段又改回去，因此单独提供这个入口。
+func SetEnabled(enabled bool) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开注册表失败: %w", err)
+	}
+	defer k.Close()
+
+	v := uint32(0)
+	if enabled {
+		v = 1
+	}
+	if err := k.SetDWordValue("ProxyEnable", v); err != nil {
+		return fmt.Errorf("写入 ProxyEnable 失败: %w", err)
+	}
+	notify()
+	return nil
+}
+
 // SetServer 单独恢复 ProxyServer。关闭代理时 Disable 只改 ProxyEnable，
 // 不会动地址；要把注册表完整还原到接管前，必须显式写回/删除该值。
 func SetServer(addr string) error {
