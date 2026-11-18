@@ -1092,12 +1092,19 @@ export default function App() {
   const overviewProps = { status, traffic, conns, activeNode, trafficHistory };
 
   // 设置面板的全部依赖集中在这里，避免 JSX 里散落一长串 props
+  // 设置页的下拉要显示延迟，而刚测出的结果在 delays 里，
+  // 不合并的话下拉永远显示内核里的历史值（未测过就是 0）。
+  const nodesWithDelay = useMemo(
+    () => nodes.map((n) => (delays[n.name] !== undefined ? { ...n, delay: delays[n.name] } : n)),
+    [nodes, delays],
+  );
+
   const settingsProps = {
     status,
     running,
     busy,
     sub,
-    nodes,
+    nodes: nodesWithDelay,
     autoStart,
     onToggleAutoStart,
     coreInfo,
@@ -1122,6 +1129,9 @@ export default function App() {
     setErr,
     schedNoteClear,
     schedErrClear,
+    // 网站分流的下拉要带延迟，这里把批量测速能力透传下去
+    onTestAll,
+    testing,
   };
 
   const banner = err || status.bootErr || (running ? "" : status.error);

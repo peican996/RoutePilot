@@ -53,6 +53,8 @@ type Props = {
   setErr: (s: string) => void;
   schedNoteClear: (ms: number) => void;
   schedErrClear: (ms: number) => void;
+  onTestAll: () => void;
+  testing: boolean;
 };
 
 type RuleRow = { type: string; payload: string; proxy: string };
@@ -87,6 +89,8 @@ export default function SettingsPanel({
   setErr,
   schedNoteClear,
   schedErrClear,
+  onTestAll,
+  testing,
 }: Props) {
   // 流量告警阈值输入框受控，避免命令式读 DOM 拿到 NaN
   const [alertInput, setAlertInput] = useState("");
@@ -150,12 +154,17 @@ export default function SettingsPanel({
   // 瞬间全变"已失效"，比空白更吓人。
   const targetChoicesLoaded = groupChoices.length + nodeChoices.length > 0;
   const renderSiteTargetOptions = (current: string) => {
-    const known =
-      current === "" ||
+    const matchesKnown =
       current === "direct" ||
       current === "proxy" ||
-      !targetChoicesLoaded ||
       [...groupChoices, ...nodeChoices].some((n) => `target:${n.name}` === current);
+    // 当前值不在选项里时必须补一项，否则 select 会静默回落到第一项
+    // 「直连」——规则明明指向某个节点，界面却显示直连，属于误导。
+    // 节点列表还没加载时只显示原值不标失效（不能断言它真的没了）。
+    const needsFallback = current !== "" && !matchesKnown;
+    const fallbackLabel = targetChoicesLoaded
+      ? `${sitePolicyLabel(current)}（已失效）`
+      : sitePolicyLabel(current);
     return (
       <>
         <option value="direct">直连</option>
@@ -173,12 +182,13 @@ export default function SettingsPanel({
           <optgroup label="节点">
             {nodeChoices.map((n) => (
               <option key={`sn-${n.name}`} value={`target:${n.name}`}>
-                {n.name}
+                {/* 带上延迟，省得为了看一眼数字切到节点页测速 */}
+                {n.delay > 0 ? `${n.name} · ${n.delay}ms` : n.name}
               </option>
             ))}
           </optgroup>
         )}
-        {!known && <option value={current}>{`${sitePolicyLabel(current)}（已失效）`}</option>}
+        {needsFallback && <option value={current}>{fallbackLabel}</option>}
       </>
     );
   };
@@ -337,6 +347,14 @@ export default function SettingsPanel({
   <div className="card" style={{ marginBottom: 14 }}>
     <div className="card-head">
       <span className="card-title">网站分流</span>
+      <button
+        className="btn sm"
+        onClick={onTestAll}
+        disabled={testing || !running}
+        title="测全部节点延迟，下拉里显示的数字就是这个结果"
+      >
+        {testing ? "测速中…" : "刷新延迟"}
+      </button>
     </div>
     <div className="kv">
       <span className="kv-k">
@@ -382,7 +400,7 @@ export default function SettingsPanel({
         className="input"
         value={siteTarget}
         onChange={(e) => setSiteTarget(e.target.value)}
-        style={{ width: 150 }}
+        style={{ width: 208 }}
       >
         {renderSiteTargetOptions("")}
       </select>
@@ -417,7 +435,7 @@ export default function SettingsPanel({
               value={r.policy}
               onChange={(e) => void onUpdateSitePolicy(r, e.target.value)}
               disabled={siteBusy || siteRowBusy === `${r.domain}|${r.type}`}
-              style={{ width: 172, flexShrink: 0 }}
+              style={{ width: 208, flexShrink: 0 }}
               title="改这条规则走哪个出口，立即对新连接生效"
             >
               {renderSiteTargetOptions(r.policy)}
