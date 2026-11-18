@@ -112,6 +112,9 @@ export default function SettingsPanel({
   const [siteType, setSiteType] = useState("suffix");
   const [siteTarget, setSiteTarget] = useState("direct");
   const [siteBusy, setSiteBusy] = useState(false);
+  // 行级忙碌标记（domain|type）。改单条规则的出口时只禁用那一行，
+  // 否则整表一起灰掉，连着改两条会觉得卡住。
+  const [siteRowBusy, setSiteRowBusy] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -138,6 +141,46 @@ export default function SettingsPanel({
     if (p === "proxy") return "主策略组";
     if (p.startsWith("target:")) return p.slice("target:".length);
     return p;
+  };
+
+  // 出口下拉的选项：添加行和已有规则行共用，保证两边能选的目标完全一致。
+  // 规则指向的节点可能已从订阅里消失（换机场/删节点），这时补一个标记项——
+  // select 找不到匹配 option 会显示空白，看着像功能坏了。
+  // 但节点列表本身还没加载（内核刚启动）时不能下"已失效"的结论，否则整表
+  // 瞬间全变"已失效"，比空白更吓人。
+  const targetChoicesLoaded = groupChoices.length + nodeChoices.length > 0;
+  const renderSiteTargetOptions = (current: string) => {
+    const known =
+      current === "" ||
+      current === "direct" ||
+      current === "proxy" ||
+      !targetChoicesLoaded ||
+      [...groupChoices, ...nodeChoices].some((n) => `target:${n.name}` === current);
+    return (
+      <>
+        <option value="direct">直连</option>
+        <option value="proxy">主策略组</option>
+        {groupChoices.length > 0 && (
+          <optgroup label="策略组">
+            {groupChoices.map((g) => (
+              <option key={`sg-${g.name}`} value={`target:${g.name}`}>
+                {g.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {nodeChoices.length > 0 && (
+          <optgroup label="节点">
+            {nodeChoices.map((n) => (
+              <option key={`sn-${n.name}`} value={`target:${n.name}`}>
+                {n.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {!known && <option value={current}>{`${sitePolicyLabel(current)}（已失效）`}</option>}
+      </>
+    );
   };
 
   const onToggleSmart = async () => {
@@ -175,6 +218,26 @@ export default function SettingsPanel({
       schedErrClear(TOAST_ERROR_MS);
     } finally {
       setSiteBusy(false);
+    }
+  };
+
+  // 改已有规则的出口。后端 SetSiteRuleWithType 是 upsert
+  // （domain+type 命中就更新 policy），所以直接复用它，不会产生重复条目。
+  const onUpdateSitePolicy = async (rule: SiteRule, policy: string) => {
+    if (policy === rule.policy) return;
+    const key = `${rule.domain}|${rule.type}`;
+    setSiteRowBusy(key);
+    setErr("");
+    try {
+      await svc.SetSiteRuleWithType(rule.domain, rule.type, policy);
+      setSiteRules(await svc.SiteRules());
+      setNote(`${rule.domain} 已改走「${sitePolicyLabel(policy)}」`);
+      schedNoteClear(TOAST_NOTE_MS);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      schedErrClear(TOAST_ERROR_MS);
+    } finally {
+      setSiteRowBusy("");
     }
   };
 
@@ -321,26 +384,7 @@ export default function SettingsPanel({
         onChange={(e) => setSiteTarget(e.target.value)}
         style={{ width: 150 }}
       >
-        <option value="direct">直连</option>
-        <option value="proxy">主策略组</option>
-        {groupChoices.length > 0 && (
-          <optgroup label="策略组">
-            {groupChoices.map((g) => (
-              <option key={`sg-${g.name}`} value={`target:${g.name}`}>
-                {g.name}
-              </option>
-            ))}
-          </optgroup>
-        )}
-        {nodeChoices.length > 0 && (
-          <optgroup label="节点">
-            {nodeChoices.map((n) => (
-              <option key={`sn-${n.name}`} value={`target:${n.name}`}>
-                {n.name}
-              </option>
-            ))}
-          </optgroup>
-        )}
+        {renderSiteTargetOptions("")}
       </select>
       <button
         className="btn sm primary"
@@ -368,7 +412,16 @@ export default function SettingsPanel({
             <span className="mono" style={{ flex: 1, color: "var(--text-dim)" }}>
               {r.domain}
             </span>
-            <span style={{ color: "var(--text-faint)" }}>{sitePolicyLabel(r.policy)}</span>
+            <select
+              className="input"
+              value={r.policy}
+              onChange={(e) => void onUpdateSitePolicy(r, e.target.value)}
+              disabled={siteBusy || siteRowBusy === `${r.domain}|${r.type}`}
+              style={{ width: 172, flexShrink: 0 }}
+              title="改这条规则走哪个出口，立即对新连接生效"
+            >
+              {renderSiteTargetOptions(r.policy)}
+            </select>
             <span
               style={{
                 fontSize: 10.5,
