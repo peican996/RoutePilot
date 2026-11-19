@@ -756,6 +756,9 @@ export default function App() {
     assetName: string;
   } | null>(null);
   const [coreChecking, setCoreChecking] = useState(false);
+  // 检查更新的结果要贴在按钮旁边。全局提示条在 .page 顶部，用户滚到
+  // 设置页底部时根本看不见——点了按钮像没反应就是这个原因。
+  const [coreCheckMsg, setCoreCheckMsg] = useState("");
   const [coreUpdating, setCoreUpdating] = useState(false);
   const [coreCustom, setCoreCustom] = useState(false);
 
@@ -855,16 +858,18 @@ export default function App() {
 
   const onCheckCore = async () => {
     setCoreChecking(true);
-    setErr("");
+    setCoreCheckMsg("");
     try {
       const info = await svc.CheckCoreUpdate();
       setCoreInfo(info);
       setCoreCustom(await svc.CoreCustomized());
+      if (!info?.hasUpdate) {
+        setCoreCheckMsg(`已是最新（${info?.latest || info?.current || "未知版本"}）`);
+      }
     } catch (e) {
-      // 网络问题很常见（GitHub 在国内不稳），提示清楚而不是抛异常
-      setErr(
-        `检查更新失败：${e instanceof Error ? e.message : String(e)}（可尝试开启代理后重试）`
-      );
+      // 网络问题很常见（GitHub 在国内不稳）。这条必须显示在按钮旁边：
+      // 只写进顶部提示条的话，用户在设置页底部看不到，等于没有反馈。
+      setCoreCheckMsg(`检查失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setCoreChecking(false);
     }
@@ -1109,6 +1114,7 @@ export default function App() {
     onToggleAutoStart,
     coreInfo,
     coreChecking,
+    coreCheckMsg,
     coreUpdating,
     coreCustom,
     onCheckCore,

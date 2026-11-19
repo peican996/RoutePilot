@@ -33,6 +33,7 @@ type Props = {
   onToggleAutoStart: () => void;
   coreInfo: CoreInfo;
   coreChecking: boolean;
+  coreCheckMsg: string;
   coreUpdating: boolean;
   coreCustom: boolean;
   onCheckCore: () => void;
@@ -69,6 +70,7 @@ export default function SettingsPanel({
   onToggleAutoStart,
   coreInfo,
   coreChecking,
+  coreCheckMsg,
   coreUpdating,
   coreCustom,
   onCheckCore,
@@ -655,6 +657,20 @@ export default function SettingsPanel({
       )}
     </span>
   </div>
+  {/* 检查结果单独占一行：塞进上面那一行会把「内核版本」标签挤成竖排 */}
+  {!coreChecking && coreCheckMsg && (
+    <div
+      className="hint"
+      style={{
+        marginTop: -4,
+        marginBottom: 8,
+        lineHeight: 1.6,
+        color: coreCheckMsg.startsWith("检查失败") ? "#ff9b9b" : undefined,
+      }}
+    >
+      {coreCheckMsg}
+    </div>
+  )}
   <div className="kv">
     <span className="kv-k">混合端口</span>
     <span className="kv-v">{status.mixedPort || "—"}</span>
