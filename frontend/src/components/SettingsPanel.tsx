@@ -34,6 +34,7 @@ type Props = {
   coreInfo: CoreInfo;
   coreChecking: boolean;
   coreCheckMsg: string;
+  coreProgress: string;
   coreUpdating: boolean;
   coreCustom: boolean;
   onCheckCore: () => void;
@@ -71,6 +72,7 @@ export default function SettingsPanel({
   coreInfo,
   coreChecking,
   coreCheckMsg,
+  coreProgress,
   coreUpdating,
   coreCustom,
   onCheckCore,
@@ -639,7 +641,7 @@ export default function SettingsPanel({
           onClick={onUpdateCore}
           disabled={coreUpdating}
         >
-          {coreUpdating ? "更新中…" : `升级到 ${coreInfo.latest}`}
+          {coreUpdating ? (coreProgress ? `更新中 ${coreProgress}` : "更新中…") : `升级到 ${coreInfo.latest}`}
         </button>
       ) : coreInfo ? (
         <button className="btn sm" onClick={onCheckCore}>
@@ -657,8 +659,14 @@ export default function SettingsPanel({
       )}
     </span>
   </div>
+  {/* 升级中说明当前在做什么：下载阶段代理仍然可用，用户不必担心断网 */}
+  {coreUpdating && (
+    <div className="hint" style={{ marginTop: -4, marginBottom: 8, lineHeight: 1.6 }}>
+      正在下载内核包，期间代理保持可用；下载完成后才会重启内核。
+    </div>
+  )}
   {/* 检查结果单独占一行：塞进上面那一行会把「内核版本」标签挤成竖排 */}
-  {!coreChecking && coreCheckMsg && (
+  {!coreChecking && !coreUpdating && coreCheckMsg && (
     <div
       className="hint"
       style={{

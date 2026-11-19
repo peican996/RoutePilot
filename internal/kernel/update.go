@@ -453,6 +453,9 @@ var allowedDownloadHosts = map[string]bool{
 	"objects.githubusercontent.com":         true,
 	"release-assets.githubusercontent.com":  true,
 	"github-releases.githubusercontent.com": true,
+	// 国内加速代理：官方直链在国内常被卡到 0 字节，走它才能完成升级。
+	// 只放宽"从哪下"，产物的完整性仍由 sha256 摘要兜底。
+	"gh-proxy.com": true,
 }
 
 // validateDownloadURL 校验下载地址的协议与域名。
@@ -480,16 +483,35 @@ func validateDownloadURL(raw string) error {
 //   - 下载大小必须与 release 声明一致，且不超过上限
 //   - 先写临时文件并 Sync，替换失败时旧内核保持原样
 //   - 替换前保留旧内核备份，新版本启动失败可回滚
-func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, wantSize int64, timeout time.Duration) (UpgradeResult, error) {
-	if strings.TrimSpace(wantDigest) == "" {
-		return UpgradeResult{}, fmt.Errorf("官方 release 未提供 sha256 摘要，已拒绝自动升级")
-	}
-	if err := validateDownloadURL(rawURL); err != nil {
-		return UpgradeResult{}, err
-	}
+// downloadMirrorHost 是国内可用的 GitHub 加速代理。
+//
+// 官方 release 直链在国内经常不是"慢"而是"完全不动"：TCP 能连上，
+// 但一个字节都下不来，一直挂到超时。实测这里 10 秒收到 0 字节，
+// 走镜像则有 115 KB/s。所以镜像优先、官方兜底。
+const downloadMirrorHost = "gh-proxy.com"
 
+// downloadCandidates 返回按优先级排好的下载地址。
+func downloadCandidates(rawURL string) []string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || u.Host == downloadMirrorHost {
+		return []string{rawURL}
+	}
+	return []string{"https://" + downloadMirrorHost + "/" + rawURL, rawURL}
+}
+
+// hostLabel 用于把失败原因归属到具体下载源。
+func hostLabel(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
+}
+
+// fetchCoreZip 下载内核包，边读边回报进度。
+// 时限由调用方的 ctx 控制，多个下载源共享同一份预算。
+// onProgress 的 total 在服务端未声明长度时为 0。
+func fetchCoreZip(ctx context.Context, rawURL string, onProgress func(done, total int64)) ([]byte, error) {
 	client := &http.Client{
-		Timeout: timeout,
 		// 重定向后的地址也要过白名单，否则可以先用合法域名跳转到任意地址
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -499,44 +521,125 @@ func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, wantSize int64, 
 		},
 	}
 
-	resp, err := client.Get(rawURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return UpgradeResult{}, fmt.Errorf("下载内核失败: %w", err)
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("连接失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return UpgradeResult{}, fmt.Errorf("下载内核失败: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	if resp.ContentLength > maxCoreDownload {
-		return UpgradeResult{}, fmt.Errorf("内核包过大：声明 %d 字节", resp.ContentLength)
+		return nil, fmt.Errorf("包过大：声明 %d 字节", resp.ContentLength)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCoreDownload+1))
-	if err != nil {
-		return UpgradeResult{}, fmt.Errorf("读取下载内容失败: %w", err)
+	// 服务端没声明长度时 ContentLength 是 -1，统一归一化成 0，
+	// 免得把负数当成"总长度"传出去（进度条会算出怪数字）。
+	total := resp.ContentLength
+	if total < 0 {
+		total = 0
 	}
-	if int64(len(data)) > maxCoreDownload {
-		return UpgradeResult{}, fmt.Errorf("内核包超过 %d 字节上限", maxCoreDownload)
+	var buf bytes.Buffer
+	chunk := make([]byte, 128<<10)
+	var done int64
+	for {
+		n, rerr := resp.Body.Read(chunk)
+		if n > 0 {
+			done += int64(n)
+			if done > maxCoreDownload {
+				return nil, fmt.Errorf("包超过 %d 字节上限", maxCoreDownload)
+			}
+			buf.Write(chunk[:n])
+			if onProgress != nil {
+				onProgress(done, total)
+			}
+		}
+		if rerr == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if rerr != nil {
+			// 卡在半路也是常见失败（连接被掐断），把已收字节数带上便于判断
+			return nil, fmt.Errorf("读取中断（已收 %d 字节）: %w", done, rerr)
+		}
 	}
-	if wantSize > 0 && int64(len(data)) != wantSize {
-		return UpgradeResult{}, fmt.Errorf("内核包大小不符：期望 %d 字节，实际 %d 字节", wantSize, len(data))
-	}
+}
 
-	// 摘要校验针对下载到的 zip 原文，必须在解包前做
-	sum := sha256.Sum256(data)
-	got := "sha256:" + hex.EncodeToString(sum[:])
-	if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(wantDigest)) {
-		return UpgradeResult{}, fmt.Errorf("内核包校验失败：摘要不匹配（期望 %s，实际 %s）", wantDigest, got)
-	}
-
-	exe, err := extractMihomo(data)
+// DownloadAndReplace 下载 zip、校验并原子替换本地 mihomo.exe。
+//
+// 安全/一致性约束：
+//   - 官方未提供 sha256 摘要时拒绝升级（不能只靠 HTTPS 判断二进制可信）
+//   - 下载大小必须与 release 声明一致，且不超过上限
+//   - 先写临时文件并 Sync，替换失败时旧内核保持原样
+//   - 替换前保留旧内核备份，新版本启动失败可回滚
+func (m *Manager) DownloadAndReplace(rawURL, wantDigest string, wantSize int64, timeout time.Duration) (UpgradeResult, error) {
+	exe, err := m.DownloadCore(rawURL, wantDigest, wantSize, timeout, nil)
 	if err != nil {
 		return UpgradeResult{}, err
 	}
-	if err := validatePE(exe); err != nil {
-		return UpgradeResult{}, fmt.Errorf("下载的内核不是有效的 Windows 可执行文件: %w", err)
+	return m.InstallCore(exe)
+}
+
+// DownloadCore 只负责下载、校验、解包，不碰磁盘上的内核。
+//
+// 拆出来的原因：下载要几分钟，这段时间不该让用户断网。
+// 调用方可以先把包拿到手，再停内核、替换、重启。
+func (m *Manager) DownloadCore(rawURL, wantDigest string, wantSize int64, timeout time.Duration, onProgress func(done, total int64)) ([]byte, error) {
+	if strings.TrimSpace(wantDigest) == "" {
+		return nil, fmt.Errorf("官方 release 未提供 sha256 摘要，已拒绝自动升级")
 	}
 
+	// 多源共享同一份总预算：某个源卡住时，剩下的时间自然留给下一个源，
+	// 不会出现"每个源各等一次满额超时"导致用户干等半小时。
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	problems := make([]string, 0, 2)
+	for _, cand := range downloadCandidates(rawURL) {
+		if ctx.Err() != nil {
+			problems = append(problems, "总时长已用完")
+			break
+		}
+		if err := validateDownloadURL(cand); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", hostLabel(cand), err))
+			continue
+		}
+		data, err := fetchCoreZip(ctx, cand, onProgress)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", hostLabel(cand), err))
+			continue
+		}
+		if wantSize > 0 && int64(len(data)) != wantSize {
+			problems = append(problems, fmt.Sprintf("%s: 大小不符（期望 %d，实际 %d）", hostLabel(cand), wantSize, len(data)))
+			continue
+		}
+
+		// 摘要校验针对下载到的 zip 原文，必须在解包前做。
+		// 有了它，从哪个镜像下载都不影响可信度。
+		sum := sha256.Sum256(data)
+		got := "sha256:" + hex.EncodeToString(sum[:])
+		if !strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(wantDigest)) {
+			problems = append(problems, fmt.Sprintf("%s: 摘要不匹配", hostLabel(cand)))
+			continue
+		}
+
+		exe, err := extractMihomo(data)
+		if err != nil {
+			return nil, err
+		}
+		if err := validatePE(exe); err != nil {
+			return nil, fmt.Errorf("下载的内核不是有效的 Windows 可执行文件: %w", err)
+		}
+		return exe, nil
+	}
+	return nil, fmt.Errorf("下载内核失败（%s）", strings.Join(problems, "；"))
+}
+
+// InstallCore 把已校验的内核写入 bin 目录并原子替换。
+func (m *Manager) InstallCore(exe []byte) (UpgradeResult, error) {
 	return m.installBinary(exe)
 }
 

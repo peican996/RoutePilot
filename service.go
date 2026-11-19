@@ -3336,6 +3336,13 @@ func (s *CoreService) CheckCoreUpdate() (*kernel.LatestInfo, error) {
 // url 参数只用于比对：真正下载的地址由后端重新向 GitHub 查询后决定。
 // 否则前端（或任何能调用本方法的东西）传一个任意 URL 就能让我们
 // 下载并执行任意程序——TUN 场景下还是管理员权限。
+// coreDownloadTimeout 是整个下载阶段的总预算（多个源共享）。
+//
+// 实测：22MB 的包走镜像约 6.2 分钟（≈60KB/s），官方直链在国内 0 字节。
+// 原先给 3 分钟，必然每一次都超时——这正是"一直卡在更新中"的原因。
+// 给 12 分钟留出网络波动余量；进度条会实时告诉用户还在动。
+const coreDownloadTimeout = 12 * time.Minute
+
 func (s *CoreService) UpdateCore(url string) (string, error) {
 	if s.mgr == nil {
 		return "", fmt.Errorf("内核管理器未初始化")
@@ -3360,14 +3367,46 @@ func (s *CoreService) UpdateCore(url string) (string, error) {
 
 	beforeVersion := s.Status().Version
 
-	// exe 被占用时替换会失败，先停内核
+	// 先把包下完再停内核。
+	// 下载要几分钟，原来的顺序是"先停内核再下载"，用户在这几分钟里完全断网，
+	// 而且下载超时失败后还得再等一次重启——观感就是"一直卡在更新中"。
+	var lastEmit time.Time
+	onProgress := func(done, total int64) {
+		if s.app == nil {
+			return
+		}
+		// 节流到约 4 次/秒；最后一个字节必须推，否则进度停在 99%
+		if total > 0 && done < total && time.Since(lastEmit) < 250*time.Millisecond {
+			return
+		}
+		lastEmit = time.Now()
+		var text string
+		if total > 0 {
+			pct := done * 100 / total
+			if pct > 100 {
+				pct = 100
+			}
+			text = fmt.Sprintf("%d%%", pct)
+		} else {
+			text = fmt.Sprintf("%.1f MB", float64(done)/(1<<20))
+		}
+		s.app.Event.Emit("core-update-progress", text)
+	}
+
+	exe, err := s.mgr.DownloadCore(info.URL, info.Digest, info.Size, coreDownloadTimeout, onProgress)
+	if err != nil {
+		// 此时内核还在跑，用户不受影响，直接报错即可
+		return "", err
+	}
+
+	// exe 被占用时替换会失败，下完包才停内核
 	if err := s.StopKernel(); err != nil {
 		return "", fmt.Errorf("停止内核失败: %w", err)
 	}
 
-	res, err := s.mgr.DownloadAndReplace(info.URL, info.Digest, info.Size, 3*time.Minute)
+	res, err := s.mgr.InstallCore(exe)
 	if err != nil {
-		// 下载/替换失败要把服务拉回来，不能让用户断网
+		// 替换失败要把服务拉回来，不能让用户断网
 		_ = s.RestartKernel()
 		return "", err
 	}
@@ -3421,6 +3460,12 @@ func (s *CoreService) ResetCore() error {
 	_ = s.StopKernel()
 	kernel.ClearCustomMark(s.mgr.DataDir())
 	_ = os.Remove(filepath.Join(s.mgr.DataDir(), "bin", "mihomo.exe"))
+	// 文件删掉了必须重新释放内置内核：EnsureBinary 只在启动时调用，
+	// 这里不补一步，RestartKernel 会因为没有可执行文件而失败，
+	// 用户点了"回退内置"反而彻底断网。
+	if _, err := s.mgr.EnsureBinary(embeddedKernel); err != nil {
+		return fmt.Errorf("恢复内置内核失败: %w", err)
+	}
 	return s.RestartKernel()
 }
 

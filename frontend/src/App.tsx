@@ -322,6 +322,11 @@ export default function App() {
       notify("内核异常", msg);
     });
 
+    const offCoreProgress = Events.On("core-update-progress", (payload: any) => {
+      const p = typeof payload?.data === "string" ? payload.data : "";
+      if (p) setCoreProgress(p);
+    });
+
     const offNet = Events.On("network-degraded", (payload: any) => {
       const msg = typeof payload?.data === "string" ? payload.data : "代理链路检测失败";
       setErr(msg);
@@ -333,6 +338,7 @@ export default function App() {
       offSub();
       offCrash();
       offNet();
+      offCoreProgress();
     };
   }, []);
 
@@ -759,6 +765,8 @@ export default function App() {
   // 检查更新的结果要贴在按钮旁边。全局提示条在 .page 顶部，用户滚到
   // 设置页底部时根本看不见——点了按钮像没反应就是这个原因。
   const [coreCheckMsg, setCoreCheckMsg] = useState("");
+  // 升级时的下载进度（"42%" 或 "3.2 MB"）。没有它，几分钟的下载只能干等。
+  const [coreProgress, setCoreProgress] = useState("");
   const [coreUpdating, setCoreUpdating] = useState(false);
   const [coreCustom, setCoreCustom] = useState(false);
 
@@ -885,19 +893,24 @@ export default function App() {
       return;
     }
     setCoreUpdating(true);
+    setCoreProgress("");
+    setCoreCheckMsg("");
     setErr("");
     try {
       await svc.UpdateCore(coreInfo.url);
       setNote(`内核已更新到 ${coreInfo.latest}`);
       schedNoteClear(TOAST_INFO_MS);
       notify("内核已更新", `RoutePilot 已升级到 ${coreInfo.latest}`);
+      setCoreCheckMsg(`已更新到 ${coreInfo.latest}`);
       const info = await svc.CheckCoreUpdate();
       setCoreInfo(info);
       setCoreCustom(await svc.CoreCustomized());
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      // 与检查更新同理：顶部提示条在这儿看不见，必须贴到按钮下方
+      setCoreCheckMsg(`升级失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setCoreUpdating(false);
+      setCoreProgress("");
     }
   };
 
@@ -907,6 +920,8 @@ export default function App() {
     try {
       await svc.ResetCore();
       setCoreCustom(false);
+      // 回退后版本变了，旧的"已更新到 x.y.z"提示必须清掉，否则自相矛盾
+      setCoreCheckMsg("已回退到内置内核");
       setNote("已回退到内置内核");
       schedNoteClear(TOAST_NOTE_MS);
     } catch (e) {
@@ -1115,6 +1130,7 @@ export default function App() {
     coreInfo,
     coreChecking,
     coreCheckMsg,
+    coreProgress,
     coreUpdating,
     coreCustom,
     onCheckCore,
