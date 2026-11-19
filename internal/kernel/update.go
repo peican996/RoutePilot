@@ -9,6 +9,7 @@ package kernel
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -24,8 +25,25 @@ import (
 	"time"
 )
 
-// GitHub 上 mihomo 的发布仓库。
-const repoAPI = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+// releaseEndpoint 是一个查询最新 release 的入口。
+type releaseEndpoint struct {
+	label string
+	url   string
+}
+
+// repoAPIEndpoints 是查询 mihomo 最新 release 的入口，按顺序尝试。
+//
+// GitHub 未登录 API 按出口 IP 限流（60 次/小时）。用户开着代理时出口是
+// 共享节点 IP，配额常被别人打光，直接 403——功能看着就像"坏的"。
+// 备用入口是 GitHub API 的反向代理，返回同一份官方 JSON（含 digest/size）。
+//
+// 摘要即便来自镜像也不降低安全性：它必须与 github.com 上的产物字节一致
+// 才能通过校验，而下载地址被 validateDownloadURL 白名单限制在 github.com
+// 域名内，镜像既改不了产物也伪造不出匹配的摘要。
+var repoAPIEndpoints = []releaseEndpoint{
+	{label: "GitHub", url: "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"},
+	{label: "镜像", url: "https://gh-proxy.com/https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"},
+}
 
 // coreCustomMark 是"内核已被手动升级"的标记文件名。
 const coreCustomMark = ".core_custom"
@@ -77,27 +95,54 @@ type UpgradeRecord struct {
 	RolledBackAt   string `json:"rolledBackAt,omitempty"`
 }
 
-// fetchLatest 查询最新 release。timeout 控制整体超时，国内访问 GitHub 可能很慢。
+// fetchLatest 查询最新 release。timeout 是整体预算：多个入口共享同一份时限，
+// 不能按入口各给一份，否则点一次"检查更新"要等好几倍时间。
 func fetchLatest(timeout time.Duration) (*release, error) {
-	client := &http.Client{Timeout: timeout}
-	req, err := http.NewRequest(http.MethodGet, repoAPI, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	problems := make([]string, 0, len(repoAPIEndpoints))
+	for _, ep := range repoAPIEndpoints {
+		rel, err := fetchLatestFrom(ctx, ep.url)
+		if err == nil {
+			return rel, nil
+		}
+		problems = append(problems, fmt.Sprintf("%s: %v", ep.label, err))
+		if ctx.Err() != nil {
+			break // 预算用完，后面的入口也不必再试
+		}
+	}
+	return nil, fmt.Errorf("查询最新内核版本失败（%s）", strings.Join(problems, "；"))
+}
+
+// fetchLatestFrom 从单个入口取 release 信息。时限由调用方的 ctx 控制。
+func fetchLatestFrom(ctx context.Context, endpoint string) (*release, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "RoutePilot")
 
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("访问 GitHub 失败: %w", err)
+		return nil, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub 返回 %d", resp.StatusCode)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusForbidden, http.StatusTooManyRequests:
+		// 匿名 API 限流就是这个状态码。单独点出来，否则用户只看到"403"，
+		// 会误以为是网络坏了或者功能没做。
+		return nil, fmt.Errorf("HTTP %d（匿名 API 限流，共享出口 IP 比较常见）", resp.StatusCode)
+	default:
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	var rel release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	// 限制读取长度：异常响应不该有机会把内存打满。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&rel); err != nil {
 		return nil, fmt.Errorf("解析 release 信息失败: %w", err)
 	}
 	return &rel, nil
