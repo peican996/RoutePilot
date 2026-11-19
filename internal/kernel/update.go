@@ -476,13 +476,6 @@ func validateDownloadURL(raw string) error {
 	return nil
 }
 
-// DownloadAndReplace 下载 zip、校验并原子替换本地 mihomo.exe。
-//
-// 安全/一致性约束：
-//   - 官方未提供 sha256 摘要时拒绝升级（不能只靠 HTTPS 判断二进制可信）
-//   - 下载大小必须与 release 声明一致，且不超过上限
-//   - 先写临时文件并 Sync，替换失败时旧内核保持原样
-//   - 替换前保留旧内核备份，新版本启动失败可回滚
 // downloadMirrorHost 是国内可用的 GitHub 加速代理。
 //
 // 官方 release 直链在国内经常不是"慢"而是"完全不动"：TCP 能连上，
