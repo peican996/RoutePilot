@@ -16,6 +16,8 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"golang.org/x/sys/windows"
+
+	"routepilot/internal/safego"
 )
 
 // 前端产物直接打进二进制，分发时只需要一个 exe。
@@ -75,6 +77,11 @@ var (
 	procCreateMx   = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateMutexW")
 	procMessageBox = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBoxW")
 )
+
+// reportBackgroundPanic 兜底后台任务的 panic：记日志，进程继续活着。
+func reportBackgroundPanic(name string, err any, stack []byte) {
+	log.Printf("后台任务 %s panic: %v\n%s", name, err, stack)
+}
 
 func init() {
 	// 注册自定义事件，绑定生成器会据此产生强类型前端 API。
@@ -232,7 +239,7 @@ func main() {
 	// Wails v3 的窗口选项没有 Icon 字段，用 Win32 API 把 rsrc 嵌入的图标
 	// 设到标题栏/任务栏。窗口句柄要等 app.Run() 启动后才就绪，
 	// 所以延迟到 goroutine 里设。
-	go func() {
+	safego.Go("设置窗口图标", func() {
 		for i := 0; i < 20; i++ {
 			time.Sleep(250 * time.Millisecond)
 			if hwnd := uintptr(mainWindow.NativeWindow()); hwnd != 0 {
@@ -240,7 +247,7 @@ func main() {
 				return
 			}
 		}
-	}()
+	}, reportBackgroundPanic)
 
 	// 窗口隐藏时记住位置
 	saveBounds = func() {
@@ -459,7 +466,7 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 	})
 
 	// 托盘图标状态：绿=运行中，黄=告警，红=错误/停止
-	go func() {
+	safego.Go("托盘状态刷新", func() {
 		lastState := ""
 		loops := 0
 		lastNodeSig := ""
@@ -468,36 +475,39 @@ func setupTray(app *application.App, svc *CoreService, win *application.WebviewW
 			if svc.Quitting() {
 				return
 			}
-			st := svc.Status()
-			var icon []byte
-			var label string
-			switch {
-			case st.State != "running":
-				icon = trayIconRed
-				label = "内核未运行"
-			case st.Error != "":
-				icon = trayIconAmber
-				label = "异常"
-			default:
-				icon = trayIconGreen
-				label = fmt.Sprintf("运行中 · %s", st.Mode)
-			}
-			if label != lastState {
-				tray.SetIcon(icon)
-				tray.SetTooltip("RoutePilot — " + label)
-				lastState = label
-			}
-
-			// 每 60 秒对一次节点签名：订阅更新/主窗口切点导致列表或
-			// 选中态变化时才重建子菜单，避免无谓的菜单抖动。
-			loops++
-			if loops%6 == 0 && st.State == "running" {
-				names, active := svc.QuickNodes(8)
-				if sig := strings.Join(names, "|") + "#" + active; sig != lastNodeSig {
-					lastNodeSig = sig
-					rebuildNodeMenu(names, active)
+			// 单轮异常只丢这一轮：托盘图标该更新还得更新
+			safego.Run("托盘状态刷新", func() {
+				st := svc.Status()
+				var icon []byte
+				var label string
+				switch {
+				case st.State != "running":
+					icon = trayIconRed
+					label = "内核未运行"
+				case st.Error != "":
+					icon = trayIconAmber
+					label = "异常"
+				default:
+					icon = trayIconGreen
+					label = fmt.Sprintf("运行中 · %s", st.Mode)
 				}
-			}
+				if label != lastState {
+					tray.SetIcon(icon)
+					tray.SetTooltip("RoutePilot — " + label)
+					lastState = label
+				}
+
+				// 每 60 秒对一次节点签名：订阅更新/主窗口切点导致列表或
+				// 选中态变化时才重建子菜单，避免无谓的菜单抖动。
+				loops++
+				if loops%6 == 0 && st.State == "running" {
+					names, active := svc.QuickNodes(8)
+					if sig := strings.Join(names, "|") + "#" + active; sig != lastNodeSig {
+						lastNodeSig = sig
+						rebuildNodeMenu(names, active)
+					}
+				}
+			}, reportBackgroundPanic)
 		}
-	}()
+	}, reportBackgroundPanic)
 }

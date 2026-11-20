@@ -1,6 +1,8 @@
 package kernel
 
 import (
+	"routepilot/internal/safego"
+
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -424,7 +426,8 @@ func (m *Manager) startLocked(configPath string) error {
 	m.mu.Unlock()
 
 	// 唯一的 Wait 调用点。进程自然退出时在这里收尾。
-	go m.waitProcess(r, w)
+	// 收尾逻辑里有状态机切换，panic 不能把整个客户端带走。
+	safego.Go("内核进程等待", func() { m.waitProcess(r, w) }, nil)
 
 	m.callHook("process-started")
 

@@ -25,6 +25,7 @@ import (
 	"routepilot/internal/geoip"
 	"routepilot/internal/kernel"
 	"routepilot/internal/procid"
+	"routepilot/internal/safego"
 	"routepilot/internal/subscription"
 	"routepilot/internal/sysproxy"
 
@@ -1086,10 +1087,10 @@ func (s *CoreService) spawnAfterTask(gen uint64, parent context.Context, fn func
 	s.afterWG.Add(1)
 	s.afterMu.Unlock()
 
-	go func() {
+	s.goSafe("启动后置任务", func() {
 		defer s.afterWG.Done()
 		fn(parent)
-	}()
+	})
 }
 
 // waitAfterTasks 等待已登记的 afterStart 任务结束。
@@ -2958,7 +2959,7 @@ func probeTwice(probe func() (int, error), retryDelay time.Duration) bool {
 func (s *CoreService) startNetworkHealthCheck() {
 	failCount := 0
 	alerted := false
-	go func() {
+	s.goSafe("网络健康检查", func() {
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 		// 首次检查等 30 秒，等内核完全就绪
@@ -2970,44 +2971,52 @@ func (s *CoreService) startNetworkHealthCheck() {
 			if s.Quitting() {
 				return
 			}
-			// 内核没在运行时检测没有意义，否则用户主动停掉内核后
-			// 会一直收到"代理链路不通"的误报。
-			if s.mgr == nil || !s.mgr.IsRunning() || s.api == nil {
-				failCount, alerted = 0, false
-				continue
-			}
+			// 单轮异常只丢这一轮，定时器继续跑
+			s.tickSafe("网络健康检查", func() { s.healthCheckOnce(&failCount, &alerted) })
+		}
+	})
+}
 
-			s.mu.RLock()
-			mode := s.mode
-			group := configgen.MainProxyGroup(s.subConfig)
-			s.mu.RUnlock()
+// healthCheckOnce 跑一轮代理链路检测。
+// 抽成方法是为了让每轮都能被 tickSafe 包住：检测涉及网络请求，
+// 单轮偶发 panic 不该让"网络告警"这个功能永久停摆。
+func (s *CoreService) healthCheckOnce(failCount *int, alerted *bool) {
+	// 内核没在运行时检测没有意义，否则用户主动停掉内核后
+	// 会一直收到"代理链路不通"的误报。
+	if s.mgr == nil || !s.mgr.IsRunning() || s.api == nil {
+		*failCount, *alerted = 0, false
+		return
+	}
 
-			// 直连模式没有代理链路可测；没有可用策略组时也不该断言代理不通。
-			// 测主策略组而不是 GLOBAL：GLOBAL 默认指向 DIRECT，测它等于测直连，
-			// 代理真的坏了也发现不了。
-			if mode == "direct" || group == "" {
-				failCount, alerted = 0, false
-				continue
-			}
+	s.mu.RLock()
+	mode := s.mode
+	group := configgen.MainProxyGroup(s.subConfig)
+	s.mu.RUnlock()
 
-			ok := probeTwice(func() (int, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				return s.api.Delay(ctx, group, "https://www.gstatic.com/generate_204", 5000)
-			}, 3*time.Second)
-			if !ok {
-				failCount++
-				if failCount >= 2 && !alerted {
-					alerted = true
-					if s.app != nil {
-						s.app.Event.Emit("network-degraded", "代理链路连续 2 次检测失败，网络可能不通")
-					}
-				}
-			} else {
-				failCount, alerted = 0, false
+	// 直连模式没有代理链路可测；没有可用策略组时也不该断言代理不通。
+	// 测主策略组而不是 GLOBAL：GLOBAL 默认指向 DIRECT，测它等于测直连，
+	// 代理真的坏了也发现不了。
+	if mode == "direct" || group == "" {
+		*failCount, *alerted = 0, false
+		return
+	}
+
+	ok := probeTwice(func() (int, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return s.api.Delay(ctx, group, "https://www.gstatic.com/generate_204", 5000)
+	}, 3*time.Second)
+	if !ok {
+		*failCount++
+		if *failCount >= 2 && !*alerted {
+			*alerted = true
+			if s.app != nil {
+				s.app.Event.Emit("network-degraded", "代理链路连续 2 次检测失败，网络可能不通")
 			}
 		}
-	}()
+	} else {
+		*failCount, *alerted = 0, false
+	}
 }
 
 // ---------- 流量告警 ----------
@@ -3336,6 +3345,27 @@ func (s *CoreService) CheckCoreUpdate() (*kernel.LatestInfo, error) {
 // url 参数只用于比对：真正下载的地址由后端重新向 GitHub 查询后决定。
 // 否则前端（或任何能调用本方法的东西）传一个任意 URL 就能让我们
 // 下载并执行任意程序——TUN 场景下还是管理员权限。
+// bgReport 是后台任务的 panic 出口：落日志 + 通知界面。
+//
+// 不能只记日志——用户看不到日志文件，只会发现"某个功能不动了"。
+func (s *CoreService) bgReport(name string, err any, stack []byte) {
+	s.dbg("后台任务 %s panic: %v\n%s", name, err, stack)
+	if s.app != nil {
+		s.app.Event.Emit("background-error", safego.Describe(name, err))
+	}
+}
+
+// goSafe 起一个 panic 不会带走进程的后台任务（一次性任务用）。
+func (s *CoreService) goSafe(name string, fn func()) {
+	safego.Go(name, fn, s.bgReport)
+}
+
+// tickSafe 包住周期任务的单轮逻辑。某一轮 panic 只丢这一轮，
+// 定时器在外层继续跑——否则一次偶发异常就让功能永久停摆。
+func (s *CoreService) tickSafe(name string, fn func()) {
+	safego.Run(name, fn, s.bgReport)
+}
+
 // coreDownloadTimeout 是整个下载阶段的总预算（多个源共享）。
 //
 // 实测：22MB 的包走镜像约 6.2 分钟（≈60KB/s），官方直链在国内 0 字节。
@@ -3505,10 +3535,10 @@ func (s *CoreService) RelaunchElevated() error {
 	}
 	// 先停内核、还原系统代理，再退出，把单实例锁让给新进程。
 	s.Shutdown()
-	go func() {
+	s.goSafe("退出进程", func() {
 		time.Sleep(400 * time.Millisecond)
 		os.Exit(0)
-	}()
+	})
 	return nil
 }
 
@@ -3788,56 +3818,64 @@ func (s *CoreService) startHistorySampler() {
 	var lastUp, lastDown int64
 	var lastMin int64
 
-	ticker := time.NewTicker(time.Minute)
-	go func() {
+	s.goSafe("流量采样", func() {
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			if s.Quitting() {
 				return
 			}
-			if s.api == nil {
-				continue
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			resp, err := s.api.Connections(ctx)
-			cancel()
-			if err != nil {
-				continue
-			}
-
-			now := time.Now()
-			min := now.Truncate(time.Minute).Unix()
-
-			// 第一次只记基线，不出样本
-			if lastMin == 0 {
-				lastUp, lastDown, lastMin = resp.UploadTotal, resp.DownloadTotal, min
-				continue
-			}
-
-			up := resp.UploadTotal - lastUp
-			down := resp.DownloadTotal - lastDown
-			// mihomo 重启会把累计值清零，差值变负 —— 记 0 重新开始
-			if up < 0 {
-				up = 0
-			}
-			if down < 0 {
-				down = 0
-			}
-
-			// 如果中间空了几分钟（比如睡眠），补空样本，避免曲线断层
-			for t := lastMin + 60; t < min; t += 60 {
-				s.appendSample(TrafficSample{Time: t, Up: 0, Down: 0})
-			}
-
-			s.appendSample(TrafficSample{Time: min, Up: up, Down: down})
-			lastUp, lastDown, lastMin = resp.UploadTotal, resp.DownloadTotal, min
-
-			// 检查当日流量告警（用今日累计值）
-			s.checkTrafficAlertToday()
-
-			s.saveHistory()
+			// 单轮异常只丢这一轮，下一分钟照常采样
+			s.tickSafe("流量采样", func() { s.sampleTrafficOnce(&lastUp, &lastDown, &lastMin) })
 		}
-	}()
+	})
+}
+
+// sampleTrafficOnce 采一次样并落盘。
+// 抽成方法是为了让单轮能被 tickSafe 包住：采样要解析内核返回的 JSON，
+// 一轮异常不该让流量曲线永久停止更新（用户会以为统计坏了）。
+func (s *CoreService) sampleTrafficOnce(lastUp, lastDown, lastMin *int64) {
+	if s.api == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp, err := s.api.Connections(ctx)
+	cancel()
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	min := now.Truncate(time.Minute).Unix()
+
+	// 第一次只记基线，不出样本
+	if *lastMin == 0 {
+		*lastUp, *lastDown, *lastMin = resp.UploadTotal, resp.DownloadTotal, min
+		return
+	}
+
+	up := resp.UploadTotal - *lastUp
+	down := resp.DownloadTotal - *lastDown
+	// mihomo 重启会把累计值清零，差值变负 —— 记 0 重新开始
+	if up < 0 {
+		up = 0
+	}
+	if down < 0 {
+		down = 0
+	}
+
+	// 如果中间空了几分钟（比如睡眠），补空样本，避免曲线断层
+	for t := *lastMin + 60; t < min; t += 60 {
+		s.appendSample(TrafficSample{Time: t, Up: 0, Down: 0})
+	}
+
+	s.appendSample(TrafficSample{Time: min, Up: up, Down: down})
+	*lastUp, *lastDown, *lastMin = resp.UploadTotal, resp.DownloadTotal, min
+
+	// 检查当日流量告警（用今日累计值）
+	s.checkTrafficAlertToday()
+
+	s.saveHistory()
 }
 
 // ---------- 模式与日志 ----------
@@ -4763,7 +4801,8 @@ func (s *CoreService) TestAllNodes() map[string]int {
 	for _, name := range names {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(n string) {
+		n := name // 显式拷贝：闭包要按轮次捕获，不能指向循环变量
+		s.goSafe("节点测速", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			c, cc := context.WithTimeout(context.Background(), 15*time.Second)
@@ -4787,7 +4826,7 @@ func (s *CoreService) TestAllNodes() map[string]int {
 			out[n] = v
 			mu.Unlock()
 			s.recordDelay(n, int32(v))
-		}(name)
+		})
 	}
 	wg.Wait()
 	return out
@@ -5364,16 +5403,18 @@ func (s *CoreService) persistSubMeta() {
 // 机场通过 profile-update-interval 头告诉我们拉取间隔（通常 24 小时），
 // 我们用 10 分钟的粗粒度去对表，够了。
 func (s *CoreService) startAutoUpdate() {
-	go func() {
+	s.goSafe("订阅自动更新", func() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
 		for range t.C {
 			if s.Quitting() {
 				return
 			}
-			s.maybeAutoRefresh()
+			// 解析机场返回的配置是最容易出问题的一步（不可信输入），
+			// 单轮异常不能让自动更新永久停摆
+			s.tickSafe("订阅自动更新", s.maybeAutoRefresh)
 		}
-	}()
+	})
 }
 
 // maybeAutoRefresh 检查全部订阅的更新间隔，而不只是当前激活的那个。

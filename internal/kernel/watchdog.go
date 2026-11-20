@@ -1,6 +1,8 @@
 package kernel
 
 import (
+	"routepilot/internal/safego"
+
 	"fmt"
 	"sync"
 	"time"
@@ -122,7 +124,8 @@ func (w *Watchdog) ReportExit(info ExitInfo) {
 	w.logf("内核异常退出，第 %d 次自动重启将在 %s 后执行: %s", attempt, delay, info.Reason)
 	if w.opts.OnRetry != nil {
 		cb := w.opts.OnRetry
-		go cb(attempt, delay, info)
+		// 回调里会去重启内核，任何 panic 都不该带走整个进程
+		safego.Go("内核自动重启", func() { cb(attempt, delay, info) }, w.reportPanic)
 	}
 }
 
@@ -285,7 +288,7 @@ func (w *Watchdog) exhaustLocked(reason string) {
 	if w.opts.OnExhausted != nil {
 		cb := w.opts.OnExhausted
 		attempts := len(w.crashes)
-		go cb(attempts, msg)
+		safego.Go("内核重启熔断通知", func() { cb(attempts, msg) }, w.reportPanic)
 	}
 }
 
@@ -306,6 +309,11 @@ func (w *Watchdog) scheduleLocked(attempt int) time.Duration {
 	delay := backoffDelay(w.opts.Config, attempt)
 	w.timer = time.AfterFunc(delay, func() { w.fire(seq) })
 	return delay
+}
+
+// reportPanic 记录后台回调的 panic，进程继续运行。
+func (w *Watchdog) reportPanic(name string, err any, stack []byte) {
+	w.logf("后台任务 %s panic: %v\n%s", name, err, stack)
 }
 
 func (w *Watchdog) logf(format string, args ...any) {

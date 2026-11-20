@@ -12,7 +12,10 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-const regPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+// regPath 是系统代理设置的实际位置。
+// 声明成变量是为了让测试能临时指向 HKCU 下的沙箱子键——
+// 单测绝不能去改用户真实的系统代理配置。
+var regPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
 // WinHTTP 的代理设置是机器级状态，放在 HKLM 下。
 const winHTTPKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings\Connections`
@@ -31,6 +34,14 @@ func notify() {
 	_, _, _ = procInternetSetOptionW.Call(0, uintptr(optionRefresh), 0, 0)
 }
 
+// ProxyBypass 是系统代理的绕过列表。
+//
+// 本地地址一律绕过，否则访问 127.0.0.1 的服务（含内核自己的 API）会被二次代理。
+// 172.16.0.0/12 覆盖 172.16–172.31 共 16 个 /16（Docker/WSL/企业内网常用），
+// 必须逐段列出——缺一段，那段内网流量就会被送进代理隧道。
+// WinHTTP 用的是同一份，声明成常量保证两处不会漂移。
+const ProxyBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;*.local"
+
 // Enable 把系统代理指向 addr，形如 127.0.0.1:7890。
 func Enable(addr string) error {
 	k, err := registry.OpenKey(registry.CURRENT_USER, regPath, registry.SET_VALUE)
@@ -42,11 +53,7 @@ func Enable(addr string) error {
 	if err := k.SetStringValue("ProxyServer", addr); err != nil {
 		return fmt.Errorf("写入 ProxyServer 失败: %w", err)
 	}
-	// 本地地址一律绕过，否则访问 127.0.0.1 的服务（含内核自己的 API）会被二次代理。
-	// 172.16.0.0/12 覆盖 172.16–172.31 共 16 个 /16（Docker/WSL/企业内网常用），
-	// 必须逐段列出，缺一段那段内网流量就会被送进代理隧道。
-	bypass := "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;*.local"
-	if err := k.SetStringValue("ProxyOverride", bypass); err != nil {
+	if err := k.SetStringValue("ProxyOverride", ProxyBypass); err != nil {
 		return fmt.Errorf("写入 ProxyOverride 失败: %w", err)
 	}
 	if err := k.SetDWordValue("ProxyEnable", 1); err != nil {
@@ -206,9 +213,10 @@ func ClearAutoConfigURL() error {
 	return nil
 }
 
-// WinHTTPBypass 是 WinHTTP 的本地绕过列表。与 Enable 的 bypass 保持一致，
-// 172.16–172.31 全部 16 个 /16 都要列出。
-const WinHTTPBypass = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;*.local"
+// WinHTTPBypass 是 WinHTTP 的本地绕过列表。
+// 与 ProxyBypass 共用同一份常量：两边曾经各写一遍，改一处漏一处
+// 会让内网流量被送进隧道。
+const WinHTTPBypass = ProxyBypass
 
 // WinHTTPRaw 读取系统当前的 WinHTTP 代理二进制设置。
 // 返回值 nil 表示从未设置过（即直连），还原时删除该值即可。
