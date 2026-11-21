@@ -14,20 +14,20 @@ func TestGoRecoversPanicAndReports(t *testing.T) {
 	var gotErr any
 	var gotStack []byte
 
+	// 由上报回调来关闭 done：fn 里的 defer 会先于 protect 执行，
+	// 用它在 fn 里 close 会读到还未写入的变量（-race 直接报出来）。
 	Go("订阅更新", func() {
-		defer close(done)
 		panic("nil map")
 	}, func(name string, err any, stack []byte) {
 		gotName, gotErr, gotStack = name, err, stack
+		close(done)
 	})
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("任务没有结束")
+		t.Fatal("任务没有结束或未上报")
 	}
-	// report 在 protect 里同步调用，done 可能先关；留一点余量
-	time.Sleep(50 * time.Millisecond)
 	if gotName != "订阅更新" {
 		t.Fatalf("上报的任务名不对: %q", gotName)
 	}
@@ -86,14 +86,16 @@ func TestRunWithoutReporterStillRecovers(t *testing.T) {
 func TestReporterPanicIsContained(t *testing.T) {
 	done := make(chan struct{})
 	Go("上报器有 bug", func() {
-		defer close(done)
 		panic("原始错误")
-	}, func(string, any, []byte) { panic("上报器也炸了") })
+	}, func(string, any, []byte) {
+		defer close(done)
+		panic("上报器也炸了")
+	})
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("上报器 panic 后任务未能结束")
+		t.Fatal("上报器 panic 后流程未能继续")
 	}
 }
 
