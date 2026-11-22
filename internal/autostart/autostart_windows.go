@@ -12,7 +12,10 @@ import (
 	"os/user"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -54,16 +57,50 @@ func classifyTaskQuery(out []byte, err error) (taskState, error) {
 	if err == nil {
 		return taskPresent, nil
 	}
-	msg := strings.ToLower(string(out))
-	switch {
-	case strings.Contains(msg, "cannot find"),
-		strings.Contains(msg, "找不到"),
-		strings.Contains(msg, "does not exist"),
-		strings.Contains(msg, "not exist"):
-		return taskNotFound, nil
-	default:
-		return taskUnknown, fmt.Errorf("查询计划任务 %s 失败: %v（%s）", taskName, err, strings.TrimSpace(string(out)))
+	// schtasks 的错误文案是本地化的，且按系统 ANSI 代码页输出——中文 Windows
+	// 上是 GBK。直接拿 UTF-8 的「找不到」去匹配永远命中不了，于是"任务不存在"
+	// 被误判成"查询失败"，自启升级到计划任务这一步就永远失败。
+	// 两份候选都试：先 UTF-8（英文系统/已是 UTF-8），再按系统代码页解一次。
+	candidates := []string{strings.ToLower(string(out))}
+	if alt := strings.ToLower(decodeANSIToUTF8(out)); alt != candidates[0] {
+		candidates = append(candidates, alt)
 	}
+	for _, msg := range candidates {
+		switch {
+		case strings.Contains(msg, "cannot find"),
+			strings.Contains(msg, "找不到"),
+			strings.Contains(msg, "does not exist"),
+			strings.Contains(msg, "not exist"):
+			return taskNotFound, nil
+		}
+	}
+	return taskUnknown, fmt.Errorf("查询计划任务 %s 失败: %v（%s）", taskName, err, strings.TrimSpace(decodeANSIToUTF8(out)))
+}
+
+var procMultiByteToWideChar = windows.NewLazySystemDLL("kernel32.dll").NewProc("MultiByteToWideChar")
+
+// decodeANSIToUTF8 把子进程输出从系统 ANSI 代码页转成 UTF-8。
+// CP_ACP(0) 跟随系统区域设置：中文系统即 GBK，英文系统即 CP1252。
+// 已经是合法 UTF-8 的内容原样返回，避免二次转换把文字搞乱。
+func decodeANSIToUTF8(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if utf8.Valid(b) {
+		return string(b)
+	}
+	n, _, _ := procMultiByteToWideChar.Call(0, 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), 0, 0)
+	if n == 0 {
+		return string(b)
+	}
+	buf := make([]uint16, n)
+	if r, _, _ := procMultiByteToWideChar.Call(0, 0,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(n)); r == 0 {
+		return string(b)
+	}
+	return windows.UTF16ToString(buf)
 }
 
 // queryTaskState 查询管理员自启计划任务的状态。

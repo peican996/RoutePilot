@@ -323,6 +323,10 @@ type CoreService struct {
 	// 收藏节点名集合
 	favorites map[string]bool
 
+	// 用户手选的出口（策略组名 → 节点名），受 s.mu 保护。
+	// 内核重启会丢掉选择，靠它写回。
+	selections map[string]string
+
 	// 地图上"本机"的坐标。默认东莞，可在设置里改；
 	// 不在该地区的用户不改的话，地图连线和距离全是错的。
 	homeLon, homeLat float64
@@ -1194,9 +1198,17 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		}
 		wantTUN := s.restoreTUN && s.admin()
 		wantProxy := s.restoreProxy
+		// 上次是 TUN，但这次没有管理员权限：TUN 起不来，系统代理也没开，
+		// 结果是"开机后什么都没接管"，用户却看不出原因。必须明确告知。
+		tunNeedsAdmin := s.restoreTUN && !s.admin()
 		s.restoreTUN = false
 		s.restoreProxy = false
 		s.mu.Unlock()
+
+		if tunNeedsAdmin {
+			s.appendBootErr("上次退出时 TUN 是开启状态，但本次启动没有管理员权限，TUN 未能恢复（当前流量没有走代理）。" +
+				"请以管理员身份重启本程序；把开机自启改为管理员计划任务后，开机即可静默提权。")
+		}
 
 		if wantTUN {
 			if s.generationCurrent(gen, ctx) {
@@ -1221,6 +1233,9 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		}
 		// 进程/网站指定到 provider 节点的隐藏组需要显式选中。
 		s.selectProcessTargets()
+		// 再把用户上次手选的出口写回去：内核重启后选择器会回到默认项，
+		// 不恢复的话用户会觉得"配置变了"。
+		s.restoreSelections()
 	})
 }
 
@@ -4009,6 +4024,11 @@ type appState struct {
 	// 国内外智能分流开关。
 	SmartRouting bool `json:"smartRouting,omitempty"`
 
+	// Selections 记录用户在每个策略组里手动选中的节点（组名 → 节点名）。
+	// mihomo 的选择器只存在内存里，内核一重启就回到默认项——
+	// "开机自启后节点变了"就是这么来的，必须由我们落盘再写回。
+	Selections map[string]string `json:"selections,omitempty"`
+
 	// 地图本机位置（不填则用默认值）
 	HomeLon   *float64 `json:"homeLon,omitempty"`
 	HomeLat   *float64 `json:"homeLat,omitempty"`
@@ -4735,7 +4755,48 @@ func (s *CoreService) SelectNode(group, name string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	return s.api.Select(ctx, group, name)
+	if err := s.api.Select(ctx, group, name); err != nil {
+		return err
+	}
+	// 只有真正切成功才记，避免把不存在的节点写进状态
+	s.rememberSelection(group, name)
+	return nil
+}
+
+// rememberSelection 记住用户手选的出口。
+func (s *CoreService) rememberSelection(group, name string) {
+	if group == "" || name == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.selections == nil {
+		s.selections = map[string]string{}
+	}
+	s.selections[group] = name
+	s.mu.Unlock()
+	s.saveAppState()
+}
+
+// restoreSelections 开机/重启内核后把用户上次选的节点写回去。
+// 节点已从订阅里消失时（订阅更新过）Select 会失败，忽略并记日志即可。
+func (s *CoreService) restoreSelections() {
+	s.mu.RLock()
+	saved := make(map[string]string, len(s.selections))
+	for k, v := range s.selections {
+		saved[k] = v
+	}
+	s.mu.RUnlock()
+	if len(saved) == 0 || s.api == nil {
+		return
+	}
+	for group, node := range saved {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := s.api.Select(ctx, group, node)
+		cancel()
+		if err != nil {
+			s.dbg("恢复节点选择失败 %s -> %s: %v", group, node, err)
+		}
+	}
 }
 
 // TestNode 对单个节点发起延迟测试，返回毫秒；失败返回 -1。
@@ -5239,6 +5300,10 @@ func (s *CoreService) loadAppState() {
 	if !s.admin() {
 		s.tunOn = false
 	}
+	s.selections = st.Selections
+	if s.selections == nil {
+		s.selections = map[string]string{}
+	}
 	s.restoreProxy = st.ProxyOn
 	s.tunPrevProxyOn = st.TunPrevProxyOn
 	if st.TunPrevRegistry != nil {
@@ -5315,6 +5380,10 @@ func (s *CoreService) saveAppStateErr() error {
 	for k, v := range s.favorites {
 		favorites[k] = v
 	}
+	selections := make(map[string]string, len(s.selections))
+	for k, v := range s.selections {
+		selections[k] = v
+	}
 	winBackup := append([]byte(nil), s.winHTTPBackup...)
 	st := appState{
 		TUN:             s.tunOn,
@@ -5330,6 +5399,7 @@ func (s *CoreService) saveAppStateErr() error {
 		WinHTTPBackup:   winBackup,
 		WinHTTPPending:  s.winHTTPPending,
 		SmartRouting:    s.smartRouting,
+		Selections:      selections,
 		HomeLon:         &lon,
 		HomeLat:         &lat,
 		HomeLabel:       s.homeLabel,
