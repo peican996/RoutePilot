@@ -62,7 +62,7 @@ func classifyTaskQuery(out []byte, err error) (taskState, error) {
 	// 被误判成"查询失败"，自启升级到计划任务这一步就永远失败。
 	// 两份候选都试：先 UTF-8（英文系统/已是 UTF-8），再按系统代码页解一次。
 	candidates := []string{strings.ToLower(string(out))}
-	if alt := strings.ToLower(decodeANSIToUTF8(out)); alt != candidates[0] {
+	if alt := strings.ToLower(ansiDecode(out)); alt != candidates[0] {
 		candidates = append(candidates, alt)
 	}
 	for _, msg := range candidates {
@@ -74,28 +74,36 @@ func classifyTaskQuery(out []byte, err error) (taskState, error) {
 			return taskNotFound, nil
 		}
 	}
-	return taskUnknown, fmt.Errorf("查询计划任务 %s 失败: %v（%s）", taskName, err, strings.TrimSpace(decodeANSIToUTF8(out)))
+	return taskUnknown, fmt.Errorf("查询计划任务 %s 失败: %v（%s）", taskName, err, strings.TrimSpace(ansiDecode(out)))
 }
 
 var procMultiByteToWideChar = windows.NewLazySystemDLL("kernel32.dll").NewProc("MultiByteToWideChar")
 
+// ansiDecode 是分类函数用的解码入口，抽成变量便于测试固定代码页。
+var ansiDecode = decodeANSIToUTF8
+
 // decodeANSIToUTF8 把子进程输出从系统 ANSI 代码页转成 UTF-8。
 // CP_ACP(0) 跟随系统区域设置：中文系统即 GBK，英文系统即 CP1252。
-// 已经是合法 UTF-8 的内容原样返回，避免二次转换把文字搞乱。
 func decodeANSIToUTF8(b []byte) string {
+	return decodeCodePage(b, 0)
+}
+
+// decodeCodePage 按指定代码页解码（0 = CP_ACP）。
+// 已经是合法 UTF-8 的内容原样返回，避免二次转换把文字搞乱。
+func decodeCodePage(b []byte, cp uint32) string {
 	if len(b) == 0 {
 		return ""
 	}
 	if utf8.Valid(b) {
 		return string(b)
 	}
-	n, _, _ := procMultiByteToWideChar.Call(0, 0,
+	n, _, _ := procMultiByteToWideChar.Call(uintptr(cp), 0,
 		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)), 0, 0)
 	if n == 0 {
 		return string(b)
 	}
 	buf := make([]uint16, n)
-	if r, _, _ := procMultiByteToWideChar.Call(0, 0,
+	if r, _, _ := procMultiByteToWideChar.Call(uintptr(cp), 0,
 		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)),
 		uintptr(unsafe.Pointer(&buf[0])), uintptr(n)); r == 0 {
 		return string(b)

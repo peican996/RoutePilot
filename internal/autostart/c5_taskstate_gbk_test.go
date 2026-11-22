@@ -19,6 +19,12 @@ var gbkTaskNotFound = []byte{
 }
 
 func TestClassifyTaskQueryHandlesGBKNotFound(t *testing.T) {
+	// 固定按 936(GBK) 解码：CI 跑在英文系统上，CP_ACP 是 1252，
+	// 不固定代码页的话这个用例在 CI 上必然失败。
+	old := ansiDecode
+	ansiDecode = func(b []byte) string { return decodeCodePage(b, 936) }
+	t.Cleanup(func() { ansiDecode = old })
+
 	st, err := classifyTaskQuery(gbkTaskNotFound, errors.New("exit status 1"))
 	if err != nil {
 		t.Fatalf("GBK 的「找不到」应当判为任务不存在，却报了错: %v", err)
@@ -63,7 +69,8 @@ func TestDecodeANSIToUTF8PassesThroughUTF8(t *testing.T) {
 
 // GBK 字节要能还原成正确的中文，否则匹配关键字仍然失效。
 func TestDecodeANSIToUTF8ConvertsGBK(t *testing.T) {
-	got := decodeANSIToUTF8(gbkTaskNotFound)
+	// 显式按 GBK 解，不受宿主系统代码页影响
+	got := decodeCodePage(gbkTaskNotFound, 936)
 	if !strings.Contains(got, "找不到") {
 		t.Fatalf("GBK 未正确解码，得到: %q", got)
 	}
