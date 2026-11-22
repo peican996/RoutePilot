@@ -1206,8 +1206,12 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		s.mu.Unlock()
 
 		if tunNeedsAdmin {
-			s.appendBootErr("上次退出时 TUN 是开启状态，但本次启动没有管理员权限，TUN 未能恢复（当前流量没有走代理）。" +
-				"请以管理员身份重启本程序；把开机自启改为管理员计划任务后，开机即可静默提权。")
+			// TUN 模式下系统代理本来就是关的，TUN 再起不来就等于零接管：
+			// 用户重启电脑后发现浏览器完全打不开。这里必须兜一层——
+			// 至少把系统代理开起来，保证能上网，同时明确告知 TUN 没恢复。
+			s.appendBootErr("上次退出时 TUN 是开启状态，但本次启动没有管理员权限，TUN 未能恢复。" +
+				"已临时改用系统代理，浏览器等程序可以正常上网；请以管理员身份重启本程序恢复 TUN，" +
+				"把开机自启改为管理员计划任务后开机即可静默提权。")
 		}
 
 		if wantTUN {
@@ -1218,7 +1222,7 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 				}
 				s.mu.Unlock()
 			}
-		} else if wantProxy && s.generationCurrent(gen, ctx) {
+		} else if (wantProxy || tunNeedsAdmin) && s.generationCurrent(gen, ctx) {
 			if err := s.setSystemProxyForGeneration(gen, ctx); err != nil {
 				if errors.Is(err, errProxyStale) {
 					return
