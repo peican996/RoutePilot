@@ -15,28 +15,28 @@ func TestStartupRestorePlan(t *testing.T) {
 		wantWarn     bool
 	}{
 		{
-			name: "上次TUN_有管理员_恢复TUN",
+			name:       "上次TUN_有管理员_恢复TUN",
 			restoreTUN: true, admin: true,
 			wantTUN: true, wantProxy: false, wantWarn: false,
 		},
 		{
-			name: "上次TUN_无管理员_回落系统代理并告警",
+			name:       "上次TUN_无管理员_回落系统代理并告警",
 			restoreTUN: true, admin: false,
 			wantTUN: false, wantProxy: true, wantWarn: true,
 		},
 		{
-			name: "上次系统代理_恢复系统代理",
+			name:         "上次系统代理_恢复系统代理",
 			restoreProxy: true, admin: false,
 			wantTUN: false, wantProxy: true, wantWarn: false,
 		},
 		{
-			name: "上次系统代理_有管理员也不动TUN",
+			name:         "上次系统代理_有管理员也不动TUN",
 			restoreProxy: true, admin: true,
 			wantTUN: false, wantProxy: true, wantWarn: false,
 		},
 		{
-			name: "上次什么都没开_不要擅自接管",
-			admin: true,
+			name:    "上次什么都没开_不要擅自接管",
+			admin:   true,
 			wantTUN: false, wantProxy: false, wantWarn: false,
 		},
 	}
