@@ -1196,11 +1196,7 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 			s.mu.Unlock()
 			return
 		}
-		wantTUN := s.restoreTUN && s.admin()
-		wantProxy := s.restoreProxy
-		// 上次是 TUN，但这次没有管理员权限：TUN 起不来，系统代理也没开，
-		// 结果是"开机后什么都没接管"，用户却看不出原因。必须明确告知。
-		tunNeedsAdmin := s.restoreTUN && !s.admin()
+		wantTUN, wantProxy, tunNeedsAdmin := startupRestorePlan(s.restoreTUN, s.restoreProxy, s.admin())
 		s.restoreTUN = false
 		s.restoreProxy = false
 		s.mu.Unlock()
@@ -1222,7 +1218,7 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 				}
 				s.mu.Unlock()
 			}
-		} else if (wantProxy || tunNeedsAdmin) && s.generationCurrent(gen, ctx) {
+		} else if wantProxy && s.generationCurrent(gen, ctx) {
 			if err := s.setSystemProxyForGeneration(gen, ctx); err != nil {
 				if errors.Is(err, errProxyStale) {
 					return
@@ -1241,6 +1237,22 @@ func (s *CoreService) afterStart(gen uint64, parent context.Context) {
 		// 不恢复的话用户会觉得"配置变了"。
 		s.restoreSelections()
 	})
+}
+
+// startupRestorePlan 决定启动后要恢复哪种接管方式。
+//
+// 关键约定：上次是 TUN 但没有管理员权限时，不能什么都不做——
+// TUN 模式下系统代理本来就是关的，什么都不做等于"零接管"，
+// 用户重启电脑后的表现就是浏览器完全打不开。这里回落到系统代理，
+// 至少保证能上网，同时由调用方告知 TUN 没恢复。
+func startupRestorePlan(restoreTUN, restoreProxy, admin bool) (wantTUN, wantProxy, warnNoAdmin bool) {
+	if restoreTUN {
+		if admin {
+			return true, false, false
+		}
+		return false, true, true
+	}
+	return false, restoreProxy, false
 }
 
 func (s *CoreService) setBootErr(msg string) {
